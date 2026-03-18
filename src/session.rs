@@ -1,0 +1,497 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+
+use crate::model::{
+    ApplyMode, ApplyResult, ArtifactEntry, ArtifactManifest, ChangeTrustReport, ExecutionContract,
+    ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot, RuntimeEvent, RuntimeEventRecord,
+    SessionConfig, SessionManifest, SessionStatus, VerificationReport, WorkerResult,
+};
+
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    pub manifest: SessionManifest,
+    manifest_path: PathBuf,
+}
+
+impl SessionContext {
+    pub fn init(config: &SessionConfig, repo_snapshot: RepoSnapshot) -> Result<Self> {
+        let session_id = format!(
+            "{}-{}",
+            Utc::now().format("%Y%m%d-%H%M%S"),
+            std::process::id()
+        );
+        let base_dir = repo_snapshot
+            .repo_root
+            .join(".codex-forge")
+            .join("sessions");
+        let session_dir = base_dir.join(&session_id);
+        fs::create_dir_all(session_dir.join("commander"))
+            .with_context(|| format!("创建 session 目录失败：{}", session_dir.display()))?;
+        fs::create_dir_all(session_dir.join("workers"))
+            .with_context(|| format!("创建 worker 目录失败：{}", session_dir.display()))?;
+        fs::create_dir_all(session_dir.join("integration"))
+            .with_context(|| format!("创建 integration 目录失败：{}", session_dir.display()))?;
+
+        let manifest = SessionManifest {
+            id: session_id,
+            task: config.task.clone(),
+            repo_snapshot,
+            created_at: Utc::now(),
+            status: SessionStatus::Planning,
+            ui_mode: config.ui_mode,
+            workers_requested: config.workers,
+            role_set: config.role_set.clone(),
+            model: config.model.clone(),
+            cleanup_success: config.cleanup_success,
+            apply_mode: config.apply_mode,
+            max_retries: config.max_retries,
+            fail_fast: config.fail_fast,
+            verification_commands: config.verification_commands.clone(),
+            config_path: config.config_path.clone(),
+            plan_todo: None,
+            execution_graph: None,
+            execution_contract: None,
+            worker_results: Vec::new(),
+            artifact_manifest: ArtifactManifest::default(),
+            apply_result: None,
+            verification_report: None,
+            change_trust_report: None,
+            doctor_report: None,
+            final_summary: None,
+            reused_plan_session_id: None,
+            timeline_path: session_dir.join("timeline.jsonl"),
+            graph_path: session_dir.join("commander").join("execution-graph.json"),
+            execution_contract_path: session_dir
+                .join("commander")
+                .join("execution-contract.json"),
+            summary_json_path: session_dir.join("summary.json"),
+            summary_markdown_path: session_dir.join("summary.md"),
+            artifact_manifest_path: session_dir.join("artifact-manifest.json"),
+            apply_plan_path: session_dir.join("integration").join("apply-plan.json"),
+            apply_result_path: session_dir.join("integration").join("apply-result.json"),
+            verification_report_path: session_dir
+                .join("integration")
+                .join("verification-report.json"),
+            change_trust_report_path: session_dir
+                .join("integration")
+                .join("change-trust-report.json"),
+            session_dir: session_dir.clone(),
+        };
+
+        let manifest_path = session_dir.join("manifest.json");
+        let ctx = Self {
+            manifest,
+            manifest_path,
+        };
+        ctx.persist()?;
+        ctx.persist_artifact_manifest()?;
+        Ok(ctx)
+    }
+
+    pub fn set_status(&mut self, status: SessionStatus) -> Result<()> {
+        self.manifest.status = status;
+        self.persist()
+    }
+
+    pub fn set_plan_todo(&mut self, plan_todo: PlanTodo) -> Result<()> {
+        let json_path = self.plan_todo_json_path();
+        let markdown_path = self.plan_todo_markdown_path();
+        self.manifest.plan_todo = Some(plan_todo.clone());
+        fs::write(
+            &json_path,
+            serde_json::to_vec_pretty(&plan_todo).context("序列化 plan todo 失败")?,
+        )
+        .with_context(|| format!("写入 plan todo JSON 失败：{}", json_path.display()))?;
+        fs::write(&markdown_path, render_plan_todo_markdown(&plan_todo)).with_context(|| {
+            format!("写入 plan todo Markdown 失败：{}", markdown_path.display())
+        })?;
+        self.manifest.artifact_manifest.plan_todo_path = Some(json_path);
+        self.persist_artifact_manifest()?;
+        self.persist()
+    }
+
+    pub fn set_graph(&mut self, graph: ExecutionGraph) -> Result<()> {
+        self.manifest.execution_graph = Some(graph.clone());
+        fs::write(
+            &self.manifest.graph_path,
+            serde_json::to_vec_pretty(&graph).context("序列化执行图失败")?,
+        )
+        .with_context(|| format!("写入执行图失败：{}", self.manifest.graph_path.display()))?;
+        self.persist()
+    }
+
+    pub fn set_execution_contract(&mut self, contract: ExecutionContract) -> Result<()> {
+        self.manifest.execution_contract = Some(contract.clone());
+        fs::write(
+            &self.manifest.execution_contract_path,
+            serde_json::to_vec_pretty(&contract).context("序列化执行契约失败")?,
+        )
+        .with_context(|| {
+            format!(
+                "写入执行契约失败：{}",
+                self.manifest.execution_contract_path.display()
+            )
+        })?;
+        self.manifest.artifact_manifest.execution_contract_path =
+            Some(self.manifest.execution_contract_path.clone());
+        self.persist_artifact_manifest()?;
+        self.persist()
+    }
+
+    pub fn add_worker_result(&mut self, result: WorkerResult) -> Result<()> {
+        self.manifest.worker_results.push(result.clone());
+        self.manifest.artifact_manifest.entries.push(ArtifactEntry {
+            agent_id: result.agent_id,
+            handoff_path: result.handoff_path,
+            diff_path: result.diff_path,
+            final_output_path: result.final_output_path,
+            changed_files: result.changed_files,
+        });
+        self.persist_artifact_manifest()?;
+        self.persist()
+    }
+
+    pub fn set_apply_result(&mut self, apply_result: ApplyResult) -> Result<()> {
+        self.manifest.apply_result = Some(apply_result);
+        self.manifest.artifact_manifest.apply_result_path =
+            Some(self.manifest.apply_result_path.clone());
+        self.persist_artifact_manifest()?;
+        self.persist()
+    }
+
+    pub fn set_verification_report(&mut self, report: VerificationReport) -> Result<()> {
+        self.manifest.verification_report = Some(report);
+        self.manifest.artifact_manifest.verification_report_path =
+            Some(self.manifest.verification_report_path.clone());
+        self.persist_artifact_manifest()?;
+        self.persist()
+    }
+
+    pub fn set_change_trust_report(&mut self, report: ChangeTrustReport) -> Result<()> {
+        self.manifest.change_trust_report = Some(report.clone());
+        fs::write(
+            &self.manifest.change_trust_report_path,
+            serde_json::to_vec_pretty(&report).context("序列化可信度报告失败")?,
+        )
+        .with_context(|| {
+            format!(
+                "写入可信度报告失败：{}",
+                self.manifest.change_trust_report_path.display()
+            )
+        })?;
+        self.manifest.artifact_manifest.change_trust_report_path =
+            Some(self.manifest.change_trust_report_path.clone());
+        self.persist_artifact_manifest()?;
+        self.persist()
+    }
+
+    pub fn set_summary(&mut self, summary: FinalSummary) -> Result<()> {
+        self.manifest.final_summary = Some(summary.clone());
+        fs::write(
+            &self.manifest.summary_json_path,
+            serde_json::to_vec_pretty(&summary).context("序列化 summary 失败")?,
+        )
+        .with_context(|| {
+            format!(
+                "写入 JSON summary 失败：{}",
+                self.manifest.summary_json_path.display()
+            )
+        })?;
+        fs::write(
+            &self.manifest.summary_markdown_path,
+            render_summary_markdown(&self.manifest, &summary),
+        )
+        .with_context(|| {
+            format!(
+                "写入 Markdown summary 失败：{}",
+                self.manifest.summary_markdown_path.display()
+            )
+        })?;
+        self.persist()
+    }
+
+    pub fn append_timeline(&self, event: &RuntimeEvent) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.manifest.timeline_path)
+            .with_context(|| {
+                format!(
+                    "打开 timeline 文件失败：{}",
+                    self.manifest.timeline_path.display()
+                )
+            })?;
+
+        let record = RuntimeEventRecord {
+            ts: Utc::now(),
+            payload: event.clone(),
+        };
+        let line = serde_json::to_string(&record).context("序列化 timeline 事件失败")?;
+        writeln!(file, "{line}").context("写入 timeline 失败")
+    }
+
+    pub fn worker_dir(&self, agent_id: &str) -> PathBuf {
+        self.manifest.session_dir.join("workers").join(agent_id)
+    }
+
+    pub fn commander_dir(&self) -> PathBuf {
+        self.manifest.session_dir.join("commander")
+    }
+
+    pub fn plan_todo_json_path(&self) -> PathBuf {
+        self.commander_dir().join("plan-todo.json")
+    }
+
+    pub fn plan_todo_markdown_path(&self) -> PathBuf {
+        self.commander_dir().join("plan-todo.md")
+    }
+
+    pub fn set_reused_plan_session_id(&mut self, session_id: impl Into<String>) -> Result<()> {
+        self.manifest.reused_plan_session_id = Some(session_id.into());
+        self.persist()
+    }
+
+    pub fn persist(&self) -> Result<()> {
+        fs::write(
+            &self.manifest_path,
+            serde_json::to_vec_pretty(&self.manifest).context("序列化 manifest 失败")?,
+        )
+        .with_context(|| format!("写入 manifest 失败：{}", self.manifest_path.display()))
+    }
+
+    pub fn persist_artifact_manifest(&self) -> Result<()> {
+        fs::write(
+            &self.manifest.artifact_manifest_path,
+            serde_json::to_vec_pretty(&self.manifest.artifact_manifest)
+                .context("序列化 artifact manifest 失败")?,
+        )
+        .with_context(|| {
+            format!(
+                "写入 artifact manifest 失败：{}",
+                self.manifest.artifact_manifest_path.display()
+            )
+        })
+    }
+}
+
+pub fn load_session(target_dir: &Path, session_id: Option<&str>) -> Result<SessionManifest> {
+    let sessions_root = resolve_sessions_root(target_dir)?;
+    if !sessions_root.exists() {
+        bail!("未找到 .codex-forge/sessions：{}", sessions_root.display());
+    }
+
+    let session_path = if let Some(id) = session_id {
+        sessions_root.join(id)
+    } else {
+        latest_session_dir(&sessions_root)?
+    };
+
+    let manifest_path = session_path.join("manifest.json");
+    let content = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("读取 manifest 失败：{}", manifest_path.display()))?;
+    serde_json::from_str(&content).context("解析 manifest 失败")
+}
+
+pub fn find_reusable_plan_session(
+    target_dir: &Path,
+    task: &str,
+    workers: usize,
+    role_set: &str,
+) -> Result<Option<SessionManifest>> {
+    let sessions_root = resolve_sessions_root(target_dir)?;
+    if !sessions_root.exists() {
+        return Ok(None);
+    }
+
+    let mut dirs = fs::read_dir(&sessions_root)
+        .with_context(|| format!("读取 sessions 根目录失败：{}", sessions_root.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    dirs.sort();
+
+    for dir in dirs.into_iter().rev() {
+        let manifest_path = dir.join("manifest.json");
+        let Ok(content) = fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<SessionManifest>(&content) else {
+            continue;
+        };
+        if is_reusable_plan_manifest(&manifest, task, workers, role_set) {
+            return Ok(Some(manifest));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_sessions_root(target_dir: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(target_dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("执行 git rev-parse 失败：{}", target_dir.display()))?;
+
+    let repo_root = if output.status.success() {
+        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        target_dir.to_path_buf()
+    };
+
+    Ok(repo_root.join(".codex-forge").join("sessions"))
+}
+
+fn latest_session_dir(sessions_root: &Path) -> Result<PathBuf> {
+    let mut dirs = fs::read_dir(sessions_root)
+        .with_context(|| format!("读取 sessions 根目录失败：{}", sessions_root.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+
+    dirs.sort();
+    dirs.pop()
+        .ok_or_else(|| anyhow::anyhow!("没有可回放的 session"))
+}
+
+fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -> String {
+    let worker_lines = manifest
+        .worker_results
+        .iter()
+        .map(|result| {
+            format!(
+                "- `{}` / `{}`：{}（handoff：`{}`）",
+                result.agent_id,
+                result.role,
+                result.status.label(),
+                result
+                    .handoff_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "无".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let accepted_files = render_bullets(&summary.accepted_files);
+    let manual_review_files = render_bullets(&summary.manual_review_files);
+    let rejected_files = render_bullets(&summary.rejected_files);
+    let verified_capabilities = render_bullets(&summary.verified_capabilities);
+    let blocked_verifications = render_bullets(&summary.blocked_verifications);
+    let open_risks = render_bullets(&summary.open_risks);
+    let recommended_next_action = render_bullets(&summary.recommended_next_action);
+
+    format!(
+        "# Session {}\n\n\
+## 任务\n\n{}\n\n\
+## 总览\n\n{}\n\n\
+## 决策状态\n\n\
+- 结果：{}\n\
+- reviewer gate：{}\n\
+- apply：{}\n\
+- 可信度：{}\n\n\
+## 执行图\n\n`{}`\n\n\
+## Worker 结果\n\n{}\n\n\
+## 执行契约\n\n`{}`\n\n\
+## 应用报告\n\n`{}`\n\n\
+## 验证报告\n\n`{}`\n\n\
+## 接收文件\n\n{}\n\n\
+## 人工复核文件\n\n{}\n\n\
+## 拒绝文件\n\n{}\n\n\
+## 已验证能力\n\n{}\n\n\
+## 因环境受阻\n\n{}\n\n\
+## 未关闭风险\n\n{}\n\n\
+## 下一步\n\n{}\n",
+        manifest.id,
+        manifest.task,
+        summary.overview,
+        summary.result_status.label(),
+        summary
+            .review_gate
+            .map(|item| item.label().to_string())
+            .unwrap_or_else(|| "无".to_string()),
+        summary.apply_status.label(),
+        summary.trust_level.label(),
+        manifest.graph_path.display(),
+        worker_lines,
+        manifest.execution_contract_path.display(),
+        manifest.apply_result_path.display(),
+        manifest.verification_report_path.display(),
+        accepted_files,
+        manual_review_files,
+        rejected_files,
+        verified_capabilities,
+        blocked_verifications,
+        open_risks,
+        recommended_next_action,
+    )
+}
+
+fn render_plan_todo_markdown(plan_todo: &PlanTodo) -> String {
+    let todo_lines = plan_todo
+        .todos
+        .iter()
+        .map(|item| {
+            let details = render_bullets(&item.details);
+            let deps = if item.dependencies.is_empty() {
+                "- 无".to_string()
+            } else {
+                render_bullets(&item.dependencies)
+            };
+            let done = render_bullets(&item.completion_criteria);
+            format!(
+                "## {} {}\n\n**目标**\n\n{}\n\n**细节**\n\n{}\n\n**依赖**\n\n{}\n\n**完成标准**\n\n{}\n",
+                item.id, item.title, item.goal, details, deps, done
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let risks = render_bullets(&plan_todo.risks);
+    let notes = render_bullets(&plan_todo.planning_notes);
+
+    format!(
+        "# 计划清单\n\n\
+## 摘要\n\n{}\n\n\
+## 推进策略\n\n{}\n\n\
+## Todo\n\n{}\n\
+## 风险\n\n{}\n\n\
+## 规划备注\n\n{}\n",
+        plan_todo.summary, plan_todo.approach, todo_lines, risks, notes
+    )
+}
+
+fn is_reusable_plan_manifest(
+    manifest: &SessionManifest,
+    task: &str,
+    workers: usize,
+    role_set: &str,
+) -> bool {
+    manifest.task == task
+        && manifest.workers_requested == workers
+        && manifest.role_set == role_set
+        && manifest.status == SessionStatus::Completed
+        && manifest.apply_mode == ApplyMode::None
+        && manifest.worker_results.is_empty()
+        && manifest.execution_graph.is_some()
+}
+
+fn render_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        "- 无".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}

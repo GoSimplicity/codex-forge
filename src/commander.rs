@@ -1,0 +1,1535 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+use crate::codex::run_json_once;
+use crate::model::{
+    ApplyDecision, ApplyStatus, DriftPolicy, ExecutionContract, ExecutionGraph, ExecutionNode,
+    FinalSummary, NodeContract, PlanTodo, PlanTodoItem, RepoSnapshot, ResultStatus, RoleConfig,
+    ScopeDrift, SessionConfig, SessionManifest, TrustLevel,
+};
+
+const PLAN_TODO_SCHEMA: &str = r#"{
+  "type": "object",
+  "required": ["summary", "approach", "todos", "risks"],
+  "properties": {
+    "summary": {"type": "string"},
+    "approach": {"type": "string"},
+    "risks": {"type": "array", "items": {"type": "string"}},
+    "todos": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "title",
+          "goal",
+          "details",
+          "dependencies",
+          "completion_criteria"
+        ],
+        "properties": {
+          "title": {"type": "string"},
+          "goal": {"type": "string"},
+          "details": {"type": "array", "items": {"type": "string"}},
+          "dependencies": {"type": "array", "items": {"type": "string"}},
+          "completion_criteria": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}"#;
+
+const PLAN_SCHEMA: &str = r#"{
+  "type": "object",
+  "required": ["summary", "strategy", "nodes"],
+  "properties": {
+    "summary": {"type": "string"},
+    "strategy": {"type": "string"},
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "title",
+          "role",
+          "objective",
+          "deliverables",
+          "dependencies",
+          "prompt_focus",
+          "input_artifacts",
+          "output_artifacts",
+          "completion_criteria"
+        ],
+        "properties": {
+          "title": {"type": "string"},
+          "role": {"type": "string"},
+          "objective": {"type": "string"},
+          "deliverables": {"type": "array", "items": {"type": "string"}},
+          "dependencies": {"type": "array", "items": {"type": "string"}},
+          "prompt_focus": {"type": "string"},
+          "input_artifacts": {"type": "array", "items": {"type": "string"}},
+          "output_artifacts": {"type": "array", "items": {"type": "string"}},
+          "completion_criteria": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}"#;
+
+#[derive(Debug, Deserialize)]
+struct PlannerOutput {
+    summary: String,
+    strategy: String,
+    nodes: Vec<PlannerNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanTodoOutput {
+    summary: String,
+    approach: String,
+    todos: Vec<PlanTodoOutputItem>,
+    risks: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanTodoOutputItem {
+    title: String,
+    goal: String,
+    details: Vec<String>,
+    dependencies: Vec<String>,
+    completion_criteria: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlannerNode {
+    title: String,
+    role: String,
+    objective: String,
+    deliverables: Vec<String>,
+    dependencies: Vec<String>,
+    prompt_focus: String,
+    input_artifacts: Vec<String>,
+    output_artifacts: Vec<String>,
+    completion_criteria: Vec<String>,
+}
+
+pub async fn build_plan(
+    config: &SessionConfig,
+    repo: &RepoSnapshot,
+    roles: &[RoleConfig],
+    commander_dir: &Path,
+    plan_todo: Option<&PlanTodo>,
+) -> Result<ExecutionGraph> {
+    fs::create_dir_all(commander_dir)
+        .with_context(|| format!("创建 commander 目录失败：{}", commander_dir.display()))?;
+
+    let schema_path = commander_dir.join("plan-schema.json");
+    let prompt_path = commander_dir.join("planner-prompt.md");
+    let output_path = commander_dir.join("planner-output.json");
+    let log_path = commander_dir.join("planner.log");
+    fs::write(&schema_path, PLAN_SCHEMA)
+        .with_context(|| format!("写入计划 schema 失败：{}", schema_path.display()))?;
+
+    let prompt = build_planner_prompt(config, repo, roles, plan_todo);
+    fs::write(&prompt_path, &prompt)
+        .with_context(|| format!("写入 planner prompt 失败：{}", prompt_path.display()))?;
+
+    let mut notes = Vec::new();
+    let json_prompt = bind_json_schema(&prompt, PLAN_SCHEMA);
+    match run_json_once(
+        &json_prompt,
+        &repo.repo_root,
+        config.model.as_deref(),
+        &output_path,
+        &log_path,
+        config.max_retries,
+    )
+    .await
+    {
+        Ok(raw) => match serde_json::from_str::<PlannerOutput>(&raw) {
+            Ok(output) => match normalize_plan(output, roles, config.workers, notes.clone()) {
+                Ok(graph) => Ok(graph),
+                Err(error) => {
+                    notes.push(format!(
+                        "Codex planner 结果不可用，改走内置回退：{}",
+                        summarize_error(&error.to_string())
+                    ));
+                    fallback_plan(config, roles, notes)
+                }
+            },
+            Err(error) => {
+                notes.push(format!(
+                    "Codex planner JSON 解析失败，改走内置回退：{}",
+                    summarize_error(&error.to_string())
+                ));
+                fallback_plan(config, roles, notes)
+            }
+        },
+        Err(error) => {
+            notes.push(format!(
+                "Codex planner 调用失败，改走内置回退：{}",
+                summarize_error(&error.to_string())
+            ));
+            fallback_plan(config, roles, notes)
+        }
+    }
+}
+
+pub async fn build_plan_todo(
+    config: &SessionConfig,
+    repo: &RepoSnapshot,
+    commander_dir: &Path,
+) -> Result<PlanTodo> {
+    fs::create_dir_all(commander_dir)
+        .with_context(|| format!("创建 commander 目录失败：{}", commander_dir.display()))?;
+
+    let schema_path = commander_dir.join("plan-todo-schema.json");
+    let prompt_path = commander_dir.join("plan-todo-prompt.md");
+    let output_path = commander_dir.join("plan-todo-output.json");
+    let log_path = commander_dir.join("plan-todo.log");
+    fs::write(&schema_path, PLAN_TODO_SCHEMA)
+        .with_context(|| format!("写入 todo schema 失败：{}", schema_path.display()))?;
+
+    let prompt = build_plan_todo_prompt(config, repo);
+    fs::write(&prompt_path, &prompt)
+        .with_context(|| format!("写入 todo prompt 失败：{}", prompt_path.display()))?;
+
+    let mut notes = Vec::new();
+    let json_prompt = bind_json_schema(&prompt, PLAN_TODO_SCHEMA);
+    match run_json_once(
+        &json_prompt,
+        &repo.repo_root,
+        config.model.as_deref(),
+        &output_path,
+        &log_path,
+        config.max_retries,
+    )
+    .await
+    {
+        Ok(raw) => match serde_json::from_str::<PlanTodoOutput>(&raw) {
+            Ok(output) => match normalize_plan_todo(output) {
+                Ok(plan_todo) => Ok(plan_todo),
+                Err(error) => {
+                    notes.push(format!(
+                        "Codex todo 计划结果不可用，改走内置回退：{}",
+                        summarize_error(&error.to_string())
+                    ));
+                    Ok(fallback_plan_todo(config, notes))
+                }
+            },
+            Err(error) => {
+                notes.push(format!(
+                    "Codex todo 计划 JSON 解析失败，改走内置回退：{}",
+                    summarize_error(&error.to_string())
+                ));
+                Ok(fallback_plan_todo(config, notes))
+            }
+        },
+        Err(error) => {
+            notes.push(format!(
+                "Codex todo 计划调用失败，改走内置回退：{}",
+                summarize_error(&error.to_string())
+            ));
+            Ok(fallback_plan_todo(config, notes))
+        }
+    }
+}
+
+pub fn derive_execution_contract(
+    config: &SessionConfig,
+    graph: &ExecutionGraph,
+) -> ExecutionContract {
+    let forbidden_paths = vec![
+        ".git/**".to_string(),
+        ".codex-forge/**".to_string(),
+        "target/**".to_string(),
+    ];
+    let node_contracts = graph
+        .nodes
+        .iter()
+        .map(|node| NodeContract {
+            node_id: node.id.clone(),
+            allowed_paths: if node.allow_code_changes {
+                vec!["*".to_string()]
+            } else {
+                Vec::new()
+            },
+            forbidden_paths: forbidden_paths.clone(),
+            expected_artifacts: if node.expected_artifacts.is_empty() {
+                node.output_artifacts.clone()
+            } else {
+                node.expected_artifacts.clone()
+            },
+            required_verifications: if node.required_verifications.is_empty() {
+                node.completion_criteria.clone()
+            } else {
+                node.required_verifications.clone()
+            },
+            acceptable_drift: node.acceptable_drift,
+        })
+        .collect::<Vec<_>>();
+
+    ExecutionContract {
+        task_fingerprint: task_fingerprint(config, graph),
+        allowed_paths: vec!["*".to_string()],
+        forbidden_paths,
+        node_contracts,
+        drift_policy: DriftPolicy::default(),
+        summary_contract: vec![
+            "result_status".to_string(),
+            "review_gate".to_string(),
+            "apply_status".to_string(),
+            "accepted_files".to_string(),
+            "manual_review_files".to_string(),
+            "rejected_files".to_string(),
+            "verified_capabilities".to_string(),
+            "blocked_verifications".to_string(),
+            "recommended_next_action".to_string(),
+        ],
+        compatibility_notes: vec!["V3 默认契约使用保守禁止列表和宽松允许列表。".to_string()],
+    }
+}
+
+pub async fn summarize_run(
+    _config: &SessionConfig,
+    manifest: &SessionManifest,
+    _roles: &[RoleConfig],
+    commander_dir: &Path,
+) -> Result<FinalSummary> {
+    fs::create_dir_all(commander_dir)
+        .with_context(|| format!("创建 commander 目录失败：{}", commander_dir.display()))?;
+
+    Ok(build_local_summary(manifest))
+}
+
+fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String {
+    let readme = repo
+        .readme_excerpt
+        .clone()
+        .unwrap_or_else(|| "无 README 摘要".to_string());
+
+    format!(
+        "你现在是 codex-forge V2 的 planner，需要先输出一份**面向用户可读**的计划 TODO 清单。\n\
+请只输出符合 schema 的 JSON，不要输出 Markdown，也不要输出执行角色。\n\n\
+全局任务：{}\n\
+目标仓库：{}\n\
+技术栈：{}\n\n\
+仓库摘要：\n\
+- 顶层目录：{}\n\
+- README 摘要：\n{}\n\n\
+规划要求：\n\
+- todo 必须直接对应用户要推进的工作，而不是 architect / implementer / tester 之类角色名。\n\
+- 优先给出 3 到 6 个可执行步骤，顺序清晰，避免空话。\n\
+- 每个 todo 需要写清目标、细节、依赖和完成标准。\n\
+- 风险要简洁，优先列真正会阻塞执行的点。\n\
+- 保持最小可执行规划，不要过度设计。\n",
+        config.task,
+        repo.display_name,
+        if repo.detected_stacks.is_empty() {
+            "未知".to_string()
+        } else {
+            repo.detected_stacks.join(" / ")
+        },
+        repo.top_level_entries.join("、"),
+        readme,
+    )
+}
+
+fn build_planner_prompt(
+    config: &SessionConfig,
+    repo: &RepoSnapshot,
+    roles: &[RoleConfig],
+    plan_todo: Option<&PlanTodo>,
+) -> String {
+    let roles_text = roles
+        .iter()
+        .map(|role| {
+            format!(
+                "- {}（{}）：{}；擅长：{}；风格：{}；可编辑：{}",
+                role.title,
+                role.key,
+                role.mission,
+                role.skills.join("、"),
+                role.working_style,
+                role.can_edit
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let readme = repo
+        .readme_excerpt
+        .clone()
+        .unwrap_or_else(|| "无 README 摘要".to_string());
+    let todo_context = plan_todo
+        .map(|plan| {
+            let todos = plan
+                .todos
+                .iter()
+                .map(|item| {
+                    format!(
+                        "- {}：{}；完成标准：{}",
+                        item.title,
+                        item.goal,
+                        item.completion_criteria.join("；")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n用户规划清单：\n- 摘要：{}\n- 策略：{}\n- Todo：\n{}\n",
+                plan.summary, plan.approach, todos
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        "你现在是 codex-forge V2 的 commander agent，需要为多个 Codex worker 规划显式执行图。\n\
+请只输出符合 schema 的 JSON，不要输出 Markdown。\n\n\
+全局任务：{}\n\
+目标仓库：{}\n\
+技术栈：{}\n\
+期望 worker 数量上限：{}\n\
+角色集合：{}\n\
+默认应用模式：{}\n\n\
+可用角色：\n{}\n\n\
+仓库摘要：\n\
+- 顶层目录：{}\n\
+- README 摘要：\n{}\n\n\
+{}\
+规划要求：\n\
+- 输出 1 到 {} 个节点。\n\
+- 每个节点必须绑定一个可用角色。\n\
+- 节点依赖必须显式列出，用节点 id 归一化前的逻辑前驱来表达。\n\
+- 默认要形成“规划 → 实现/验证 → reviewer gate → apply”的收敛闭环。\n\
+- reviewer 节点应位于准备应用之前，默认只读。\n\
+- input_artifacts / output_artifacts / completion_criteria 必须具体，便于下游 handoff。\n\
+- 优先保证可执行性和自动收敛，不要设计过度。\n",
+        config.task,
+        repo.display_name,
+        if repo.detected_stacks.is_empty() {
+            "未知".to_string()
+        } else {
+            repo.detected_stacks.join(" / ")
+        },
+        config.workers,
+        config.role_set,
+        config.apply_mode,
+        roles_text,
+        repo.top_level_entries.join("、"),
+        readme,
+        todo_context,
+        config.workers,
+    )
+}
+
+fn bind_json_schema(prompt: &str, schema: &str) -> String {
+    format!(
+        "{prompt}\n\
+输出规则（必须严格遵守）：\n\
+- 最终输出必须是一个合法 JSON 对象。\n\
+- 不要输出 Markdown、代码块、解释文字、前后缀。\n\
+- 字段名、层级和类型必须满足下面的 JSON Schema。\n\
+- 如果你想解释，请把解释写进 JSON 字段，而不是写在 JSON 外。\n\n\
+JSON Schema：\n{schema}\n"
+    )
+}
+
+fn normalize_plan(
+    output: PlannerOutput,
+    roles: &[RoleConfig],
+    max_workers: usize,
+    mut notes: Vec<String>,
+) -> Result<ExecutionGraph> {
+    let available_roles = roles
+        .iter()
+        .map(|role| role.key.as_str())
+        .collect::<HashSet<_>>();
+    let role_map = roles
+        .iter()
+        .map(|role| (role.key.as_str(), role))
+        .collect::<HashMap<_, _>>();
+    let mut role_counts: HashMap<String, usize> = HashMap::new();
+
+    let mut nodes = output
+        .nodes
+        .into_iter()
+        .take(max_workers.max(1))
+        .map(|node| {
+            let deliverables = node.deliverables.clone();
+            let role_key = if available_roles.contains(node.role.as_str()) {
+                node.role
+            } else {
+                notes.push(format!(
+                    "planner 给出了未知角色 `{}`，已回退到 implementer",
+                    node.role
+                ));
+                "implementer".to_string()
+            };
+            let index = role_counts
+                .entry(role_key.clone())
+                .and_modify(|item| *item += 1)
+                .or_insert(1);
+            let role = role_map.get(role_key.as_str()).context("缺少角色定义")?;
+            Ok(ExecutionNode {
+                id: format!("{role_key}-{index}"),
+                title: node.title,
+                role: role_key,
+                objective: node.objective,
+                deliverables: deliverables.clone(),
+                dependencies: node.dependencies,
+                prompt_focus: node.prompt_focus,
+                input_artifacts: node.input_artifacts,
+                output_artifacts: node.output_artifacts,
+                completion_criteria: node.completion_criteria,
+                allow_code_changes: role.can_edit,
+                expected_artifacts: deliverables,
+                required_verifications: Vec::new(),
+                scope_guard_ref: None,
+                acceptable_drift: if role.can_edit {
+                    ScopeDrift::Minor
+                } else {
+                    ScopeDrift::None
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    ensure_reviewer_gate(&mut nodes, roles);
+    normalize_dependencies(&mut nodes)?;
+    let graph = ExecutionGraph {
+        summary: output.summary,
+        strategy: output.strategy,
+        nodes,
+        used_fallback: false,
+        planning_notes: notes,
+    };
+    graph.topological_order()?;
+    Ok(graph)
+}
+
+fn normalize_plan_todo(output: PlanTodoOutput) -> Result<PlanTodo> {
+    let mut alias_map = HashMap::<String, Vec<String>>::new();
+    let mut items = output
+        .todos
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let id = format!("todo-{}", index + 1);
+            push_alias(&mut alias_map, &id, &id);
+            push_alias(&mut alias_map, &item.title, &id);
+            let title_slug = slugify(&item.title);
+            if !title_slug.is_empty() {
+                push_alias(&mut alias_map, &title_slug, &id);
+            }
+            PlanTodoItem {
+                id,
+                title: item.title,
+                goal: item.goal,
+                details: item.details,
+                dependencies: item.dependencies,
+                completion_criteria: item.completion_criteria,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for item in &mut items {
+        let raw_dependencies = item.dependencies.clone();
+        let mut normalized = Vec::new();
+        for dep in raw_dependencies {
+            let resolved = resolve_plan_todo_dependency(&dep, &alias_map)?;
+            if resolved == item.id {
+                anyhow::bail!("todo `{}` 依赖自身：`{dep}`", item.id);
+            }
+            if !normalized.contains(&resolved) {
+                normalized.push(resolved);
+            }
+        }
+        item.dependencies = normalized;
+    }
+
+    Ok(PlanTodo {
+        summary: output.summary,
+        approach: output.approach,
+        todos: items,
+        risks: output.risks,
+        used_fallback: false,
+        planning_notes: Vec::new(),
+    })
+}
+
+fn fallback_plan(
+    config: &SessionConfig,
+    roles: &[RoleConfig],
+    mut notes: Vec<String>,
+) -> Result<ExecutionGraph> {
+    let role_map = roles
+        .iter()
+        .map(|role| (role.key.as_str(), role))
+        .collect::<HashMap<_, _>>();
+    let available = roles
+        .iter()
+        .map(|role| role.key.as_str())
+        .collect::<HashSet<_>>();
+    let ordered_roles = fallback_role_order(config.workers, &available);
+    let mut role_counts: HashMap<String, usize> = HashMap::new();
+
+    let mut nodes = ordered_roles
+        .into_iter()
+        .map(|role_key| {
+            let count = role_counts
+                .entry(role_key.clone())
+                .and_modify(|item| *item += 1)
+                .or_insert(1);
+            let role = role_map
+                .get(role_key.as_str())
+                .context("fallback 角色缺失")?;
+            Ok(ExecutionNode {
+                id: format!("{role_key}-{count}"),
+                title: fallback_title(&role_key, *count),
+                role: role_key.clone(),
+                objective: fallback_objective(&role_key, *count, &config.task),
+                deliverables: fallback_deliverables(&role_key),
+                dependencies: fallback_dependencies(&role_key),
+                prompt_focus: fallback_focus(&role_key, *count),
+                input_artifacts: fallback_inputs(&role_key),
+                output_artifacts: fallback_outputs(&role_key),
+                completion_criteria: fallback_completion(&role_key),
+                allow_code_changes: role.can_edit,
+                expected_artifacts: fallback_deliverables(&role_key),
+                required_verifications: Vec::new(),
+                scope_guard_ref: None,
+                acceptable_drift: if role.can_edit {
+                    ScopeDrift::Minor
+                } else {
+                    ScopeDrift::None
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    ensure_reviewer_gate(&mut nodes, roles);
+    drop_invalid_dependencies(&mut nodes);
+    notes.push("使用内置规则完成执行图拆分。".to_string());
+    let graph = ExecutionGraph {
+        summary: "基于固定角色模板和 worker 数量完成的执行图计划。".to_string(),
+        strategy: "采用固定角色分工：先规划，再并发实现，之后补验证并增加 reviewer gate，最后进入 auto-safe 集成阶段。".to_string(),
+        nodes,
+        used_fallback: true,
+        planning_notes: notes,
+    };
+    graph.topological_order()?;
+    Ok(graph)
+}
+
+fn fallback_plan_todo(config: &SessionConfig, mut notes: Vec<String>) -> PlanTodo {
+    let keyword_blog = config.task.contains("博客")
+        || config.task.to_ascii_lowercase().contains("blog")
+        || config.task.to_ascii_lowercase().contains("web");
+
+    let todos = if keyword_blog {
+        vec![
+            PlanTodoItem {
+                id: "todo-1".to_string(),
+                title: "明确博客 MVP 范围".to_string(),
+                goal: format!("先把 `{}` 收敛成最小可交付范围。", config.task),
+                details: vec![
+                    "明确是否需要首页、文章详情页、后台或静态发布".to_string(),
+                    "确定技术栈、部署方式和内容来源".to_string(),
+                ],
+                dependencies: vec![],
+                completion_criteria: vec![
+                    "功能边界明确".to_string(),
+                    "技术选型可直接进入实现".to_string(),
+                ],
+            },
+            PlanTodoItem {
+                id: "todo-2".to_string(),
+                title: "设计页面与数据结构".to_string(),
+                goal: "先定义博客页面、文章字段与导航结构，减少返工。".to_string(),
+                details: vec![
+                    "梳理首页、文章列表、文章详情的结构".to_string(),
+                    "定义文章标题、摘要、正文、标签、日期等字段".to_string(),
+                ],
+                dependencies: vec!["todo-1".to_string()],
+                completion_criteria: vec![
+                    "页面结构清晰".to_string(),
+                    "数据字段足够支撑后续实现".to_string(),
+                ],
+            },
+            PlanTodoItem {
+                id: "todo-3".to_string(),
+                title: "实现博客主链路".to_string(),
+                goal: "完成可运行的博客页面主干，让用户可以浏览内容。".to_string(),
+                details: vec![
+                    "搭建基础布局、路由和文章展示".to_string(),
+                    "优先保证首页与详情页可用".to_string(),
+                ],
+                dependencies: vec!["todo-2".to_string()],
+                completion_criteria: vec![
+                    "核心页面可访问".to_string(),
+                    "文章展示链路跑通".to_string(),
+                ],
+            },
+            PlanTodoItem {
+                id: "todo-4".to_string(),
+                title: "补齐样式与验证".to_string(),
+                goal: "在主链路可用后补最小样式、错误处理与发布前验证。".to_string(),
+                details: vec![
+                    "补基础视觉样式与响应式体验".to_string(),
+                    "检查空数据、错误页与部署配置".to_string(),
+                ],
+                dependencies: vec!["todo-3".to_string()],
+                completion_criteria: vec![
+                    "页面具备基本可用性".to_string(),
+                    "至少一条可信验证路径通过".to_string(),
+                ],
+            },
+        ]
+    } else {
+        vec![
+            PlanTodoItem {
+                id: "todo-1".to_string(),
+                title: "明确目标与边界".to_string(),
+                goal: format!("先把 `{}` 的范围、限制和交付标准讲清楚。", config.task),
+                details: vec![
+                    "确认影响模块、输入输出和非目标范围".to_string(),
+                    "明确必须保留的现有约束".to_string(),
+                ],
+                dependencies: vec![],
+                completion_criteria: vec![
+                    "任务边界清晰".to_string(),
+                    "没有关键前提缺失".to_string(),
+                ],
+            },
+            PlanTodoItem {
+                id: "todo-2".to_string(),
+                title: "拆最小实现路径".to_string(),
+                goal: "把任务拆成能连续推进的最小步骤，而不是一次性大改。".to_string(),
+                details: vec![
+                    "先做主链路，再补边界和验证".to_string(),
+                    "尽量减少跨模块同时改动".to_string(),
+                ],
+                dependencies: vec!["todo-1".to_string()],
+                completion_criteria: vec![
+                    "每步都有明确产出".to_string(),
+                    "依赖顺序可执行".to_string(),
+                ],
+            },
+            PlanTodoItem {
+                id: "todo-3".to_string(),
+                title: "完成主干实现".to_string(),
+                goal: "优先把能证明价值的主链路做通。".to_string(),
+                details: vec![
+                    "只改当前任务直接相关的模块".to_string(),
+                    "优先修根因，不做顺手重构".to_string(),
+                ],
+                dependencies: vec!["todo-2".to_string()],
+                completion_criteria: vec![
+                    "主目标可运行或可验证".to_string(),
+                    "改动范围受控".to_string(),
+                ],
+            },
+            PlanTodoItem {
+                id: "todo-4".to_string(),
+                title: "补验证与交付收敛".to_string(),
+                goal: "补最小可信验证，并明确残余风险与下一步。".to_string(),
+                details: vec![
+                    "运行最小必要测试或 smoke check".to_string(),
+                    "整理未验证点和潜在回归".to_string(),
+                ],
+                dependencies: vec!["todo-3".to_string()],
+                completion_criteria: vec![
+                    "至少一条验证路径通过".to_string(),
+                    "交付说明完整".to_string(),
+                ],
+            },
+        ]
+    };
+
+    notes.push("使用内置规则生成用户可读 todo 清单。".to_string());
+    PlanTodo {
+        summary: format!("围绕 `{}` 生成的最小可执行计划。", config.task),
+        approach: "先收敛范围，再完成主链路，最后补验证和交付说明。".to_string(),
+        todos,
+        risks: vec![
+            "如果技术栈、部署方式或内容来源未提前定清，后续实现容易返工。".to_string(),
+            "如果任务实际跨多个模块或服务，执行前仍需再确认边界。".to_string(),
+        ],
+        used_fallback: true,
+        planning_notes: notes,
+    }
+}
+
+fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
+    let success = manifest
+        .worker_results
+        .iter()
+        .filter(|result| result.status == crate::model::WorkerStatus::Succeeded)
+        .count();
+    let failed_workers = manifest
+        .worker_results
+        .iter()
+        .filter(|result| result.status == crate::model::WorkerStatus::Failed)
+        .count();
+    let apply_status = manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.status)
+        .unwrap_or(ApplyStatus::Skipped);
+    let review_gate = manifest
+        .apply_result
+        .as_ref()
+        .and_then(|item| item.review_gate)
+        .or_else(|| latest_reviewer_gate(manifest));
+    let trust_level = manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.trust_level)
+        .unwrap_or(TrustLevel::Low);
+    let scope_drift = manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.scope_drift)
+        .unwrap_or(ScopeDrift::None);
+    let accepted_files = manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.accepted_files.clone())
+        .unwrap_or_default();
+    let manual_review_files = manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.manual_review_files.clone())
+        .unwrap_or_default();
+    let rejected_files = manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.rejected_files.clone())
+        .unwrap_or_default();
+    let verified_capabilities = manifest
+        .verification_report
+        .as_ref()
+        .map(|item| item.verified_capabilities.clone())
+        .unwrap_or_default();
+    let blocked_verifications = manifest
+        .verification_report
+        .as_ref()
+        .map(|item| item.blocked_verifications.clone())
+        .unwrap_or_default();
+    let open_risks = collect_open_risks(manifest);
+    let result_status = if failed_workers > 0 || matches!(apply_status, ApplyStatus::SyncFailed) {
+        ResultStatus::Failed
+    } else if !manual_review_files.is_empty()
+        || !rejected_files.is_empty()
+        || !blocked_verifications.is_empty()
+        || matches!(
+            apply_status,
+            ApplyStatus::Bundled | ApplyStatus::VerificationFailed
+        )
+        || manifest.apply_mode == crate::model::ApplyMode::None
+    {
+        ResultStatus::CompletedWithManualReview
+    } else {
+        ResultStatus::Completed
+    };
+
+    FinalSummary {
+        overview: format!(
+            "本次运行共调度 {} 个节点，成功 {} 个、失败 {} 个；apply 状态为 `{}`，可信度为 `{}`，范围漂移为“{}”。",
+            manifest.worker_results.len(),
+            success,
+            failed_workers,
+            apply_status,
+            trust_level.label(),
+            scope_drift.label()
+        ),
+        result_status,
+        review_gate,
+        apply_status,
+        trust_level,
+        accepted_files,
+        manual_review_files,
+        rejected_files,
+        verified_capabilities,
+        blocked_verifications,
+        open_risks,
+        recommended_next_action: recommended_next_actions(manifest, result_status),
+        used_fallback: false,
+    }
+}
+
+fn detect_conflicts(manifest: &SessionManifest) -> Vec<String> {
+    let mut touched_by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+    for result in &manifest.worker_results {
+        for file in &result.changed_files {
+            touched_by_file
+                .entry(file.as_str())
+                .or_default()
+                .push(result.agent_id.as_str());
+        }
+    }
+
+    let mut conflicts = touched_by_file
+        .into_iter()
+        .filter_map(|(file, workers)| {
+            if workers.len() > 1 {
+                Some(format!(
+                    "文件 `{file}` 被多个 worker 触达：{}",
+                    workers.join("、")
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(apply_result) = &manifest.apply_result {
+        conflicts.extend(apply_result.conflicts.clone());
+    }
+
+    conflicts
+}
+
+fn collect_open_risks(manifest: &SessionManifest) -> Vec<String> {
+    let mut risks = manifest
+        .worker_results
+        .iter()
+        .filter(|result| result.status == crate::model::WorkerStatus::Failed)
+        .map(|result| {
+            format!(
+                "{} 执行失败：{}",
+                result.agent_id,
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "未知错误".to_string())
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(report) = &manifest.verification_report {
+        risks.extend(
+            report
+                .failed_capabilities
+                .iter()
+                .map(|item| format!("验证失败：{item}")),
+        );
+    }
+
+    risks.extend(detect_conflicts(manifest));
+    risks.sort();
+    risks.dedup();
+    if risks.is_empty() {
+        risks.push("未发现必须立即阻断的开放风险。".to_string());
+    }
+    risks
+}
+
+fn recommended_next_actions(
+    manifest: &SessionManifest,
+    result_status: ResultStatus,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    match manifest.apply_mode {
+        crate::model::ApplyMode::None => {
+            actions.push(
+                format!(
+                    "先阅读 `{}`
+，按 accepted/manual/rejected 三类清单做人工接收。",
+                    manifest.summary_markdown_path.display()
+                )
+                .replace('\n', ""),
+            );
+        }
+        crate::model::ApplyMode::AutoSafe => {
+            if matches!(result_status, ResultStatus::Completed) {
+                actions.push("可直接检查目标工作区 diff 并继续提交。".to_string());
+            } else {
+                actions.push("先处理人工复核文件与开放风险，再决定是否重跑 run。".to_string());
+            }
+        }
+        crate::model::ApplyMode::Bundle => {
+            actions.push("检查 bundle/patch 输出，选择需要人工接收的文件。".to_string());
+        }
+    }
+    actions.push(format!(
+        "查看应用报告：`{}`",
+        manifest.apply_result_path.display()
+    ));
+    actions.push(format!(
+        "查看验证报告：`{}`",
+        manifest.verification_report_path.display()
+    ));
+    actions
+}
+
+fn latest_reviewer_gate(manifest: &SessionManifest) -> Option<ApplyDecision> {
+    manifest
+        .worker_results
+        .iter()
+        .filter(|result| result.role == "reviewer")
+        .filter_map(|result| {
+            result
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.apply_decision)
+        })
+        .next_back()
+}
+
+fn task_fingerprint(config: &SessionConfig, graph: &ExecutionGraph) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.task.hash(&mut hasher);
+    config.role_set.hash(&mut hasher);
+    config.workers.hash(&mut hasher);
+    graph.summary.hash(&mut hasher);
+    for node in &graph.nodes {
+        node.id.hash(&mut hasher);
+        node.role.hash(&mut hasher);
+        node.title.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn fallback_role_order(workers: usize, available: &HashSet<&str>) -> Vec<String> {
+    let workers = workers.max(1);
+    let mut roles = match workers {
+        1 => vec!["implementer".to_string()],
+        2 => vec!["architect".to_string(), "implementer".to_string()],
+        3 => vec![
+            "architect".to_string(),
+            "implementer".to_string(),
+            "reviewer".to_string(),
+        ],
+        _ => vec![
+            "architect".to_string(),
+            "implementer".to_string(),
+            "tester".to_string(),
+            "reviewer".to_string(),
+        ],
+    };
+
+    while roles.len() < workers {
+        roles.push("implementer".to_string());
+    }
+
+    roles
+        .into_iter()
+        .filter(|role| available.contains(role.as_str()))
+        .collect()
+}
+
+fn fallback_title(role: &str, count: usize) -> String {
+    match role {
+        "architect" => "执行图拆解与关键路径梳理".to_string(),
+        "implementer" if count == 1 => "核心实现与模块装配".to_string(),
+        "implementer" => format!("实现分队 {count}"),
+        "tester" => "验证路径与测试补强".to_string(),
+        "reviewer" => "集成审阅与风险挑战".to_string(),
+        _ => format!("通用任务 {count}"),
+    }
+}
+
+fn fallback_objective(role: &str, count: usize, task: &str) -> String {
+    match role {
+        "architect" => {
+            format!("围绕 `{task}` 梳理执行图、handoff 契约与应用前 gate。")
+        }
+        "implementer" if count == 1 => {
+            format!("围绕 `{task}` 完成主干实现，让系统尽快形成可运行版本。")
+        }
+        "implementer" => {
+            format!("围绕 `{task}` 的剩余子模块补足实现细节，并减少与主干实现冲突。")
+        }
+        "tester" => format!("围绕 `{task}` 设计最小可信验证，补充测试或验证性改动。"),
+        "reviewer" => format!("围绕 `{task}` 做应用前集成审阅，指出冲突、遗漏和风险。"),
+        _ => task.to_string(),
+    }
+}
+
+fn fallback_deliverables(role: &str) -> Vec<String> {
+    match role {
+        "architect" => vec![
+            "执行图节点与依赖建议".to_string(),
+            "handoff 契约建议".to_string(),
+            "集成风险说明".to_string(),
+        ],
+        "implementer" => vec![
+            "直接可用的代码改动".to_string(),
+            "结构化 handoff".to_string(),
+            "未覆盖风险".to_string(),
+        ],
+        "tester" => vec![
+            "验证方案".to_string(),
+            "测试或 smoke check".to_string(),
+            "剩余未验证点".to_string(),
+        ],
+        "reviewer" => vec![
+            "findings 清单".to_string(),
+            "是否允许应用的判断".to_string(),
+            "修正建议".to_string(),
+        ],
+        _ => vec!["结果摘要".to_string()],
+    }
+}
+
+fn fallback_dependencies(role: &str) -> Vec<String> {
+    match role {
+        "implementer" => vec!["architect-1".to_string()],
+        "tester" => vec!["implementer-1".to_string()],
+        "reviewer" => vec!["implementer-1".to_string(), "tester-1".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn fallback_focus(role: &str, count: usize) -> String {
+    match role {
+        "architect" => "先定义图结构、handoff 契约与优先级，再指导实现。".to_string(),
+        "implementer" if count == 1 => "聚焦 CLI 主链路、编排器与核心运行能力。".to_string(),
+        "implementer" => "聚焦次级子模块，减少与主实现冲突。".to_string(),
+        "tester" => "聚焦最小可信验证、错误处理与失败路径。".to_string(),
+        "reviewer" => "聚焦应用前 gate、冲突与质量风险。".to_string(),
+        _ => "聚焦可执行落地。".to_string(),
+    }
+}
+
+fn fallback_inputs(role: &str) -> Vec<String> {
+    match role {
+        "architect" => vec!["仓库摘要".to_string(), "全局任务".to_string()],
+        "implementer" => vec!["架构 handoff".to_string()],
+        "tester" => vec!["实现 handoff".to_string(), "变更 patch".to_string()],
+        "reviewer" => vec!["实现 handoff".to_string(), "测试 handoff".to_string()],
+        _ => vec![],
+    }
+}
+
+fn fallback_outputs(role: &str) -> Vec<String> {
+    match role {
+        "architect" => vec!["执行图建议".to_string(), "下游实施建议".to_string()],
+        "implementer" => vec!["代码改动".to_string(), "handoff".to_string()],
+        "tester" => vec!["验证报告".to_string(), "回归风险".to_string()],
+        "reviewer" => vec!["findings".to_string(), "应用意见".to_string()],
+        _ => vec!["摘要".to_string()],
+    }
+}
+
+fn fallback_completion(role: &str) -> Vec<String> {
+    match role {
+        "architect" => vec![
+            "依赖关系清晰且可排序".to_string(),
+            "handoff 字段足够支撑下游执行".to_string(),
+        ],
+        "implementer" => vec![
+            "代码改动聚焦当前节点".to_string(),
+            "最终输出含完整 handoff 小节".to_string(),
+        ],
+        "tester" => vec![
+            "至少覆盖一条可信验证路径".to_string(),
+            "明确剩余未验证风险".to_string(),
+        ],
+        "reviewer" => vec![
+            "给出应用前结论".to_string(),
+            "指出关键冲突或确认可集成".to_string(),
+        ],
+        _ => vec!["形成可消费结果".to_string()],
+    }
+}
+
+fn ensure_reviewer_gate(nodes: &mut Vec<ExecutionNode>, roles: &[RoleConfig]) {
+    if nodes.iter().any(|node| node.role == "reviewer") {
+        return;
+    }
+    if !roles.iter().any(|role| role.key == "reviewer") {
+        return;
+    }
+
+    let dependencies = nodes
+        .iter()
+        .filter(|node| node.role != "architect")
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+
+    nodes.push(ExecutionNode {
+        id: "reviewer-1".to_string(),
+        title: "默认集成审阅关卡".to_string(),
+        role: "reviewer".to_string(),
+        objective: "在自动应用前，基于 handoff 与 patch 进行一次集成审阅，指出冲突和回归风险。"
+            .to_string(),
+        deliverables: vec![
+            "findings 清单".to_string(),
+            "应用建议".to_string(),
+            "剩余风险".to_string(),
+        ],
+        dependencies,
+        prompt_focus: "优先找问题，判断是否适合进入 apply 阶段。".to_string(),
+        input_artifacts: vec!["所有上游 handoff".to_string(), "所有候选 patch".to_string()],
+        output_artifacts: vec!["reviewer handoff".to_string()],
+        completion_criteria: vec![
+            "明确给出应用意见".to_string(),
+            "指出冲突、重复和遗漏".to_string(),
+        ],
+        allow_code_changes: false,
+        expected_artifacts: vec!["reviewer handoff".to_string()],
+        required_verifications: vec!["检查范围漂移与冲突".to_string()],
+        scope_guard_ref: None,
+        acceptable_drift: ScopeDrift::None,
+    });
+}
+
+fn normalize_dependencies(nodes: &mut [ExecutionNode]) -> Result<()> {
+    let mut alias_map = HashMap::<String, Vec<String>>::new();
+    let mut role_map = HashMap::<String, Vec<String>>::new();
+
+    for node in nodes.iter() {
+        push_alias(&mut alias_map, &node.id, &node.id);
+        push_alias(&mut alias_map, &node.title, &node.id);
+        let title_slug = slugify(&node.title);
+        if !title_slug.is_empty() {
+            push_alias(&mut alias_map, &title_slug, &node.id);
+        }
+        role_map
+            .entry(node.role.clone())
+            .or_default()
+            .push(node.id.clone());
+    }
+
+    for node in nodes.iter_mut() {
+        let raw_dependencies = node.dependencies.clone();
+        let mut normalized = Vec::new();
+        for dep in raw_dependencies {
+            let resolved = resolve_dependency(&dep, &alias_map, &role_map)?;
+            if resolved == node.id {
+                anyhow::bail!("节点 `{}` 依赖自身：`{dep}`", node.id);
+            }
+            if !normalized.contains(&resolved) {
+                normalized.push(resolved);
+            }
+        }
+        node.dependencies = normalized;
+    }
+
+    Ok(())
+}
+
+fn drop_invalid_dependencies(nodes: &mut [ExecutionNode]) {
+    let existing = nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    for node in nodes {
+        node.dependencies.retain(|dep| existing.contains(dep));
+    }
+}
+
+fn resolve_dependency(
+    raw: &str,
+    alias_map: &HashMap<String, Vec<String>>,
+    role_map: &HashMap<String, Vec<String>>,
+) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("planner 产生了空依赖");
+    }
+
+    let normalized = slugify(trimmed);
+    let candidates = alias_map
+        .get(trimmed)
+        .or_else(|| alias_map.get(&normalized))
+        .cloned()
+        .or_else(|| role_map.get(trimmed).filter(|ids| ids.len() == 1).cloned())
+        .ok_or_else(|| anyhow::anyhow!("planner 依赖 `{trimmed}` 无法解析到节点 id"))?;
+
+    if candidates.len() != 1 {
+        anyhow::bail!(
+            "planner 依赖 `{trimmed}` 映射到多个节点：{}",
+            candidates.join("、")
+        );
+    }
+
+    Ok(candidates[0].clone())
+}
+
+fn resolve_plan_todo_dependency(
+    raw: &str,
+    alias_map: &HashMap<String, Vec<String>>,
+) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("todo 产生了空依赖");
+    }
+
+    let normalized = slugify(trimmed);
+    let candidates = alias_map
+        .get(trimmed)
+        .or_else(|| alias_map.get(&normalized))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("todo 依赖 `{trimmed}` 无法解析到节点 id"))?;
+
+    if candidates.len() != 1 {
+        anyhow::bail!(
+            "todo 依赖 `{trimmed}` 映射到多个节点：{}",
+            candidates.join("、")
+        );
+    }
+
+    Ok(candidates[0].clone())
+}
+
+fn push_alias(alias_map: &mut HashMap<String, Vec<String>>, alias: &str, node_id: &str) {
+    let key = alias.trim();
+    if key.is_empty() {
+        return;
+    }
+    let entry = alias_map.entry(key.to_string()).or_default();
+    if !entry.iter().any(|item| item == node_id) {
+        entry.push(node_id.to_string());
+    }
+}
+
+fn slugify(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect()
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max {
+        trimmed.to_string()
+    } else {
+        format!("{}...", trimmed.chars().take(max).collect::<String>())
+    }
+}
+
+fn summarize_error(text: &str) -> String {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !is_error_noise_line(line))
+        .collect::<Vec<_>>();
+
+    let mut preferred = lines
+        .iter()
+        .copied()
+        .filter(|line| is_preferred_error_line(line))
+        .map(normalize_error_line)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    preferred.dedup();
+
+    if !preferred.is_empty() {
+        return truncate(&preferred.join("；"), 220);
+    }
+
+    let fallback = lines
+        .into_iter()
+        .map(normalize_error_line)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| text.trim().to_string());
+    truncate(&fallback, 220)
+}
+
+fn is_error_noise_line(line: &str) -> bool {
+    matches!(
+        line,
+        "user" | "assistant" | "mcp startup: no servers" | "--------"
+    ) || line.starts_with("OpenAI Codex v")
+        || line.starts_with("workdir:")
+        || line.starts_with("model:")
+        || line.starts_with("provider:")
+        || line.starts_with("approval:")
+        || line.starts_with("sandbox:")
+        || line.starts_with("reasoning effort:")
+        || line.starts_with("reasoning summaries:")
+        || line.starts_with("session id:")
+        || line.starts_with("全局任务：")
+        || line.starts_with("目标仓库：")
+        || line.starts_with("技术栈：")
+        || line.starts_with("期望 worker 数量上限：")
+        || line.starts_with("角色集合：")
+        || line.starts_with("默认应用模式：")
+        || line.starts_with("可用角色：")
+        || line.starts_with("仓库摘要：")
+        || line.starts_with("规划要求：")
+        || line.starts_with("你现在是 codex-forge")
+        || line.starts_with("请只输出符合 schema")
+        || line.starts_with('#')
+        || line.starts_with("```")
+        || line.starts_with("- ")
+}
+
+fn is_preferred_error_line(line: &str) -> bool {
+    line.starts_with("ERROR:")
+        || line.starts_with("Warning:")
+        || line.contains("unexpected status")
+        || line.contains("调用失败")
+        || line.contains("解析失败")
+        || line.contains("结果不可用")
+        || line.contains("缺少结果文件")
+        || line.contains("Operation not permitted")
+        || line.contains("Permission denied")
+        || line.contains("os error")
+        || line.contains("fatal:")
+}
+
+fn normalize_error_line(line: &str) -> String {
+    let normalized = line
+        .trim_start_matches("ERROR:")
+        .trim_start_matches("Warning:")
+        .trim_start_matches("Codex 结构化调用失败：")
+        .trim();
+
+    if normalized.starts_with("OpenAI Codex v") {
+        return String::new();
+    }
+
+    if let Some(index) = normalized.find("unexpected status") {
+        return normalized[index..]
+            .trim()
+            .split(", cf-ray:")
+            .next()
+            .unwrap_or(normalized)
+            .trim()
+            .trim_end_matches(')')
+            .trim()
+            .to_string();
+    }
+    if let Some(index) = normalized.find("os error") {
+        return normalized[index..].trim().to_string();
+    }
+    if let Some(index) = normalized.find("fatal:") {
+        return normalized[index..].trim().to_string();
+    }
+    if let Some(index) = normalized.find("Operation not permitted") {
+        return normalized[index..].trim().to_string();
+    }
+    if let Some(index) = normalized.find("Permission denied") {
+        return normalized[index..].trim().to_string();
+    }
+
+    normalized.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PlanTodoOutput, PlanTodoOutputItem, PlannerNode, PlannerOutput, fallback_plan,
+        normalize_plan, normalize_plan_todo, summarize_error,
+    };
+    use crate::model::{ApplyMode, SessionConfig, UiMode};
+    use crate::roles::resolve_role_set;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn fallback_plan_respects_worker_count() {
+        let config = SessionConfig {
+            task: "实现多 agent CLI".to_string(),
+            workers: 3,
+            role_set: "core".to_string(),
+            model: None,
+            ui_mode: UiMode::Minimal,
+            target_dir: PathBuf::from("."),
+            cleanup_success: false,
+            apply_mode: ApplyMode::AutoSafe,
+            max_retries: 1,
+            fail_fast: false,
+            verification_commands: vec!["cargo test".to_string()],
+            config_path: None,
+            plan_only: false,
+        };
+        let roles = resolve_role_set("core", &HashMap::new());
+        let graph = fallback_plan(&config, &roles, Vec::new()).expect("fallback graph");
+        assert!(graph.nodes.len() >= 3);
+        assert!(graph.topological_order().is_ok());
+    }
+
+    #[test]
+    fn normalize_plan_resolves_title_dependencies() {
+        let roles = resolve_role_set("core", &HashMap::new());
+        let graph = normalize_plan(
+            PlannerOutput {
+                summary: "x".to_string(),
+                strategy: "y".to_string(),
+                nodes: vec![
+                    PlannerNode {
+                        title: "架构设计".to_string(),
+                        role: "architect".to_string(),
+                        objective: "拆解".to_string(),
+                        deliverables: vec![],
+                        dependencies: vec![],
+                        prompt_focus: "聚焦拆解".to_string(),
+                        input_artifacts: vec![],
+                        output_artifacts: vec![],
+                        completion_criteria: vec![],
+                    },
+                    PlannerNode {
+                        title: "实现主干".to_string(),
+                        role: "implementer".to_string(),
+                        objective: "实现".to_string(),
+                        deliverables: vec![],
+                        dependencies: vec!["架构设计".to_string()],
+                        prompt_focus: "聚焦实现".to_string(),
+                        input_artifacts: vec![],
+                        output_artifacts: vec![],
+                        completion_criteria: vec![],
+                    },
+                ],
+            },
+            &roles,
+            2,
+            Vec::new(),
+        )
+        .expect("normalized graph");
+
+        let implementer = graph
+            .nodes
+            .iter()
+            .find(|node| node.role == "implementer")
+            .expect("implementer");
+        assert_eq!(implementer.dependencies, vec!["architect-1".to_string()]);
+    }
+
+    #[test]
+    fn normalize_plan_todo_resolves_title_dependencies() {
+        let plan_todo = normalize_plan_todo(PlanTodoOutput {
+            summary: "x".to_string(),
+            approach: "y".to_string(),
+            risks: vec![],
+            todos: vec![
+                PlanTodoOutputItem {
+                    title: "明确范围".to_string(),
+                    goal: "澄清任务".to_string(),
+                    details: vec![],
+                    dependencies: vec![],
+                    completion_criteria: vec![],
+                },
+                PlanTodoOutputItem {
+                    title: "实现主干".to_string(),
+                    goal: "实现功能".to_string(),
+                    details: vec![],
+                    dependencies: vec!["明确范围".to_string()],
+                    completion_criteria: vec![],
+                },
+            ],
+        })
+        .expect("todo should normalize");
+
+        assert_eq!(plan_todo.todos[1].dependencies, vec!["todo-1".to_string()]);
+    }
+
+    #[test]
+    fn summarize_error_filters_prompt_noise() {
+        let error = "OpenAI Codex v0.115.0 (research preview)\nworkdir: /tmp/demo\nuser\n全局任务：做个博客\nReconnecting... 1/5 (unexpected status 502 Bad Gateway)\nERROR: unexpected status 502 Bad Gateway";
+        assert_eq!(summarize_error(error), "unexpected status 502 Bad Gateway");
+    }
+}
