@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use walkdir::WalkDir;
 
+use crate::model::WorkerResult;
+
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 #[derive(Debug, Clone)]
@@ -203,6 +205,35 @@ pub async fn apply_patch_file_for_paths(
 ) -> Result<()> {
     run_git_apply_with_filters(target_dir, patch_path, included_paths, true).await?;
     run_git_apply_with_filters(target_dir, patch_path, included_paths, false).await
+}
+
+pub async fn materialize_dependency_patches(
+    target_dir: &Path,
+    dependency_results: &[&WorkerResult],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut applied = Vec::new();
+    let mut failed = Vec::new();
+
+    for result in dependency_results {
+        let Some(diff_path) = result.diff_path.as_ref() else {
+            continue;
+        };
+        if !diff_path.exists() {
+            continue;
+        }
+        let metadata = fs::metadata(diff_path)
+            .with_context(|| format!("读取依赖 patch 元数据失败：{}", diff_path.display()))?;
+        if metadata.len() == 0 {
+            continue;
+        }
+
+        match apply_patch_file(target_dir, diff_path).await {
+            Ok(()) => applied.push(result.agent_id.clone()),
+            Err(error) => failed.push(format!("{}: {}", result.agent_id, error)),
+        }
+    }
+
+    Ok((applied, failed))
 }
 
 pub async fn run_git_with_path<I, S>(cwd: &Path, args: I, path: &Path) -> Result<()>

@@ -15,7 +15,7 @@ use crate::repo::discover_repo;
 use crate::roles::{find_role, render_worker_prompt};
 use crate::session::{SessionContext, find_reusable_plan_session};
 use crate::ui::UiController;
-use crate::worktree::{WorktreeManager, git_is_clean};
+use crate::worktree::{WorktreeManager, git_is_clean, materialize_dependency_patches};
 
 pub async fn plan_session(
     config: SessionConfig,
@@ -387,6 +387,41 @@ async fn schedule_graph(
             let worktree_path = manager.create(&node.id).await?;
             let role = find_role(roles, &node.role)
                 .with_context(|| format!("未找到角色模板：{}", node.role))?;
+            let dependency_results = node
+                .dependencies
+                .iter()
+                .filter_map(|dep| result_by_id.get(dep))
+                .collect::<Vec<_>>();
+            if !node.allow_code_changes {
+                let (materialized, materialize_failures) =
+                    materialize_dependency_patches(&worktree_path, &dependency_results).await?;
+                if !materialized.is_empty() {
+                    record_event(
+                        session,
+                        ui,
+                        RuntimeEvent::CommanderNote {
+                            message: format!(
+                                "已为 `{}` 预铺依赖 patch：{}",
+                                node.id,
+                                materialized.join("、")
+                            ),
+                        },
+                    )?;
+                }
+                if !materialize_failures.is_empty() {
+                    record_event(
+                        session,
+                        ui,
+                        RuntimeEvent::CommanderNote {
+                            message: format!(
+                                "为 `{}` 预铺依赖 patch 时有冲突，交由下游节点审阅：{}",
+                                node.id,
+                                materialize_failures.join("；")
+                            ),
+                        },
+                    )?;
+                }
+            }
             let upstream_handoffs = node
                 .dependencies
                 .iter()

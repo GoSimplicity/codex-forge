@@ -178,6 +178,12 @@ elif [ "$agent_id" = "reviewer-1" ]; then
   decision="allow"
   if [ "$case_name" = "reviewer-block" ]; then
     decision="block"
+  elif [ "$case_name" = "reviewer-needs-materialized" ]; then
+    if grep -q "from implementer 1" file-a.txt; then
+      decision="allow"
+    else
+      decision="block"
+    fi
   fi
   cat > "$output" <<EOF
 # 交付摘要
@@ -433,6 +439,38 @@ fn reviewer_block_stops_auto_apply() {
 
     let file_a = fs::read_to_string(repo.path().join("file-a.txt")).expect("read file-a");
     assert_eq!(file_a, "alpha\n");
+}
+
+#[test]
+fn reviewer_receives_materialized_dependency_changes() {
+    let repo = make_repo("reviewer-needs-materialized");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let output = command(bin, repo.path())
+        .args([
+            "run",
+            "reviewer 应看到上游候选改动",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run forge");
+    assert!(output.status.success(), "{:?}", output);
+
+    let manifest = load_manifest(repo.path());
+    assert_eq!(manifest["apply_result"]["status"], "applied");
+    assert_eq!(manifest["apply_result"]["review_gate"], "allow_full");
+    assert_eq!(
+        manifest["final_summary"]["open_risks"]
+            .as_array()
+            .expect("open risks"),
+        &vec![Value::String("未发现必须立即阻断的开放风险。".to_string())]
+    );
+
+    let file_a = fs::read_to_string(repo.path().join("file-a.txt")).expect("read file-a");
+    assert!(file_a.contains("from implementer 1"));
 }
 
 #[test]

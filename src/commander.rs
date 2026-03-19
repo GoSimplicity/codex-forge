@@ -866,8 +866,25 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
 }
 
 fn detect_conflicts(manifest: &SessionManifest) -> Vec<String> {
+    let node_allow_map = manifest
+        .execution_graph
+        .as_ref()
+        .map(|graph| {
+            graph
+                .nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.allow_code_changes))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut touched_by_file: HashMap<&str, Vec<&str>> = HashMap::new();
     for result in &manifest.worker_results {
+        if node_allow_map
+            .get(result.agent_id.as_str())
+            .is_some_and(|allow| !allow)
+        {
+            continue;
+        }
         for file in &result.changed_files {
             touched_by_file
                 .entry(file.as_str())
