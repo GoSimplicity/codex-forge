@@ -593,6 +593,22 @@ pub fn parse_handoff(
     let handoff_section = sections.get("交接").map(String::as_str).unwrap_or_default();
     let apply_decision = parse_apply_decision(handoff_section);
     let downstream_suggestions = split_non_decision_lines(handoff_section);
+    let blocking_findings = collect_prefixed_lines(
+        handoff_section,
+        &["BLOCKING_FINDING:", "blocking_finding:"],
+    );
+    let accepted_scopes = collect_prefixed_lines(
+        handoff_section,
+        &["ACCEPT_SCOPE:", "accept_scope:"],
+    );
+    let rejected_scopes = collect_prefixed_lines(
+        handoff_section,
+        &["REJECT_SCOPE:", "reject_scope:"],
+    );
+    let confidence_reasoning = collect_prefixed_value(
+        handoff_section,
+        &["CONFIDENCE_REASONING:", "confidence_reasoning:"],
+    );
 
     Some(HandoffArtifact {
         agent_id: agent_id.to_string(),
@@ -611,6 +627,10 @@ pub fn parse_handoff(
             sections.get("验证").map(String::as_str).unwrap_or_default(),
         ),
         scope_exceptions: Vec::new(),
+        blocking_findings,
+        accepted_scopes,
+        rejected_scopes,
+        confidence_reasoning,
     })
 }
 
@@ -651,10 +671,56 @@ fn split_non_decision_lines(text: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter(|line| parse_apply_decision_line(line).is_none())
+        .filter(|line| !has_prefixed_marker(line))
         .map(|line| line.trim_start_matches('-').trim())
         .filter(|line| !line.is_empty() && *line != "无")
         .map(|line| line.to_string())
         .collect()
+}
+
+fn collect_prefixed_lines(text: &str, prefixes: &[&str]) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let normalized = line.trim_start_matches('-').trim();
+            prefixes.iter().find_map(|prefix| {
+                normalized
+                    .strip_prefix(prefix)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+            })
+        })
+        .collect()
+}
+
+fn collect_prefixed_value(text: &str, prefixes: &[&str]) -> Option<String> {
+    text.lines().find_map(|line| {
+        let normalized = line.trim().trim_start_matches('-').trim();
+        prefixes.iter().find_map(|prefix| {
+            normalized
+                .strip_prefix(prefix)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
+    })
+}
+
+fn has_prefixed_marker(line: &str) -> bool {
+    let normalized = line.trim().trim_start_matches('-').trim();
+    [
+        "BLOCKING_FINDING:",
+        "blocking_finding:",
+        "ACCEPT_SCOPE:",
+        "accept_scope:",
+        "REJECT_SCOPE:",
+        "reject_scope:",
+        "CONFIDENCE_REASONING:",
+        "confidence_reasoning:",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
 }
 
 fn parse_apply_decision(text: &str) -> Option<ApplyDecision> {
@@ -790,6 +856,29 @@ mod tests {
 
         assert_eq!(handoff.apply_decision, Some(ApplyDecision::AllowFull));
         assert_eq!(handoff.downstream_suggestions, vec!["integration 可以继续"]);
+    }
+
+    #[test]
+    fn parses_reviewer_partial_and_block_decision() {
+        let partial = parse_handoff(
+            "reviewer-1",
+            "reviewer",
+            "集成审阅",
+            "# 交付摘要\n部分放行\n# 变更清单\n- 无\n# 风险\n- 需要人工复核\n# 验证\n- 检查 handoff\n# 交接\n- APPLY_DECISION: allow_partial\n- 仅放行安全文件",
+            &[],
+        )
+        .expect("partial handoff");
+        assert_eq!(partial.apply_decision, Some(ApplyDecision::AllowPartial));
+
+        let block = parse_handoff(
+            "reviewer-1",
+            "reviewer",
+            "集成审阅",
+            "# 交付摘要\n阻止应用\n# 变更清单\n- 无\n# 风险\n- 存在阻断问题\n# 验证\n- 检查 handoff\n# 交接\n- APPLY_DECISION: block\n- 先修复阻断项",
+            &[],
+        )
+        .expect("block handoff");
+        assert_eq!(block.apply_decision, Some(ApplyDecision::Block));
     }
 
     #[test]

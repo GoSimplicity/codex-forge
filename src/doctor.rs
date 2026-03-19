@@ -1,50 +1,114 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use tokio::process::Command;
+use anyhow::Result;
 
 use crate::config::LoadedProjectConfig;
-use crate::model::{ApplyMode, CheckStatus, DoctorCheck, DoctorReport};
+use crate::model::{ApplyMode, CheckStatus, DoctorCheck, DoctorReadiness, DoctorReport};
 use crate::repo::discover_repo;
+use crate::resources::{ResourceCatalog, resolve_role_set};
 use crate::verify::extract_first_command;
+use crate::workspace::describe_git_readiness;
 use crate::worktree::{WorktreeManager, git_is_clean};
 
 pub async fn run_doctor(
     target_dir: &Path,
     project_config: &LoadedProjectConfig,
+    resources: &ResourceCatalog,
     apply_mode: Option<ApplyMode>,
+    demo_mode: bool,
 ) -> Result<DoctorReport> {
-    let repo = discover_repo(target_dir)?;
+    let repo = discover_repo(target_dir).ok();
     let effective_apply_mode = apply_mode.unwrap_or(project_config.settings.apply_mode);
     let mut checks = Vec::new();
 
     checks.push(check_codex().await);
-    checks.push(check_git_repo(&repo.repo_root).await?);
-    checks.push(check_worktree(&repo.repo_root).await);
+    checks.push(check_git_repo(target_dir).await?);
+    if let Some(repo) = &repo {
+        checks.push(check_worktree(&repo.repo_root).await);
+    } else {
+        checks.push(DoctorCheck {
+            name: "git worktree".to_string(),
+            status: CheckStatus::Skipped,
+            detail: "当前目录还不是 Git 仓库；run/plan 时会先自动 git init。".to_string(),
+        });
+    }
     checks.push(check_config(project_config));
+    checks.push(check_resources(
+        resources,
+        &project_config.settings.role_set,
+    ));
     checks.push(check_verification_commands(&project_config.settings.verification_commands).await);
 
     if matches!(effective_apply_mode, ApplyMode::AutoSafe) {
-        let clean = git_is_clean(&repo.repo_root).await?;
-        checks.push(DoctorCheck {
-            name: "目标工作区状态".to_string(),
-            status: if clean {
-                CheckStatus::Passed
-            } else {
-                CheckStatus::Failed
-            },
-            detail: if clean {
-                "目标工作区干净，适合自动应用。".to_string()
-            } else {
-                "目标工作区存在未提交改动，auto-safe 同步前建议先清理。".to_string()
-            },
-        });
+        if let Some(repo) = &repo {
+            let clean = git_is_clean(&repo.repo_root).await?;
+            checks.push(DoctorCheck {
+                name: "目标工作区状态".to_string(),
+                status: if clean {
+                    CheckStatus::Passed
+                } else {
+                    CheckStatus::Failed
+                },
+                detail: if clean {
+                    "目标工作区干净，适合自动应用。".to_string()
+                } else {
+                    "目标工作区存在未提交改动，auto-safe 同步前建议先清理。".to_string()
+                },
+            });
+        } else {
+            checks.push(DoctorCheck {
+                name: "目标工作区状态".to_string(),
+                status: CheckStatus::Skipped,
+                detail: "非 Git 目录将先自动初始化仓库，然后再进入 auto-safe 流程。".to_string(),
+            });
+        }
     }
 
-    let ok = checks
+    let failed = checks
         .iter()
-        .all(|check| check.status != CheckStatus::Failed);
-    Ok(DoctorReport { checks, ok })
+        .filter(|check| check.status == CheckStatus::Failed)
+        .count();
+    let skipped = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Skipped)
+        .count();
+    let ok = failed == 0;
+    let readiness = if failed > 0 {
+        DoctorReadiness::Red
+    } else if skipped > 0 {
+        DoctorReadiness::Yellow
+    } else {
+        DoctorReadiness::Green
+    };
+    let summary = if demo_mode {
+        match readiness {
+            DoctorReadiness::Green => "适合现场跑黄金路径 demo。".to_string(),
+            DoctorReadiness::Yellow => "可演示，但建议先处理可预见阻塞项。".to_string(),
+            DoctorReadiness::Red => "当前不适合直接 demo，建议先修复红灯项。".to_string(),
+        }
+    } else if ok {
+        "运行前检查通过。".to_string()
+    } else {
+        "存在阻塞问题，请先处理失败项。".to_string()
+    };
+
+    Ok(DoctorReport {
+        checks,
+        ok,
+        readiness,
+        summary,
+        demo_mode,
+        recommended_role_set: if demo_mode {
+            "default".to_string()
+        } else {
+            project_config.settings.role_set.clone()
+        },
+        recommended_apply_mode: if demo_mode {
+            ApplyMode::AutoSafe
+        } else {
+            effective_apply_mode
+        },
+    })
 }
 
 async fn check_codex() -> DoctorCheck {
@@ -63,26 +127,15 @@ async fn check_codex() -> DoctorCheck {
 }
 
 async fn check_git_repo(repo_root: &Path) -> Result<DoctorCheck> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .await
-        .context("执行 git rev-parse 失败")?;
-
+    let detail = describe_git_readiness(repo_root)?;
     Ok(DoctorCheck {
         name: "Git 仓库".to_string(),
-        status: if output.status.success() {
+        status: if detail.contains("自动执行 git init") {
+            CheckStatus::Skipped
+        } else {
             CheckStatus::Passed
-        } else {
-            CheckStatus::Failed
         },
-        detail: if output.status.success() {
-            format!("仓库根目录：{}", repo_root.display())
-        } else {
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
-        },
+        detail,
     })
 }
 
@@ -130,6 +183,25 @@ fn check_config(project_config: &LoadedProjectConfig) -> DoctorCheck {
         detail: match &project_config.path {
             Some(path) => format!("配置有效：{}", path.display()),
             None => "未找到项目配置，已使用内置默认值。".to_string(),
+        },
+    }
+}
+
+fn check_resources(resources: &ResourceCatalog, role_set: &str) -> DoctorCheck {
+    match resolve_role_set(resources, role_set) {
+        Ok(roles) => DoctorCheck {
+            name: "资源目录".to_string(),
+            status: CheckStatus::Passed,
+            detail: format!(
+                "role_set `{role_set}` 有效，共 {} 个角色；global 规则来源：{}",
+                roles.len(),
+                resources.rules.global_origin.describe()
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "资源目录".to_string(),
+            status: CheckStatus::Failed,
+            detail: error.to_string(),
         },
     }
 }

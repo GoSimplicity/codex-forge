@@ -39,11 +39,37 @@ impl Display for ApplyMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
+    Preflight,
     Planning,
+    Ready,
     Running,
+    Reviewing,
+    Applying,
+    Verifying,
+    Summarizing,
     Integrating,
     Completed,
+    Blocked,
     Failed,
+}
+
+impl SessionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preflight => "预检中",
+            Self::Planning => "规划中",
+            Self::Ready => "待执行",
+            Self::Running => "执行中",
+            Self::Reviewing => "审阅中",
+            Self::Applying => "应用中",
+            Self::Verifying => "验证中",
+            Self::Summarizing => "总结中",
+            Self::Integrating => "集成中",
+            Self::Completed => "已完成",
+            Self::Blocked => "已阻断",
+            Self::Failed => "失败",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +253,44 @@ impl ResultStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorReadiness {
+    Green,
+    Yellow,
+    Red,
+}
+
+impl DoctorReadiness {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Green => "绿色",
+            Self::Yellow => "黄色",
+            Self::Red => "红色",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionPreset {
+    FeatureDemo,
+}
+
+impl SessionPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FeatureDemo => "feature-demo",
+        }
+    }
+}
+
+impl Display for SessionPreset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub task: String,
@@ -241,7 +305,11 @@ pub struct SessionConfig {
     pub fail_fast: bool,
     pub verification_commands: Vec<String>,
     pub config_path: Option<PathBuf>,
+    pub global_rule_prompt: String,
+    pub reviewer_rule_prompt: Option<String>,
     pub plan_only: bool,
+    pub preset: Option<SessionPreset>,
+    pub resume_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +338,8 @@ pub struct RoleConfig {
 pub struct ExecutionNode {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub todo_id: Option<String>,
     pub role: String,
     pub objective: String,
     pub deliverables: Vec<String>,
@@ -423,6 +493,55 @@ pub struct PlanTodo {
     pub planning_notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    Ready,
+    Running,
+    InReview,
+    Verifying,
+    Applied,
+    Verified,
+    Committed,
+    Failed,
+    Blocked,
+    NeedsManualFollowup,
+}
+
+impl TodoStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "待执行",
+            Self::Ready => "已就绪",
+            Self::Running => "执行中",
+            Self::InReview => "审阅中",
+            Self::Verifying => "验证中",
+            Self::Applied => "已应用",
+            Self::Verified => "已验证",
+            Self::Committed => "已提交",
+            Self::Failed => "失败",
+            Self::Blocked => "阻塞",
+            Self::NeedsManualFollowup => "待人工跟进",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoStateRecord {
+    pub todo_id: String,
+    pub title: String,
+    pub status: TodoStatus,
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+    #[serde(default)]
+    pub completed_node_ids: Vec<String>,
+    #[serde(default)]
+    pub commit_hash: Option<String>,
+    #[serde(default)]
+    pub last_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerLocalVerification {
     pub agent_id: String,
@@ -449,6 +568,14 @@ pub struct HandoffArtifact {
     pub verification_claims: Vec<String>,
     #[serde(default)]
     pub scope_exceptions: Vec<String>,
+    #[serde(default)]
+    pub blocking_findings: Vec<String>,
+    #[serde(default)]
+    pub accepted_scopes: Vec<String>,
+    #[serde(default)]
+    pub rejected_scopes: Vec<String>,
+    #[serde(default)]
+    pub confidence_reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,11 +606,23 @@ pub struct WorkerResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyOperation {
     pub agent_id: String,
+    #[serde(default)]
+    pub todo_id: Option<String>,
     pub patch_path: PathBuf,
     pub order: usize,
     pub touched_files: Vec<String>,
     pub applied: bool,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoCommitRecord {
+    pub todo_id: String,
+    pub title: String,
+    pub status: TodoStatus,
+    pub changed_files: Vec<String>,
+    pub commit_hash: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -524,6 +663,10 @@ pub struct ApplyResult {
     pub manual_review_files: Vec<String>,
     pub rejected_files: Vec<String>,
     pub out_of_scope_files: Vec<String>,
+    #[serde(default)]
+    pub todo_commits: Vec<TodoCommitRecord>,
+    #[serde(default)]
+    pub review_report: Option<ReviewGateReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +704,8 @@ pub struct VerificationReport {
     pub blocked_verifications: Vec<String>,
     pub fallback_verifications: Vec<String>,
     pub overall_status: VerificationOverallStatus,
+    #[serde(default)]
+    pub todo_evidence: Vec<TodoVerificationEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,10 +722,41 @@ pub struct ArtifactManifest {
     pub entries: Vec<ArtifactEntry>,
     pub plan_todo_path: Option<PathBuf>,
     pub execution_contract_path: Option<PathBuf>,
+    pub todo_state_path: Option<PathBuf>,
     pub apply_plan_path: Option<PathBuf>,
     pub apply_result_path: Option<PathBuf>,
     pub verification_report_path: Option<PathBuf>,
     pub change_trust_report_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactIndexEntry {
+    pub key: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewGateReport {
+    pub decision: ApplyDecision,
+    #[serde(default)]
+    pub blocking_findings: Vec<String>,
+    #[serde(default)]
+    pub accepted_scopes: Vec<String>,
+    #[serde(default)]
+    pub rejected_scopes: Vec<String>,
+    #[serde(default)]
+    pub confidence_reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoVerificationEvidence {
+    pub todo_id: String,
+    #[serde(default)]
+    pub verified_capabilities: Vec<String>,
+    #[serde(default)]
+    pub failed_capabilities: Vec<String>,
+    #[serde(default)]
+    pub blocked_verifications: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,7 +773,13 @@ pub struct FinalSummary {
     pub blocked_verifications: Vec<String>,
     pub open_risks: Vec<String>,
     pub recommended_next_action: Vec<String>,
+    #[serde(default)]
+    pub todo_states: Vec<TodoStateRecord>,
     pub used_fallback: bool,
+    #[serde(default)]
+    pub review_report: Option<ReviewGateReport>,
+    #[serde(default)]
+    pub evidence_summary: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,6 +793,11 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
     pub ok: bool,
+    pub readiness: DoctorReadiness,
+    pub summary: String,
+    pub demo_mode: bool,
+    pub recommended_role_set: String,
+    pub recommended_apply_mode: ApplyMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -625,6 +812,13 @@ pub enum RuntimeEvent {
     GraphReady {
         nodes: usize,
         dependencies: usize,
+    },
+    TodoStateChanged {
+        todo_id: String,
+        title: String,
+        status: TodoStatus,
+        message: String,
+        commit_hash: Option<String>,
     },
     WorkerDispatched {
         agent_id: String,
@@ -648,6 +842,9 @@ pub enum RuntimeEvent {
         mode: ApplyMode,
         operations: usize,
     },
+    ReviewGateReady {
+        report: Box<ReviewGateReport>,
+    },
     ApplyUpdate {
         message: String,
     },
@@ -668,6 +865,13 @@ pub struct RuntimeEventRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEventSummary {
+    pub ts: DateTime<Utc>,
+    pub title: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionManifest {
     pub id: String,
     pub task: String,
@@ -684,7 +888,11 @@ pub struct SessionManifest {
     pub fail_fast: bool,
     pub verification_commands: Vec<String>,
     pub config_path: Option<PathBuf>,
+    #[serde(default)]
+    pub preset: Option<SessionPreset>,
     pub plan_todo: Option<PlanTodo>,
+    #[serde(default)]
+    pub todo_states: Vec<TodoStateRecord>,
     pub execution_graph: Option<ExecutionGraph>,
     pub execution_contract: Option<ExecutionContract>,
     pub worker_results: Vec<WorkerResult>,
@@ -695,6 +903,14 @@ pub struct SessionManifest {
     pub doctor_report: Option<DoctorReport>,
     pub final_summary: Option<FinalSummary>,
     pub reused_plan_session_id: Option<String>,
+    #[serde(default)]
+    pub resumed_from_session_id: Option<String>,
+    #[serde(default)]
+    pub artifact_index: Vec<ArtifactIndexEntry>,
+    #[serde(default)]
+    pub timeline_events: Vec<TimelineEventSummary>,
+    #[serde(default)]
+    pub demo_summary: Vec<String>,
     pub session_dir: PathBuf,
     pub timeline_path: PathBuf,
     pub graph_path: PathBuf,
@@ -738,6 +954,7 @@ mod tests {
         ExecutionNode {
             id: id.to_string(),
             title: id.to_string(),
+            todo_id: None,
             role: "implementer".to_string(),
             objective: "x".to_string(),
             deliverables: vec![],

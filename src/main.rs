@@ -9,10 +9,12 @@ mod model;
 mod orchestrator;
 mod replay;
 mod repo;
+mod resources;
 mod roles;
 mod session;
 mod ui;
 mod verify;
+mod workspace;
 mod worktree;
 
 #[tokio::main]

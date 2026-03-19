@@ -23,13 +23,6 @@ workers = 3
 apply_mode = "auto-safe"
 max_retries = 2
 verification_commands = ["git status --short >/dev/null"]
-
-[roles.reviewer]
-can_edit = false
-working_style = "只审阅，不改代码"
-
-[roles.tester]
-can_edit = false
 "#,
     )
     .expect("write config");
@@ -748,10 +741,18 @@ fn command_with_bin(bin: &str, repo: &Path, bin_dir: &Path) -> Command {
             .and_then(|name| name.to_str())
             .unwrap_or("repo")
     ));
+    let home_dir = std::env::temp_dir().join(format!(
+        "codex-forge-home-{}",
+        repo.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repo")
+    ));
     let _ = fs::create_dir_all(&state_dir);
+    let _ = fs::create_dir_all(&home_dir);
     let path = std::env::var("PATH").expect("PATH");
     cmd.env("PATH", format!("{}:{}", bin_dir.display(), path));
     cmd.env("CODEX_FIXTURE_STATE", state_dir);
+    cmd.env("CODEX_FORGE_HOME", home_dir);
     if let Ok(case_name) = fs::read_to_string(bin_dir.join(".case")) {
         cmd.env("CODEX_FIXTURE_CASE", case_name.trim());
     }
@@ -786,4 +787,70 @@ fn run(dir: &Path, args: &[&str]) {
         .status()
         .expect("run command");
     assert!(status.success(), "command failed: {:?}", args);
+}
+
+#[test]
+fn remembered_target_dir_is_reused_without_repassing_flag() {
+    let repo = make_repo("success");
+    let other = TempDir::new().expect("other cwd");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let first = command(bin, repo.path())
+        .args([
+            "plan",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("first plan");
+    assert!(first.status.success(), "{:?}", first);
+
+    let mut second = command(bin, repo.path());
+    second.current_dir(other.path());
+    let second = second
+        .args(["config", "validate"])
+        .output()
+        .expect("config validate without target");
+    assert!(second.status.success(), "{:?}", second);
+    assert!(String::from_utf8_lossy(&second.stdout).contains("配置有效"));
+}
+
+#[test]
+fn run_creates_local_commits_for_each_todo() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let output = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run forge");
+    assert!(output.status.success(), "{:?}", output);
+
+    let count = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .expect("count commits");
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "3");
+
+    let subjects = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["log", "--pretty=%s", "-2"])
+        .output()
+        .expect("log subjects");
+    let text = String::from_utf8_lossy(&subjects.stdout);
+    assert!(text.contains("todo-1"));
+    assert!(text.contains("todo-2"));
 }

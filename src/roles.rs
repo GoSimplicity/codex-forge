@@ -1,28 +1,7 @@
-use std::collections::HashMap;
-
-use crate::config::RoleOverride;
 use crate::model::{ExecutionNode, HandoffArtifact, RepoSnapshot, RoleConfig, SessionConfig};
-
-pub fn resolve_role_set(name: &str, overrides: &HashMap<String, RoleOverride>) -> Vec<RoleConfig> {
-    let base = match name {
-        "core" => core_role_set(),
-        _ => core_role_set(),
-    };
-
-    base.into_iter()
-        .map(|role| {
-            let key = role.key.clone();
-            apply_override(role, overrides.get(&key))
-        })
-        .collect()
-}
 
 pub fn find_role(roles: &[RoleConfig], name: &str) -> Option<RoleConfig> {
     roles.iter().find(|role| role.key == name).cloned()
-}
-
-pub fn agents_overview() -> Vec<RoleConfig> {
-    core_role_set()
 }
 
 pub fn render_worker_prompt(
@@ -85,20 +64,23 @@ pub fn render_worker_prompt(
     let prompt_preamble = role
         .prompt_preamble
         .clone()
-        .unwrap_or_else(|| "你在 codex-forge V2 中承担一个显式依赖节点。".to_string());
-    let reviewer_gate_rule = if role.key == "reviewer" {
-        "\n- 你是 apply 前的最终 gatekeeper。\n- 必须在 `# 交接` 小节首行输出且只能输出一条决策：`- APPLY_DECISION: allow_full`、`- APPLY_DECISION: allow_partial` 或 `- APPLY_DECISION: block`。\n- 若只建议接收部分文件，必须写 `allow_partial`，并在交接中明确哪些文件需要人工复核。\n- 只有在你确认当前结果适合整体自动应用时才写 `allow_full`；否则根据风险写 `allow_partial` 或 `block`。"
-    } else {
-        "\n- 非 reviewer 节点不要输出 `APPLY_DECISION`。"
-    };
+        .unwrap_or_else(|| "你在 codex-forge V3 中承担一个显式依赖节点。".to_string());
 
+    let global_rules = config.global_rule_prompt.trim();
+    let reviewer_rules = if role.key == "reviewer" {
+        config.reviewer_rule_prompt.as_deref().unwrap_or("").trim()
+    } else {
+        ""
+    };
     format!(
         "{prompt_preamble}\n\
 角色：{}（{}）\n\
 职责：{}\n\
-擅长：{}\n\
+可用 Codex Skills：{}\n\
 工作风格：{}\n\
 编辑权限：{}\n\n\
+全局规则：\n{}\n\n\
+角色专项规则：\n{}\n\n\
 全局任务：{}\n\
 当前节点：{}\n\
 节点目标：{}\n\
@@ -119,7 +101,7 @@ pub fn render_worker_prompt(
 - 不要假设未声明依赖的节点已经完成。\n\
 - 如果遇到阻塞或不确定性，写进风险与交接。\n\
 - 在 `# 交接` 中补充你认为自己实际被授权修改的路径范围、额外越界说明和后续接手建议。\n\
-- reviewer 节点重点挑战集成风险；tester 节点重点验证最小可信路径。{}\n\n\
+- reviewer 节点重点挑战集成风险；tester 节点重点验证最小可信路径。\n\n\
 最终请严格使用以下 Markdown 小节输出：\n\
 # 交付摘要\n\
 # 变更清单\n\
@@ -130,9 +112,23 @@ pub fn render_worker_prompt(
         role.title,
         role.key,
         role.mission,
-        role.skills.join("、"),
+        if role.skills.is_empty() {
+            "无".to_string()
+        } else {
+            role.skills.join("、")
+        },
         role.working_style,
         edit_policy,
+        if global_rules.is_empty() {
+            "无".to_string()
+        } else {
+            global_rules.to_string()
+        },
+        if reviewer_rules.is_empty() {
+            "无".to_string()
+        } else {
+            reviewer_rules.to_string()
+        },
         config.task,
         node.title,
         node.objective,
@@ -146,103 +142,7 @@ pub fn render_worker_prompt(
         repo.display_name,
         stacks,
         repo.top_level_entries.join("、"),
-        reviewer_gate_rule,
     )
-}
-
-fn core_role_set() -> Vec<RoleConfig> {
-    vec![
-        RoleConfig {
-            key: "architect".to_string(),
-            title: "架构师".to_string(),
-            mission: "负责拆解需求、识别模块边界、定义接口与依赖关系。".to_string(),
-            skills: vec![
-                "系统设计".to_string(),
-                "依赖分析".to_string(),
-                "风险识别".to_string(),
-            ],
-            working_style: "先明确图结构、handoff 契约和落地顺序，再给实现建议。".to_string(),
-            can_edit: false,
-            max_concurrency: Some(1),
-            dependency_policy: Some("fan_out".to_string()),
-            prompt_preamble: None,
-        },
-        RoleConfig {
-            key: "implementer".to_string(),
-            title: "实现者".to_string(),
-            mission: "负责把节点目标实现成最小充分代码，并保证与依赖契约一致。".to_string(),
-            skills: vec![
-                "编码实现".to_string(),
-                "工程落地".to_string(),
-                "集成配合".to_string(),
-            ],
-            working_style: "直接改代码，优先修根因，不做与目标无关的重构。".to_string(),
-            can_edit: true,
-            max_concurrency: None,
-            dependency_policy: Some("ready_only".to_string()),
-            prompt_preamble: None,
-        },
-        RoleConfig {
-            key: "tester".to_string(),
-            title: "测试员".to_string(),
-            mission: "负责补齐验证路径、构造失败样例并增强可验证性。".to_string(),
-            skills: vec![
-                "测试设计".to_string(),
-                "失败复现".to_string(),
-                "验证报告".to_string(),
-            ],
-            working_style: "优先最小可信验证；必要时补测试或验证性改动。".to_string(),
-            can_edit: true,
-            max_concurrency: Some(1),
-            dependency_policy: Some("after_impl".to_string()),
-            prompt_preamble: None,
-        },
-        RoleConfig {
-            key: "reviewer".to_string(),
-            title: "审阅者".to_string(),
-            mission: "负责在应用前做集成审阅，优先发现冲突、遗漏与回归风险。".to_string(),
-            skills: vec![
-                "代码审阅".to_string(),
-                "冲突判断".to_string(),
-                "集成收敛".to_string(),
-            ],
-            working_style: "默认只读，先找问题和证据，再给精确修正建议。".to_string(),
-            can_edit: false,
-            max_concurrency: Some(1),
-            dependency_policy: Some("gate_before_apply".to_string()),
-            prompt_preamble: None,
-        },
-    ]
-}
-
-fn apply_override(mut role: RoleConfig, override_item: Option<&RoleOverride>) -> RoleConfig {
-    if let Some(override_item) = override_item {
-        if let Some(title) = &override_item.title {
-            role.title = title.clone();
-        }
-        if let Some(mission) = &override_item.mission {
-            role.mission = mission.clone();
-        }
-        if let Some(skills) = &override_item.skills {
-            role.skills = skills.clone();
-        }
-        if let Some(working_style) = &override_item.working_style {
-            role.working_style = working_style.clone();
-        }
-        if let Some(can_edit) = override_item.can_edit {
-            role.can_edit = can_edit;
-        }
-        if let Some(max_concurrency) = override_item.max_concurrency {
-            role.max_concurrency = Some(max_concurrency);
-        }
-        if let Some(policy) = &override_item.dependency_policy {
-            role.dependency_policy = Some(policy.clone());
-        }
-        if let Some(prompt_preamble) = &override_item.prompt_preamble {
-            role.prompt_preamble = Some(prompt_preamble.clone());
-        }
-    }
-    role
 }
 
 fn render_bullets(items: &[String], empty_text: &str) -> String {
@@ -258,9 +158,11 @@ fn render_bullets(items: &[String], empty_text: &str) -> String {
 }
 
 fn compact(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        text.to_string()
+    let mut chars = text.chars();
+    let preview = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
     } else {
-        format!("{}…", text.chars().take(limit).collect::<String>())
+        preview
     }
 }

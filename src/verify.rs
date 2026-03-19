@@ -7,7 +7,8 @@ use tokio::process::Command;
 
 use crate::model::{
     EnvironmentBlock, VerificationCommandResult, VerificationOverallStatus, VerificationReport,
-    VerificationStatus, WorkerLocalVerification, WorkerResult, WorkerStatus,
+    VerificationStatus, TodoVerificationEvidence, WorkerLocalVerification, WorkerResult,
+    WorkerStatus,
 };
 
 pub async fn run_stage_verification(
@@ -147,6 +148,7 @@ pub fn build_verification_report(
         blocked_verifications,
         fallback_verifications,
         overall_status,
+        todo_evidence: build_todo_evidence(worker_results),
     }
 }
 
@@ -222,6 +224,21 @@ fn classify_environment_block(stdout: &str, stderr: &str) -> Option<(String, Str
         }
     }
     None
+}
+
+fn build_todo_evidence(worker_results: &[WorkerResult]) -> Vec<TodoVerificationEvidence> {
+    worker_results
+        .iter()
+        .filter_map(|result| {
+            let handoff = result.handoff.as_ref()?;
+            Some(TodoVerificationEvidence {
+                todo_id: result.agent_id.clone(),
+                verified_capabilities: handoff.verification.clone(),
+                failed_capabilities: Vec::new(),
+                blocked_verifications: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

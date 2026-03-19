@@ -14,7 +14,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap};
 
-use crate::model::{FinalSummary, RuntimeEvent, UiMode, WorkerResult, WorkerStatus};
+use crate::model::{
+    FinalSummary, ReviewGateReport, RuntimeEvent, TodoStatus, UiMode, WorkerResult, WorkerStatus,
+};
 
 #[derive(Debug, Clone)]
 struct WorkerView {
@@ -33,6 +35,8 @@ struct UiState {
     started_at: Instant,
     commander_notes: Vec<String>,
     workers: BTreeMap<String, WorkerView>,
+    todos: BTreeMap<String, (String, TodoStatus, String)>,
+    review_report: Option<ReviewGateReport>,
     summary: Option<FinalSummary>,
     graph_summary: Option<String>,
     apply_status: Option<String>,
@@ -48,6 +52,8 @@ impl UiState {
             started_at: Instant::now(),
             commander_notes: Vec::new(),
             workers: BTreeMap::new(),
+            todos: BTreeMap::new(),
+            review_report: None,
             summary: None,
             graph_summary: None,
             apply_status: None,
@@ -68,6 +74,33 @@ impl UiState {
                 dependencies,
             } => {
                 self.graph_summary = Some(format!("节点 {} / 依赖 {}", nodes, dependencies));
+            }
+            RuntimeEvent::TodoStateChanged {
+                todo_id,
+                title,
+                status,
+                message,
+                commit_hash,
+            } => {
+                self.todos.insert(
+                    todo_id.clone(),
+                    (title.clone(), *status, message.clone()),
+                );
+                let suffix = commit_hash
+                    .as_ref()
+                    .map(|hash| format!(" / commit {}", truncate(hash, 12)))
+                    .unwrap_or_default();
+                push_note(
+                    &mut self.commander_notes,
+                    &format!(
+                        "{} {} -> {} / {}{}",
+                        todo_id,
+                        title,
+                        status.label(),
+                        truncate(message, 48),
+                        suffix
+                    ),
+                );
             }
             RuntimeEvent::WorkerDispatched {
                 agent_id,
@@ -108,6 +141,10 @@ impl UiState {
             }
             RuntimeEvent::ApplyPlanReady { mode, operations } => {
                 self.apply_status = Some(format!("计划：{} / {} 个 patch", mode, operations));
+            }
+            RuntimeEvent::ReviewGateReady { report } => {
+                self.review_report = Some(report.as_ref().clone());
+                self.apply_status = Some(format!("review gate：{}", report.decision.label()));
             }
             RuntimeEvent::ApplyUpdate { message } => {
                 self.apply_status = Some(message.clone());
@@ -233,7 +270,7 @@ fn render_rich(rich: &mut RichTerminal, state: &UiState) -> Result<()> {
         let header = Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
-                    "◢ CODEX-FORGE V2 ◣",
+                    "◢ CODEX-FORGE V4 ◣",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -273,6 +310,11 @@ fn render_rich(rich: &mut RichTerminal, state: &UiState) -> Result<()> {
         .wrap(Wrap { trim: true });
         frame.render_widget(header, sections[0]);
 
+        let middle_sections = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(sections[1]);
+
         let worker_rows = state
             .workers
             .iter()
@@ -307,7 +349,61 @@ fn render_rich(rich: &mut RichTerminal, state: &UiState) -> Result<()> {
         )
         .block(Block::default().title("Worker 矩阵").borders(Borders::ALL))
         .column_spacing(1);
-        frame.render_widget(workers_table, sections[1]);
+        frame.render_widget(workers_table, middle_sections[0]);
+
+        let todo_items = state
+            .todos
+            .iter()
+            .map(|(todo_id, (title, status, message))| {
+                ListItem::new(Line::from(format!(
+                    "{} {} / {} / {}",
+                    todo_id,
+                    truncate(title, 18),
+                    status.label(),
+                    truncate(message, 22)
+                )))
+            })
+            .collect::<Vec<_>>();
+        let review_lines = if let Some(report) = &state.review_report {
+            vec![
+                Line::from(format!("结论：{}", report.decision.label())),
+                Line::from(format!(
+                    "说明：{}",
+                    truncate(
+                        report
+                            .confidence_reasoning
+                            .as_deref()
+                            .unwrap_or("无补充说明"),
+                        44
+                    )
+                )),
+                Line::from(format!(
+                    "阻断项：{}",
+                    truncate(&report.blocking_findings.join("；"), 44)
+                )),
+            ]
+        } else {
+            vec![
+                Line::from("结论：等待 reviewer"),
+                Line::from("说明：尚未形成 gate"),
+                Line::from("阻断项：无"),
+            ]
+        };
+        let right_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(middle_sections[1]);
+        frame.render_widget(
+            List::new(todo_items)
+                .block(Block::default().title("Todo 态势").borders(Borders::ALL)),
+            right_sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(review_lines)
+                .block(Block::default().title("Review Gate").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            right_sections[1],
+        );
 
         let note_items = state
             .commander_notes
@@ -390,6 +486,24 @@ fn render_plain(event: &RuntimeEvent) {
         } => {
             println!("🕸️ 执行图就绪：节点 {nodes} / 依赖 {dependencies}");
         }
+        RuntimeEvent::TodoStateChanged {
+            todo_id,
+            title,
+            status,
+            message,
+            commit_hash,
+        } => {
+            if let Some(hash) = commit_hash {
+                println!(
+                    "📝 {todo_id} {title}：{} - {} ({})",
+                    status.label(),
+                    message,
+                    truncate(hash, 12)
+                );
+            } else {
+                println!("📝 {todo_id} {title}：{} - {}", status.label(), message);
+            }
+        }
         RuntimeEvent::WorkerDispatched {
             agent_id,
             role,
@@ -426,6 +540,16 @@ fn render_plain(event: &RuntimeEvent) {
         }
         RuntimeEvent::ApplyPlanReady { mode, operations } => {
             println!("🧩 apply 计划：模式={}，候选 patch={operations}", mode);
+        }
+        RuntimeEvent::ReviewGateReady { report } => {
+            println!(
+                "🛡️ review gate：{} - {}",
+                report.decision.label(),
+                report
+                    .confidence_reasoning
+                    .clone()
+                    .unwrap_or_else(|| "无补充说明".to_string())
+            );
         }
         RuntimeEvent::ApplyUpdate { message } => {
             println!("🪄 {message}");

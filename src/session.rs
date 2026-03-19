@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use crate::model::{
-    ApplyMode, ApplyResult, ArtifactEntry, ArtifactManifest, ChangeTrustReport, ExecutionContract,
-    ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot, RuntimeEvent, RuntimeEventRecord,
-    SessionConfig, SessionManifest, SessionStatus, VerificationReport, WorkerResult,
+    ApplyMode, ApplyResult, ArtifactEntry, ArtifactIndexEntry, ArtifactManifest,
+    ChangeTrustReport, ExecutionContract, ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot,
+    RuntimeEvent, RuntimeEventRecord, SessionConfig, SessionManifest, SessionStatus,
+    TimelineEventSummary, TodoStateRecord, TodoStatus, VerificationReport, WorkerResult,
 };
 
 #[derive(Debug, Clone)]
@@ -30,12 +31,8 @@ impl SessionContext {
             .join(".codex-forge")
             .join("sessions");
         let session_dir = base_dir.join(&session_id);
-        fs::create_dir_all(session_dir.join("commander"))
+        fs::create_dir_all(&session_dir)
             .with_context(|| format!("创建 session 目录失败：{}", session_dir.display()))?;
-        fs::create_dir_all(session_dir.join("workers"))
-            .with_context(|| format!("创建 worker 目录失败：{}", session_dir.display()))?;
-        fs::create_dir_all(session_dir.join("integration"))
-            .with_context(|| format!("创建 integration 目录失败：{}", session_dir.display()))?;
 
         let manifest = SessionManifest {
             id: session_id,
@@ -53,7 +50,9 @@ impl SessionContext {
             fail_fast: config.fail_fast,
             verification_commands: config.verification_commands.clone(),
             config_path: config.config_path.clone(),
+            preset: config.preset,
             plan_todo: None,
+            todo_states: Vec::new(),
             execution_graph: None,
             execution_contract: None,
             worker_results: Vec::new(),
@@ -64,6 +63,10 @@ impl SessionContext {
             doctor_report: None,
             final_summary: None,
             reused_plan_session_id: None,
+            resumed_from_session_id: None,
+            artifact_index: Vec::new(),
+            timeline_events: Vec::new(),
+            demo_summary: Vec::new(),
             timeline_path: session_dir.join("timeline.jsonl"),
             graph_path: session_dir.join("commander").join("execution-graph.json"),
             execution_contract_path: session_dir
@@ -84,7 +87,7 @@ impl SessionContext {
         };
 
         let manifest_path = session_dir.join("manifest.json");
-        let ctx = Self {
+        let mut ctx = Self {
             manifest,
             manifest_path,
         };
@@ -101,7 +104,26 @@ impl SessionContext {
     pub fn set_plan_todo(&mut self, plan_todo: PlanTodo) -> Result<()> {
         let json_path = self.plan_todo_json_path();
         let markdown_path = self.plan_todo_markdown_path();
+        fs::create_dir_all(self.commander_dir()).with_context(|| {
+            format!(
+                "创建 commander 目录失败：{}",
+                self.commander_dir().display()
+            )
+        })?;
         self.manifest.plan_todo = Some(plan_todo.clone());
+        self.manifest.todo_states = plan_todo
+            .todos
+            .iter()
+            .map(|item| TodoStateRecord {
+                todo_id: item.id.clone(),
+                title: item.title.clone(),
+                status: TodoStatus::Pending,
+                node_ids: Vec::new(),
+                completed_node_ids: Vec::new(),
+                commit_hash: None,
+                last_message: Some("等待调度".to_string()),
+            })
+            .collect();
         fs::write(
             &json_path,
             serde_json::to_vec_pretty(&plan_todo).context("序列化 plan todo 失败")?,
@@ -111,21 +133,56 @@ impl SessionContext {
             format!("写入 plan todo Markdown 失败：{}", markdown_path.display())
         })?;
         self.manifest.artifact_manifest.plan_todo_path = Some(json_path);
+        self.persist_todo_states()?;
         self.persist_artifact_manifest()?;
         self.persist()
     }
 
     pub fn set_graph(&mut self, graph: ExecutionGraph) -> Result<()> {
+        fs::create_dir_all(self.commander_dir()).with_context(|| {
+            format!(
+                "创建 commander 目录失败：{}",
+                self.commander_dir().display()
+            )
+        })?;
         self.manifest.execution_graph = Some(graph.clone());
+        let node_ids_by_todo = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                node.todo_id
+                    .as_ref()
+                    .map(|todo_id| (todo_id, node.id.clone()))
+            })
+            .fold(
+                std::collections::HashMap::<String, Vec<String>>::new(),
+                |mut acc, (todo_id, node_id)| {
+                    acc.entry(todo_id.clone()).or_default().push(node_id);
+                    acc
+                },
+            );
+        for todo in &mut self.manifest.todo_states {
+            todo.node_ids = node_ids_by_todo
+                .get(&todo.todo_id)
+                .cloned()
+                .unwrap_or_default();
+        }
         fs::write(
             &self.manifest.graph_path,
             serde_json::to_vec_pretty(&graph).context("序列化执行图失败")?,
         )
         .with_context(|| format!("写入执行图失败：{}", self.manifest.graph_path.display()))?;
+        self.persist_todo_states()?;
         self.persist()
     }
 
     pub fn set_execution_contract(&mut self, contract: ExecutionContract) -> Result<()> {
+        fs::create_dir_all(self.commander_dir()).with_context(|| {
+            format!(
+                "创建 commander 目录失败：{}",
+                self.commander_dir().display()
+            )
+        })?;
         self.manifest.execution_contract = Some(contract.clone());
         fs::write(
             &self.manifest.execution_contract_path,
@@ -192,6 +249,7 @@ impl SessionContext {
 
     pub fn set_summary(&mut self, summary: FinalSummary) -> Result<()> {
         self.manifest.final_summary = Some(summary.clone());
+        self.manifest.demo_summary = build_demo_summary(&self.manifest, &summary);
         fs::write(
             &self.manifest.summary_json_path,
             serde_json::to_vec_pretty(&summary).context("序列化 summary 失败")?,
@@ -215,32 +273,16 @@ impl SessionContext {
         self.persist()
     }
 
-    pub fn append_timeline(&self, event: &RuntimeEvent) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.manifest.timeline_path)
-            .with_context(|| {
-                format!(
-                    "打开 timeline 文件失败：{}",
-                    self.manifest.timeline_path.display()
-                )
-            })?;
-
-        let record = RuntimeEventRecord {
-            ts: Utc::now(),
-            payload: event.clone(),
-        };
-        let line = serde_json::to_string(&record).context("序列化 timeline 事件失败")?;
-        writeln!(file, "{line}").context("写入 timeline 失败")
-    }
-
     pub fn worker_dir(&self, agent_id: &str) -> PathBuf {
         self.manifest.session_dir.join("workers").join(agent_id)
     }
 
     pub fn commander_dir(&self) -> PathBuf {
         self.manifest.session_dir.join("commander")
+    }
+
+    pub fn todo_state_path(&self) -> PathBuf {
+        self.commander_dir().join("todo-state.json")
     }
 
     pub fn plan_todo_json_path(&self) -> PathBuf {
@@ -256,7 +298,70 @@ impl SessionContext {
         self.persist()
     }
 
-    pub fn persist(&self) -> Result<()> {
+    pub fn set_resumed_from_session_id(&mut self, session_id: impl Into<String>) -> Result<()> {
+        self.manifest.resumed_from_session_id = Some(session_id.into());
+        self.persist()
+    }
+
+    pub fn update_todo_status(
+        &mut self,
+        todo_id: &str,
+        status: TodoStatus,
+        message: impl Into<String>,
+        commit_hash: Option<String>,
+    ) -> Result<Option<TodoStateRecord>> {
+        let message = message.into();
+        let mut updated = None;
+        for todo in &mut self.manifest.todo_states {
+            if todo.todo_id == todo_id {
+                todo.status = status;
+                todo.last_message = Some(message.clone());
+                if let Some(hash) = commit_hash.clone() {
+                    todo.commit_hash = Some(hash);
+                }
+                updated = Some(todo.clone());
+                break;
+            }
+        }
+        if updated.is_some() {
+            self.persist_todo_states()?;
+            self.persist()?;
+        }
+        Ok(updated)
+    }
+
+    pub fn mark_todo_node_completed(&mut self, todo_id: &str, node_id: &str) -> Result<()> {
+        for todo in &mut self.manifest.todo_states {
+            if todo.todo_id == todo_id
+                && !todo.completed_node_ids.iter().any(|item| item == node_id)
+            {
+                todo.completed_node_ids.push(node_id.to_string());
+            }
+        }
+        self.persist_todo_states()?;
+        self.persist()
+    }
+
+    pub fn persist_todo_states(&mut self) -> Result<()> {
+        fs::create_dir_all(self.commander_dir()).with_context(|| {
+            format!(
+                "创建 commander 目录失败：{}",
+                self.commander_dir().display()
+            )
+        })?;
+        let path = self.todo_state_path();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&self.manifest.todo_states)
+                .context("序列化 todo 状态失败")?,
+        )
+        .with_context(|| format!("写入 todo 状态失败：{}", path.display()))?;
+        self.manifest.artifact_manifest.todo_state_path = Some(path);
+        self.persist_artifact_manifest()
+    }
+
+    pub fn persist(&mut self) -> Result<()> {
+        self.refresh_indexes();
         fs::write(
             &self.manifest_path,
             serde_json::to_vec_pretty(&self.manifest).context("序列化 manifest 失败")?,
@@ -264,7 +369,8 @@ impl SessionContext {
         .with_context(|| format!("写入 manifest 失败：{}", self.manifest_path.display()))
     }
 
-    pub fn persist_artifact_manifest(&self) -> Result<()> {
+    pub fn persist_artifact_manifest(&mut self) -> Result<()> {
+        self.refresh_indexes();
         fs::write(
             &self.manifest.artifact_manifest_path,
             serde_json::to_vec_pretty(&self.manifest.artifact_manifest)
@@ -276,6 +382,40 @@ impl SessionContext {
                 self.manifest.artifact_manifest_path.display()
             )
         })
+    }
+
+    pub fn append_timeline(&mut self, event: &RuntimeEvent) -> Result<()> {
+        let record = RuntimeEventRecord {
+            ts: Utc::now(),
+            payload: event.clone(),
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.manifest.timeline_path)
+            .with_context(|| {
+                format!(
+                    "打开 timeline 文件失败：{}",
+                    self.manifest.timeline_path.display()
+                )
+            })?;
+        let line = serde_json::to_string(&record).context("序列化 timeline 事件失败")?;
+        writeln!(file, "{line}").context("写入 timeline 失败")?;
+
+        self.manifest.timeline_events.push(TimelineEventSummary {
+            ts: record.ts,
+            title: timeline_title(event),
+            detail: timeline_detail(event),
+        });
+        if self.manifest.timeline_events.len() > 256 {
+            let overflow = self.manifest.timeline_events.len() - 256;
+            self.manifest.timeline_events.drain(0..overflow);
+        }
+        self.persist()
+    }
+
+    fn refresh_indexes(&mut self) {
+        self.manifest.artifact_index = build_artifact_index(&self.manifest);
     }
 }
 
@@ -389,6 +529,23 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
     let blocked_verifications = render_bullets(&summary.blocked_verifications);
     let open_risks = render_bullets(&summary.open_risks);
     let recommended_next_action = render_bullets(&summary.recommended_next_action);
+    let todo_states = render_todo_states(&summary.todo_states);
+    let evidence_summary = render_bullets(&summary.evidence_summary);
+    let demo_summary = render_bullets(&manifest.demo_summary);
+    let review_findings = summary
+        .review_report
+        .as_ref()
+        .map(|report| render_bullets(&report.blocking_findings))
+        .unwrap_or_else(|| "- 无".to_string());
+    let review_scopes = summary
+        .review_report
+        .as_ref()
+        .map(|report| {
+            let accepted = render_bullets(&report.accepted_scopes);
+            let rejected = render_bullets(&report.rejected_scopes);
+            format!("**放行范围**\n\n{}\n\n**拦截范围**\n\n{}", accepted, rejected)
+        })
+        .unwrap_or_else(|| "**放行范围**\n\n- 无\n\n**拦截范围**\n\n- 无".to_string());
 
     format!(
         "# Session {}\n\n\
@@ -409,6 +566,10 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
 ## 拒绝文件\n\n{}\n\n\
 ## 已验证能力\n\n{}\n\n\
 ## 因环境受阻\n\n{}\n\n\
+## Todo 状态\n\n{}\n\n\
+## 审阅关卡\n\n{}\n\n{}\n\n\
+## 证据摘要\n\n{}\n\n\
+## Demo 摘要\n\n{}\n\n\
 ## 未关闭风险\n\n{}\n\n\
 ## 下一步\n\n{}\n",
         manifest.id,
@@ -431,6 +592,11 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
         rejected_files,
         verified_capabilities,
         blocked_verifications,
+        todo_states,
+        review_findings,
+        review_scopes,
+        evidence_summary,
+        demo_summary,
         open_risks,
         recommended_next_action,
     )
@@ -493,5 +659,170 @@ fn render_bullets(items: &[String]) -> String {
             .map(|item| format!("- {item}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+fn render_todo_states(items: &[TodoStateRecord]) -> String {
+    if items.is_empty() {
+        return "- 无".to_string();
+    }
+    items
+        .iter()
+        .map(|item| {
+            let commit = item
+                .commit_hash
+                .as_ref()
+                .map(|hash| format!(" / commit {}", hash))
+                .unwrap_or_default();
+            let message = item
+                .last_message
+                .as_ref()
+                .map(|text| format!(" / {}", text))
+                .unwrap_or_default();
+            format!(
+                "- {} {}：{}{}{}",
+                item.todo_id,
+                item.title,
+                item.status.label(),
+                commit,
+                message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_artifact_index(manifest: &SessionManifest) -> Vec<ArtifactIndexEntry> {
+    let mut items = Vec::new();
+    if let Some(path) = &manifest.artifact_manifest.plan_todo_path {
+        items.push(ArtifactIndexEntry {
+            key: "plan_todo".to_string(),
+            path: path.clone(),
+        });
+    }
+    items.push(ArtifactIndexEntry {
+        key: "timeline".to_string(),
+        path: manifest.timeline_path.clone(),
+    });
+    items.push(ArtifactIndexEntry {
+        key: "graph".to_string(),
+        path: manifest.graph_path.clone(),
+    });
+    items.push(ArtifactIndexEntry {
+        key: "summary_json".to_string(),
+        path: manifest.summary_json_path.clone(),
+    });
+    items.push(ArtifactIndexEntry {
+        key: "summary_markdown".to_string(),
+        path: manifest.summary_markdown_path.clone(),
+    });
+    if let Some(path) = &manifest.artifact_manifest.execution_contract_path {
+        items.push(ArtifactIndexEntry {
+            key: "execution_contract".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.apply_plan_path {
+        items.push(ArtifactIndexEntry {
+            key: "apply_plan".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.apply_result_path {
+        items.push(ArtifactIndexEntry {
+            key: "apply_result".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.verification_report_path {
+        items.push(ArtifactIndexEntry {
+            key: "verification_report".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.change_trust_report_path {
+        items.push(ArtifactIndexEntry {
+            key: "change_trust_report".to_string(),
+            path: path.clone(),
+        });
+    }
+    items
+}
+
+fn build_demo_summary(manifest: &SessionManifest, summary: &FinalSummary) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(preset) = manifest.preset {
+        lines.push(format!("运行预设：{}", preset.label()));
+    }
+    lines.push(format!("结果：{}", summary.result_status.label()));
+    if let Some(report) = &summary.review_report {
+        lines.push(format!("review gate：{}", report.decision.label()));
+    }
+    lines.push(format!("自动接收文件：{}", summary.accepted_files.len()));
+    lines.push(format!("验证通过：{}", summary.verified_capabilities.len()));
+    if !summary.open_risks.is_empty() {
+        lines.push(format!("开放风险：{}", summary.open_risks.len()));
+    }
+    lines
+}
+
+fn timeline_title(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::PhaseChanged { .. } => "阶段切换".to_string(),
+        RuntimeEvent::CommanderNote { .. } => "指挥备注".to_string(),
+        RuntimeEvent::GraphReady { .. } => "执行图就绪".to_string(),
+        RuntimeEvent::TodoStateChanged { title, .. } => format!("Todo 更新：{title}"),
+        RuntimeEvent::WorkerDispatched { agent_id, .. } => format!("启动 {agent_id}"),
+        RuntimeEvent::WorkerUpdate { agent_id, .. } => format!("Worker 更新：{agent_id}"),
+        RuntimeEvent::HandoffReady { agent_id, .. } => format!("交接就绪：{agent_id}"),
+        RuntimeEvent::WorkerFinished { result } => format!("Worker 完成：{}", result.agent_id),
+        RuntimeEvent::ApplyPlanReady { .. } => "应用计划就绪".to_string(),
+        RuntimeEvent::ReviewGateReady { .. } => "审阅关卡结论".to_string(),
+        RuntimeEvent::ApplyUpdate { .. } => "应用更新".to_string(),
+        RuntimeEvent::VerificationReady { stage, .. } => format!("验证完成：{stage}"),
+        RuntimeEvent::SummaryReady { .. } => "总结完成".to_string(),
+    }
+}
+
+fn timeline_detail(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::PhaseChanged { phase } => phase.clone(),
+        RuntimeEvent::CommanderNote { message } => message.clone(),
+        RuntimeEvent::GraphReady {
+            nodes,
+            dependencies,
+        } => format!("节点 {nodes} / 依赖 {dependencies}"),
+        RuntimeEvent::TodoStateChanged {
+            todo_id,
+            status,
+            message,
+            ..
+        } => format!("{todo_id} -> {} / {}", status.label(), message),
+        RuntimeEvent::WorkerDispatched { role, title, .. } => format!("{role} / {title}"),
+        RuntimeEvent::WorkerUpdate { kind, message, .. } => {
+            format!("{kind} / {}", message.replace('\n', " "))
+        }
+        RuntimeEvent::HandoffReady {
+            handoff_path, ..
+        } => handoff_path.display().to_string(),
+        RuntimeEvent::WorkerFinished { result } => {
+            format!("{} / {}", result.task_title, result.status.label())
+        }
+        RuntimeEvent::ApplyPlanReady { mode, operations } => {
+            format!("{} / {} 个 patch", mode, operations)
+        }
+        RuntimeEvent::ReviewGateReady { report } => format!(
+            "{} / {}",
+            report.decision.label(),
+            report
+                .confidence_reasoning
+                .clone()
+                .unwrap_or_else(|| "无补充说明".to_string())
+        ),
+        RuntimeEvent::ApplyUpdate { message } => message.clone(),
+        RuntimeEvent::VerificationReady {
+            success, message, ..
+        } => format!("{} / {}", if *success { "成功" } else { "失败" }, message),
+        RuntimeEvent::SummaryReady { summary } => summary.overview.clone(),
     }
 }

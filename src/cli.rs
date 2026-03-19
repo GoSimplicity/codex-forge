@@ -34,20 +34,24 @@ pub struct SharedTaskArgs {
     pub config: Option<PathBuf>,
     #[arg(long, help = "并发 worker 数量；不传时走配置文件或默认值")]
     pub workers: Option<usize>,
-    #[arg(long, help = "角色模板集合；默认 core")]
+    #[arg(long, help = "角色集合标识；默认读取 `.roles/sets.toml` 中的 default")]
     pub role_set: Option<String>,
     #[arg(long, help = "统一指定 Codex model")]
     pub model: Option<String>,
     #[arg(long, value_enum, default_value_t = UiModeArg::Rich, help = "终端展示模式")]
     pub ui: UiModeArg,
-    #[arg(long, default_value = ".", help = "要协同开发的目标仓库目录")]
-    pub target_dir: PathBuf,
+    #[arg(long, help = "要协同开发的目标仓库目录；不传则优先复用上次指定目录")]
+    pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
     #[command(flatten)]
     pub shared: SharedTaskArgs,
+    #[arg(long, value_enum, help = "使用内置运行预设；feature-demo 适合黑客松现场展示")]
+    pub preset: Option<PresetArg>,
+    #[arg(long, help = "从指定 session 恢复运行，优先复用其执行图与已成功节点")]
+    pub resume: Option<String>,
     #[arg(long, value_enum, help = "结果应用模式：auto-safe、bundle、none")]
     pub apply_mode: Option<ApplyModeArg>,
     #[arg(long, help = "worker 最大重试次数")]
@@ -74,10 +78,11 @@ pub struct ReplayArgs {
     pub ui: UiModeArg,
     #[arg(
         long,
-        default_value = ".",
-        help = "仓库目录，用于定位 .codex-forge 会话"
+        help = "仓库目录，用于定位 .codex-forge 会话；不传则优先复用上次指定目录"
     )]
-    pub target_dir: PathBuf,
+    pub target_dir: Option<PathBuf>,
+    #[arg(long, help = "按关键决策时间线输出，不走动态 UI 回放")]
+    pub timeline: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -88,17 +93,25 @@ pub struct AgentsArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AgentCommands {
-    List,
+    List(AgentListArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AgentListArgs {
+    #[arg(long, help = "目标仓库目录；不传则优先复用上次指定目录")]
+    pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct DoctorArgs {
-    #[arg(long, default_value = ".", help = "要检查的目标仓库目录")]
-    pub target_dir: PathBuf,
+    #[arg(long, help = "要检查的目标仓库目录；不传则优先复用上次指定目录")]
+    pub target_dir: Option<PathBuf>,
     #[arg(long, help = "项目配置文件路径；默认尝试读取 codex-forge.toml")]
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, help = "覆盖 apply mode，便于提前检查运行条件")]
     pub apply_mode: Option<ApplyModeArg>,
+    #[arg(long, help = "按黑客松演示模式输出红黄绿结论与推荐执行参数")]
+    pub demo: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -114,8 +127,8 @@ pub enum ConfigCommands {
 
 #[derive(Debug, Clone, Args)]
 pub struct ConfigValidateArgs {
-    #[arg(long, default_value = ".", help = "目标仓库目录")]
-    pub target_dir: PathBuf,
+    #[arg(long, help = "目标仓库目录；不传则优先复用上次指定目录")]
+    pub target_dir: Option<PathBuf>,
     #[arg(long, help = "显式指定配置文件路径")]
     pub config: Option<PathBuf>,
 }
@@ -132,4 +145,10 @@ pub enum ApplyModeArg {
     AutoSafe,
     Bundle,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PresetArg {
+    #[value(name = "feature-demo")]
+    FeatureDemo,
 }

@@ -207,6 +207,56 @@ pub async fn apply_patch_file_for_paths(
     run_git_apply_with_filters(target_dir, patch_path, included_paths, false).await
 }
 
+pub async fn git_commit_paths(
+    repo_root: &Path,
+    message: &str,
+    included_paths: &[String],
+    allow_empty: bool,
+) -> Result<String> {
+    if !included_paths.is_empty() {
+        let mut add_command = Command::new("git");
+        add_command
+            .arg("-C")
+            .arg(repo_root)
+            .args(["add", "-A", "--"]);
+        for path in included_paths {
+            add_command.arg(path);
+        }
+        let add_output = add_command.output().await.context("执行 git add 失败")?;
+        if !add_output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&add_output.stderr).trim());
+        }
+    }
+
+    let mut commit_command = Command::new("git");
+    commit_command.arg("-C").arg(repo_root).arg("commit");
+    if allow_empty {
+        commit_command.arg("--allow-empty");
+    }
+    commit_command.args(["-m", message]);
+    let commit_output = commit_command
+        .output()
+        .await
+        .context("执行 git commit 失败")?;
+    if !commit_output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&commit_output.stderr).trim());
+    }
+
+    let rev_output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("读取最新 commit 失败")?;
+    if !rev_output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&rev_output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&rev_output.stdout)
+        .trim()
+        .to_string())
+}
+
 pub async fn materialize_dependency_patches(
     target_dir: &Path,
     dependency_results: &[&WorkerResult],

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,19 +28,6 @@ pub struct ProjectSettings {
     pub fail_fast: bool,
     pub cleanup_success: bool,
     pub verification_commands: Vec<String>,
-    pub role_overrides: HashMap<String, RoleOverride>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RoleOverride {
-    pub title: Option<String>,
-    pub mission: Option<String>,
-    pub skills: Option<Vec<String>>,
-    pub working_style: Option<String>,
-    pub can_edit: Option<bool>,
-    pub max_concurrency: Option<usize>,
-    pub dependency_policy: Option<String>,
-    pub prompt_preamble: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,7 +35,7 @@ struct RawProjectConfig {
     #[serde(default)]
     defaults: RawDefaults,
     #[serde(default)]
-    roles: HashMap<String, RawRoleOverride>,
+    roles: toml::value::Table,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,18 +66,6 @@ impl From<ApplyModeSerde> for ApplyMode {
             ApplyModeSerde::None => ApplyMode::None,
         }
     }
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawRoleOverride {
-    title: Option<String>,
-    mission: Option<String>,
-    skills: Option<Vec<String>>,
-    working_style: Option<String>,
-    can_edit: Option<bool>,
-    max_concurrency: Option<usize>,
-    dependency_policy: Option<String>,
-    prompt_preamble: Option<String>,
 }
 
 pub fn load_project_config(
@@ -138,7 +112,7 @@ pub fn validate_project_config(
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
-            role_set: "core".to_string(),
+            role_set: "default".to_string(),
             model: None,
             workers: 4,
             apply_mode: ApplyMode::AutoSafe,
@@ -149,13 +123,15 @@ impl Default for ProjectSettings {
                 .iter()
                 .map(|item| item.to_string())
                 .collect(),
-            role_overrides: HashMap::new(),
         }
     }
 }
 
 fn validate_and_build(raw: RawProjectConfig) -> Result<ProjectSettings> {
     let defaults = ProjectSettings::default();
+    if !raw.roles.is_empty() {
+        bail!("v3 已不再支持 `[roles.*]` 配置，请改用 `.roles/` 目录");
+    }
     let workers = raw.defaults.workers.unwrap_or(defaults.workers).max(1);
     let max_retries = raw.defaults.max_retries.unwrap_or(defaults.max_retries);
     if max_retries > 8 {
@@ -169,26 +145,6 @@ fn validate_and_build(raw: RawProjectConfig) -> Result<ProjectSettings> {
     if verification_commands.is_empty() {
         bail!("verification_commands 不能为空");
     }
-
-    let role_overrides = raw
-        .roles
-        .into_iter()
-        .map(|(key, value)| {
-            (
-                key,
-                RoleOverride {
-                    title: value.title,
-                    mission: value.mission,
-                    skills: value.skills,
-                    working_style: value.working_style,
-                    can_edit: value.can_edit,
-                    max_concurrency: value.max_concurrency,
-                    dependency_policy: value.dependency_policy,
-                    prompt_preamble: value.prompt_preamble,
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
 
     Ok(ProjectSettings {
         role_set: raw.defaults.role_set.unwrap_or(defaults.role_set),
@@ -206,7 +162,6 @@ fn validate_and_build(raw: RawProjectConfig) -> Result<ProjectSettings> {
             .cleanup_success
             .unwrap_or(defaults.cleanup_success),
         verification_commands,
-        role_overrides,
     })
 }
 
@@ -222,11 +177,12 @@ mod tests {
         let loaded = load_project_config(dir.path(), None).expect("load config");
         assert!(loaded.path.is_none());
         assert_eq!(loaded.settings.workers, 4);
+        assert_eq!(loaded.settings.role_set, "default");
         assert_eq!(loaded.settings.apply_mode.label(), "auto-safe");
     }
 
     #[test]
-    fn loads_and_overrides_values() {
+    fn loads_default_values_without_role_overrides() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("codex-forge.toml");
         fs::write(
@@ -237,10 +193,6 @@ workers = 2
 apply_mode = "bundle"
 max_retries = 1
 verification_commands = ["cargo test -q"]
-
-[roles.reviewer]
-can_edit = false
-working_style = "只做审阅"
 "#,
         )
         .expect("write config");
@@ -249,13 +201,23 @@ working_style = "只做审阅"
         assert_eq!(loaded.settings.workers, 2);
         assert_eq!(loaded.settings.apply_mode.label(), "bundle");
         assert_eq!(loaded.settings.max_retries, 1);
-        assert_eq!(
-            loaded
-                .settings
-                .role_overrides
-                .get("reviewer")
-                .and_then(|role| role.can_edit),
-            Some(false)
-        );
+    }
+
+    #[test]
+    fn rejects_legacy_role_overrides() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("codex-forge.toml");
+        fs::write(
+            &path,
+            r#"
+[roles.reviewer]
+can_edit = false
+"#,
+        )
+        .expect("write config");
+
+        let error =
+            load_project_config(dir.path(), None).expect_err("legacy overrides should fail");
+        assert!(error.to_string().contains(".roles/"));
     }
 }

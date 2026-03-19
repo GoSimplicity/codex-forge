@@ -2,15 +2,16 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::cli::{
-    AgentCommands, ApplyModeArg, Cli, Commands, ConfigCommands, ConfigValidateArgs, DoctorArgs,
-    PlanArgs, ReplayArgs, RunArgs, UiModeArg,
+    AgentCommands, AgentListArgs, ApplyModeArg, Cli, Commands, ConfigCommands, ConfigValidateArgs,
+    DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs, UiModeArg,
 };
 use crate::config::{load_project_config, validate_project_config};
 use crate::doctor::run_doctor;
-use crate::model::{ApplyMode, SessionConfig, UiMode};
+use crate::model::{ApplyMode, SessionConfig, SessionPreset, UiMode};
 use crate::orchestrator::{plan_session, run_session};
 use crate::replay::replay_session;
-use crate::roles::{agents_overview, resolve_role_set};
+use crate::resources::{load_resource_catalog, resolve_role_set};
+use crate::workspace::{describe_git_readiness, resolve_target_dir};
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -32,7 +33,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Replay(args) => run_replay(args).await?,
         Commands::Agents(args) => match args.command {
-            AgentCommands::List => print_agents(),
+            AgentCommands::List(list_args) => print_agents(list_args)?,
         },
         Commands::Doctor(args) => run_doctor_command(args).await?,
         Commands::Config(args) => match args.command {
@@ -43,13 +44,15 @@ pub async fn run() -> Result<()> {
 }
 
 fn resolve_run_config(args: RunArgs) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
-    let loaded = load_project_config(&args.shared.target_dir, args.shared.config.as_deref())?;
+    let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
+    let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
+    let resources = load_resource_catalog(&target_dir)?;
     let role_set = args
         .shared
         .role_set
         .clone()
         .unwrap_or_else(|| loaded.settings.role_set.clone());
-    let roles = resolve_role_set(&role_set, &loaded.settings.role_overrides);
+    let roles = resolve_role_set(&resources, &role_set)?;
     if roles.is_empty() {
         bail!("角色集合为空，无法运行");
     }
@@ -64,7 +67,7 @@ fn resolve_run_config(args: RunArgs) -> Result<(SessionConfig, Vec<crate::model:
         role_set,
         model: args.shared.model.or(loaded.settings.model.clone()),
         ui_mode: into_ui_mode(args.shared.ui),
-        target_dir: args.shared.target_dir,
+        target_dir,
         cleanup_success: args.cleanup_success || loaded.settings.cleanup_success,
         apply_mode: args
             .apply_mode
@@ -74,19 +77,25 @@ fn resolve_run_config(args: RunArgs) -> Result<(SessionConfig, Vec<crate::model:
         fail_fast: args.fail_fast || loaded.settings.fail_fast,
         verification_commands: loaded.settings.verification_commands.clone(),
         config_path: loaded.path,
+        global_rule_prompt: resources.rules.global.clone(),
+        reviewer_rule_prompt: resources.rules.reviewer.clone(),
         plan_only: false,
+        preset: args.preset.map(into_preset),
+        resume_session_id: args.resume,
     };
-    Ok((config, roles))
+    Ok((apply_run_preset(config), roles))
 }
 
 fn resolve_plan_config(args: PlanArgs) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
-    let loaded = load_project_config(&args.shared.target_dir, args.shared.config.as_deref())?;
+    let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
+    let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
+    let resources = load_resource_catalog(&target_dir)?;
     let role_set = args
         .shared
         .role_set
         .clone()
         .unwrap_or_else(|| loaded.settings.role_set.clone());
-    let roles = resolve_role_set(&role_set, &loaded.settings.role_overrides);
+    let roles = resolve_role_set(&resources, &role_set)?;
 
     let config = SessionConfig {
         task: args.shared.task,
@@ -98,33 +107,43 @@ fn resolve_plan_config(args: PlanArgs) -> Result<(SessionConfig, Vec<crate::mode
         role_set,
         model: args.shared.model.or(loaded.settings.model.clone()),
         ui_mode: into_ui_mode(args.shared.ui),
-        target_dir: args.shared.target_dir,
+        target_dir,
         cleanup_success: false,
         apply_mode: ApplyMode::None,
         max_retries: loaded.settings.max_retries,
         fail_fast: loaded.settings.fail_fast,
         verification_commands: loaded.settings.verification_commands.clone(),
         config_path: loaded.path,
+        global_rule_prompt: resources.rules.global.clone(),
+        reviewer_rule_prompt: resources.rules.reviewer.clone(),
         plan_only: true,
+        preset: None,
+        resume_session_id: None,
     };
     Ok((config, roles))
 }
 
 async fn run_replay(args: ReplayArgs) -> Result<()> {
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
     replay_session(
-        &args.target_dir,
+        &target_dir,
         args.session_id.as_deref(),
         into_ui_mode(args.ui),
+        args.timeline,
     )
     .await
 }
 
 async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
-    let loaded = load_project_config(&args.target_dir, args.config.as_deref())?;
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let loaded = load_project_config(&target_dir, args.config.as_deref())?;
+    let resources = load_resource_catalog(&target_dir)?;
     let report = run_doctor(
-        &args.target_dir,
+        &target_dir,
         &loaded,
+        &resources,
         args.apply_mode.map(into_apply_mode),
+        args.demo,
     )
     .await?;
 
@@ -137,7 +156,20 @@ async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
         );
     }
 
+    println!(
+        "doctor 结论：{} / {}",
+        report.readiness.label(),
+        report.summary
+    );
+    if args.demo {
+        println!(
+            "推荐 role_set：{}；推荐 apply_mode：{}",
+            report.recommended_role_set, report.recommended_apply_mode
+        );
+    }
+
     if report.ok {
+        println!("Git 预处理：{}", describe_git_readiness(&target_dir)?);
         println!("doctor 通过");
         Ok(())
     } else {
@@ -146,8 +178,12 @@ async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
 }
 
 fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
-    let loaded = validate_project_config(&args.target_dir, args.config.as_deref())
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let loaded = validate_project_config(&target_dir, args.config.as_deref())
         .with_context(|| "配置校验失败")?;
+    let resources = load_resource_catalog(&target_dir).with_context(|| "资源校验失败")?;
+    let roles = resolve_role_set(&resources, &loaded.settings.role_set)
+        .with_context(|| "角色集合校验失败")?;
     println!(
         "配置有效：{}",
         loaded
@@ -159,21 +195,44 @@ fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
     println!("默认 workers：{}", loaded.settings.workers);
     println!("默认 apply_mode：{}", loaded.settings.apply_mode);
     println!("默认 max_retries：{}", loaded.settings.max_retries);
+    println!("默认 role_set：{}", loaded.settings.role_set);
+    println!("命中全局规则：{}", resources.rules.global_origin.describe());
+    if let Some(origin) = &resources.rules.reviewer_origin {
+        println!("命中 reviewer 规则：{}", origin.describe());
+    }
+    println!("角色集合节点数：{}", roles.len());
     Ok(())
 }
 
-fn print_agents() {
-    println!("codex-forge 内置角色：");
-    for role in agents_overview() {
+fn print_agents(args: AgentListArgs) -> Result<()> {
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let resources = load_resource_catalog(&target_dir)?;
+    println!("codex-forge v4 可用角色：");
+    let mut role_items = resources.roles.values().collect::<Vec<_>>();
+    role_items.sort_by(|left, right| left.role.key.cmp(&right.role.key));
+    for role in role_items {
         println!(
-            "- {} (`{}`)：{} | skills: {} | can_edit: {}",
-            role.title,
-            role.key,
-            role.mission,
-            role.skills.join("、"),
-            role.can_edit
+            "- {} (`{}`)：{} | skills: {} | can_edit: {} | source: {}",
+            role.role.title,
+            role.role.key,
+            role.role.mission,
+            role.role.skills.join("、"),
+            role.role.can_edit,
+            role.origin.describe()
         );
     }
+    println!("角色集合：");
+    let mut role_sets = resources.role_sets.iter().collect::<Vec<_>>();
+    role_sets.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, role_set) in role_sets {
+        println!(
+            "- {}：{} | source: {}",
+            name,
+            role_set.roles.join("、"),
+            role_set.origin.describe()
+        );
+    }
+    Ok(())
 }
 
 fn into_ui_mode(mode: UiModeArg) -> UiMode {
@@ -189,4 +248,28 @@ fn into_apply_mode(mode: ApplyModeArg) -> ApplyMode {
         ApplyModeArg::Bundle => ApplyMode::Bundle,
         ApplyModeArg::None => ApplyMode::None,
     }
+}
+
+fn into_preset(preset: PresetArg) -> SessionPreset {
+    match preset {
+        PresetArg::FeatureDemo => SessionPreset::FeatureDemo,
+    }
+}
+
+fn apply_run_preset(mut config: SessionConfig) -> SessionConfig {
+    match config.preset {
+        Some(SessionPreset::FeatureDemo) => {
+            config.workers = config.workers.max(4);
+            config.ui_mode = UiMode::Rich;
+            if config.role_set == "default" || config.role_set.is_empty() {
+                config.role_set = "default".to_string();
+            }
+            if matches!(config.apply_mode, ApplyMode::None) {
+                config.apply_mode = ApplyMode::AutoSafe;
+            }
+            config.cleanup_success = true;
+        }
+        None => {}
+    }
+    config
 }

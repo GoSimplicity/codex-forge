@@ -7,12 +7,14 @@ use anyhow::{Context, Result};
 
 use crate::model::{
     ApplyDecision, ApplyMode, ApplyOperation, ApplyPlan, ApplyResult, ApplyStatus,
-    ChangeTrustReport, ExecutionContract, ExecutionGraph, ScopeDrift, TrustLevel, WorkerResult,
-    WorkerStatus,
+    ChangeTrustReport, ExecutionContract, ExecutionGraph, ReviewGateReport, ScopeDrift,
+    TodoCommitRecord, TodoStateRecord, TodoStatus, TrustLevel, VerificationCommandResult,
+    WorkerResult, WorkerStatus,
 };
 use crate::verify::{build_verification_report, run_stage_verification, verification_dir};
 use crate::worktree::{
-    WorktreeManager, apply_patch_file, apply_patch_file_for_paths, git_diff_binary, git_is_clean,
+    WorktreeManager, apply_patch_file, apply_patch_file_for_paths, git_commit_paths,
+    git_diff_binary, git_is_clean,
 };
 
 pub struct ApplyExecutionContext<'a> {
@@ -25,6 +27,23 @@ pub struct ApplyExecutionContext<'a> {
     pub verification_report_path: &'a Path,
     pub change_trust_report_path: &'a Path,
     pub execution_contract: &'a ExecutionContract,
+    pub todo_states: &'a [TodoStateRecord],
+}
+
+#[derive(Debug)]
+struct TodoBatch {
+    todo_id: String,
+    title: String,
+    changed_files: Vec<String>,
+    operation_indexes: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct TodoCommitExecution {
+    records: Vec<TodoCommitRecord>,
+    verification_results: Vec<VerificationCommandResult>,
+    final_ok: bool,
+    error: Option<String>,
 }
 
 pub async fn build_apply_plan(
@@ -34,6 +53,10 @@ pub async fn build_apply_plan(
     worker_results: &[WorkerResult],
     apply_plan_path: &Path,
 ) -> Result<ApplyPlan> {
+    if let Some(parent) = apply_plan_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建 apply 目录失败：{}", parent.display()))?;
+    }
     let result_map = worker_results
         .iter()
         .map(|item| (item.agent_id.as_str(), item))
@@ -56,6 +79,7 @@ pub async fn build_apply_plan(
         {
             operations.push(ApplyOperation {
                 agent_id: result.agent_id.clone(),
+                todo_id: node.todo_id.clone(),
                 patch_path: diff_path.clone(),
                 order: index + 1,
                 touched_files: result.changed_files.clone(),
@@ -94,6 +118,7 @@ pub async fn execute_apply_plan(
     let final_patch_path = integration_dir.join("final.patch");
     let integration_worktree = context.manager.create_named("integration", "HEAD").await?;
     let reviewer_gate = latest_reviewer_gate(context.worker_results);
+    let review_report = latest_reviewer_report(context.worker_results);
     let trust_report = build_change_trust_report(
         context.execution_contract,
         &plan,
@@ -130,6 +155,8 @@ pub async fn execute_apply_plan(
         manual_review_files: trust_report.manual_review_files.clone(),
         rejected_files: trust_report.rejected_files.clone(),
         out_of_scope_files: trust_report.out_of_scope_files.clone(),
+        todo_commits: Vec::new(),
+        review_report,
     };
 
     match plan.mode {
@@ -250,29 +277,27 @@ pub async fn execute_apply_plan(
                     apply_result.final_patch_path = Some(final_patch_path.clone());
 
                     if git_is_clean(context.repo_root).await? {
-                        match apply_patch_file(context.repo_root, &final_patch_path).await {
-                            Ok(()) => {
-                                final_results = run_stage_verification(
-                                    "final",
-                                    context.verification_commands,
-                                    context.repo_root,
-                                    &verification_root,
-                                )
-                                .await?;
-                                let final_ok = final_results.iter().all(|item| item.passed());
-                                apply_result.synced_to_target = final_ok;
-                                apply_result.status = if final_ok {
-                                    ApplyStatus::Applied
-                                } else {
-                                    ApplyStatus::VerificationFailed
-                                };
-                            }
-                            Err(error) => {
-                                apply_result.status = ApplyStatus::SyncFailed;
-                                apply_result
-                                    .conflicts
-                                    .push(format!("同步目标工作区失败：{error}"));
-                            }
+                        let commit_execution = apply_and_commit_todos(
+                            context.repo_root,
+                            &plan,
+                            &trust_report.accepted_files,
+                            context.todo_states,
+                            context.verification_commands,
+                            &verification_root,
+                        )
+                        .await?;
+                        apply_result.todo_commits = commit_execution.records;
+                        final_results = commit_execution.verification_results;
+                        if let Some(error) = commit_execution.error {
+                            apply_result.status = ApplyStatus::SyncFailed;
+                            apply_result.conflicts.push(error);
+                        } else {
+                            apply_result.synced_to_target = commit_execution.final_ok;
+                            apply_result.status = if commit_execution.final_ok {
+                                ApplyStatus::Applied
+                            } else {
+                                ApplyStatus::VerificationFailed
+                            };
                         }
                     } else {
                         apply_result.status = ApplyStatus::SyncFailed;
@@ -302,6 +327,209 @@ pub async fn execute_apply_plan(
     persist_verification_report(&report, context.verification_report_path).await?;
     let _ = context.manager.cleanup(&integration_worktree).await;
     Ok((apply_result, report, trust_report))
+}
+
+async fn apply_and_commit_todos(
+    repo_root: &Path,
+    plan: &ApplyPlan,
+    accepted_files: &[String],
+    todo_states: &[TodoStateRecord],
+    verification_commands: &[String],
+    verification_root: &Path,
+) -> Result<TodoCommitExecution> {
+    let batches = build_todo_batches(plan, accepted_files, todo_states);
+    let mut records = Vec::new();
+    let mut verification_results = Vec::new();
+
+    for batch in batches {
+        for index in &batch.operation_indexes {
+            let operation = &plan.operations[*index];
+            let accepted_for_operation = operation
+                .touched_files
+                .iter()
+                .filter(|file| accepted_files.contains(*file))
+                .cloned()
+                .collect::<Vec<_>>();
+            let apply_res = if accepted_for_operation.len() == operation.touched_files.len() {
+                apply_patch_file(repo_root, &operation.patch_path).await
+            } else {
+                apply_patch_file_for_paths(
+                    repo_root,
+                    &operation.patch_path,
+                    &accepted_for_operation,
+                )
+                .await
+            };
+            if let Err(error) = apply_res {
+                records.push(TodoCommitRecord {
+                    todo_id: batch.todo_id.clone(),
+                    title: batch.title.clone(),
+                    status: TodoStatus::Blocked,
+                    changed_files: batch.changed_files.clone(),
+                    commit_hash: None,
+                    message: format!("应用 todo patch 失败：{error}"),
+                });
+                return Ok(TodoCommitExecution {
+                    records,
+                    verification_results,
+                    final_ok: false,
+                    error: Some(format!("todo `{}` 应用失败：{error}", batch.todo_id)),
+                });
+            }
+        }
+
+        let stage = format!("todo-{}", batch.todo_id);
+        let todo_verify =
+            run_stage_verification(&stage, verification_commands, repo_root, verification_root)
+                .await?;
+        let verified = todo_verify.iter().all(|item| item.passed());
+        verification_results.extend(todo_verify);
+        if !verified {
+            records.push(TodoCommitRecord {
+                todo_id: batch.todo_id.clone(),
+                title: batch.title.clone(),
+                status: TodoStatus::Failed,
+                changed_files: batch.changed_files.clone(),
+                commit_hash: None,
+                message: "todo 验证失败，已停止后续提交".to_string(),
+            });
+            return Ok(TodoCommitExecution {
+                records,
+                verification_results,
+                final_ok: false,
+                error: None,
+            });
+        }
+
+        let commit_message = build_todo_commit_message(&batch);
+        match git_commit_paths(
+            repo_root,
+            &commit_message,
+            &batch.changed_files,
+            batch.changed_files.is_empty(),
+        )
+        .await
+        {
+            Ok(commit_hash) => records.push(TodoCommitRecord {
+                todo_id: batch.todo_id.clone(),
+                title: batch.title.clone(),
+                status: TodoStatus::Committed,
+                changed_files: batch.changed_files.clone(),
+                commit_hash: Some(commit_hash),
+                message: commit_message,
+            }),
+            Err(error) => {
+                records.push(TodoCommitRecord {
+                    todo_id: batch.todo_id.clone(),
+                    title: batch.title.clone(),
+                    status: TodoStatus::Blocked,
+                    changed_files: batch.changed_files.clone(),
+                    commit_hash: None,
+                    message: format!("git commit 失败：{error}"),
+                });
+                return Ok(TodoCommitExecution {
+                    records,
+                    verification_results,
+                    final_ok: false,
+                    error: Some(format!("todo `{}` 提交失败：{error}", batch.todo_id)),
+                });
+            }
+        }
+    }
+
+    let final_results =
+        run_stage_verification("final", verification_commands, repo_root, verification_root)
+            .await?;
+    let final_ok = final_results.iter().all(|item| item.passed());
+    verification_results.extend(final_results);
+    Ok(TodoCommitExecution {
+        records,
+        verification_results,
+        final_ok,
+        error: None,
+    })
+}
+
+fn build_todo_batches(
+    plan: &ApplyPlan,
+    accepted_files: &[String],
+    todo_states: &[TodoStateRecord],
+) -> Vec<TodoBatch> {
+    let mut by_todo = HashMap::<String, TodoBatch>::new();
+    for todo in todo_states {
+        by_todo.insert(
+            todo.todo_id.clone(),
+            TodoBatch {
+                todo_id: todo.todo_id.clone(),
+                title: todo.title.clone(),
+                changed_files: Vec::new(),
+                operation_indexes: Vec::new(),
+            },
+        );
+    }
+
+    for (index, operation) in plan.operations.iter().enumerate() {
+        let Some(todo_id) = operation.todo_id.as_ref() else {
+            continue;
+        };
+        let accepted_for_operation = operation
+            .touched_files
+            .iter()
+            .filter(|file| accepted_files.contains(*file))
+            .cloned()
+            .collect::<Vec<_>>();
+        let batch = by_todo.entry(todo_id.clone()).or_insert_with(|| TodoBatch {
+            todo_id: todo_id.clone(),
+            title: todo_id.clone(),
+            changed_files: Vec::new(),
+            operation_indexes: Vec::new(),
+        });
+        if !accepted_for_operation.is_empty() {
+            batch.operation_indexes.push(index);
+            batch.changed_files.extend(accepted_for_operation);
+        }
+    }
+
+    let mut ordered = todo_states
+        .iter()
+        .map(|todo| {
+            let mut batch = by_todo.remove(&todo.todo_id).unwrap_or(TodoBatch {
+                todo_id: todo.todo_id.clone(),
+                title: todo.title.clone(),
+                changed_files: Vec::new(),
+                operation_indexes: Vec::new(),
+            });
+            batch.changed_files.sort();
+            batch.changed_files.dedup();
+            batch
+        })
+        .collect::<Vec<_>>();
+
+    if ordered.is_empty() {
+        for (todo_id, mut batch) in by_todo {
+            batch.changed_files.sort();
+            batch.changed_files.dedup();
+            ordered.push(TodoBatch { todo_id, ..batch });
+        }
+        ordered.sort_by(|left, right| left.todo_id.cmp(&right.todo_id));
+    }
+    ordered
+}
+
+fn build_todo_commit_message(batch: &TodoBatch) -> String {
+    let lowercase = batch.title.to_lowercase();
+    let prefix = if lowercase.contains("fix")
+        || lowercase.contains("bug")
+        || batch.title.contains("修复")
+        || batch.title.contains("修正")
+    {
+        "fix"
+    } else if batch.changed_files.is_empty() {
+        "chore"
+    } else {
+        "feat"
+    };
+    format!("{prefix}({}): {}", batch.todo_id, batch.title)
 }
 
 fn build_change_trust_report(
@@ -473,6 +701,24 @@ fn latest_reviewer_gate(worker_results: &[WorkerResult]) -> Option<ApplyDecision
                 .handoff
                 .as_ref()
                 .and_then(|handoff| handoff.apply_decision)
+        })
+        .next_back()
+}
+
+fn latest_reviewer_report(worker_results: &[WorkerResult]) -> Option<ReviewGateReport> {
+    worker_results
+        .iter()
+        .filter(|result| result.role == "reviewer")
+        .filter_map(|result| {
+            result.handoff.as_ref().and_then(|handoff| {
+                handoff.apply_decision.map(|decision| ReviewGateReport {
+                    decision,
+                    blocking_findings: handoff.blocking_findings.clone(),
+                    accepted_scopes: handoff.accepted_scopes.clone(),
+                    rejected_scopes: handoff.rejected_scopes.clone(),
+                    confidence_reasoning: handoff.confidence_reasoning.clone(),
+                })
+            })
         })
         .next_back()
 }

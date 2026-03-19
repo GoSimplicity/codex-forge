@@ -9,34 +9,46 @@ use crate::codex::{ensure_codex_available, run_worker};
 use crate::commander::{build_plan, build_plan_todo, derive_execution_contract, summarize_run};
 use crate::model::{
     ExecutionGraph, ExecutionNode, HandoffArtifact, RoleConfig, RuntimeEvent, SessionConfig,
-    SessionManifest, SessionStatus, WorkerLaunchSpec, WorkerResult, WorkerStatus,
+    SessionManifest, SessionStatus, TodoStatus, WorkerLaunchSpec, WorkerResult, WorkerStatus,
 };
 use crate::repo::discover_repo;
 use crate::roles::{find_role, render_worker_prompt};
-use crate::session::{SessionContext, find_reusable_plan_session};
+use crate::session::{SessionContext, find_reusable_plan_session, load_session};
 use crate::ui::UiController;
+use crate::workspace::{cleanup_empty_dirs, prepare_target_dir};
 use crate::worktree::{WorktreeManager, git_is_clean, materialize_dependency_patches};
 
 pub async fn plan_session(
     config: SessionConfig,
     roles: Vec<RoleConfig>,
 ) -> Result<SessionManifest> {
+    let prep = prepare_target_dir(&config.target_dir).await?;
     let repo_snapshot = discover_repo(&config.target_dir)?;
     let mut session = SessionContext::init(&config, repo_snapshot)?;
     let mut ui = UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?;
 
+    session.set_status(SessionStatus::Planning)?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::PhaseChanged {
             phase: "规划中".to_string(),
         },
     )?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::CommanderNote {
-            message: "开始生成用户规划清单与 commander 执行图。".to_string(),
+            message: format!(
+                "开始生成用户规划清单与 commander 执行图。工作目录：{}；git 初始化：{}；本地身份补齐：{}。",
+                prep.target_dir.display(),
+                if prep.git_initialized { "是" } else { "否" },
+                if prep.local_identity_configured {
+                    "是"
+                } else {
+                    "否"
+                }
+            ),
         },
     )?;
 
@@ -48,7 +60,7 @@ pub async fn plan_session(
     .await?;
     session.set_plan_todo(plan_todo.clone())?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::CommanderNote {
             message: format!("计划清单已生成，共 {} 项 todo。", plan_todo.todos.len()),
@@ -64,7 +76,7 @@ pub async fn plan_session(
     )
     .await?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::GraphReady {
             nodes: graph.nodes.len(),
@@ -76,6 +88,13 @@ pub async fn plan_session(
     session.set_graph(graph)?;
     session.set_status(SessionStatus::Completed)?;
     ui.finish()?;
+    let _ = cleanup_empty_dirs(
+        &session
+            .manifest
+            .repo_snapshot
+            .repo_root
+            .join(".codex-forge"),
+    );
 
     println!("计划已生成：`{}`", session.manifest.id);
     println!(
@@ -87,6 +106,7 @@ pub async fn plan_session(
 }
 
 pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Result<SessionManifest> {
+    let prep = prepare_target_dir(&config.target_dir).await?;
     let codex_path = ensure_codex_available()?;
     if matches!(config.apply_mode, crate::model::ApplyMode::AutoSafe) {
         let repo_snapshot = discover_repo(&config.target_dir)?;
@@ -98,22 +118,38 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     let repo_snapshot = discover_repo(&config.target_dir)?;
     let mut session = SessionContext::init(&config, repo_snapshot)?;
     let mut ui = UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?;
+    session.set_status(SessionStatus::Preflight)?;
 
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::CommanderNote {
-            message: format!("检测到 Codex CLI：`{codex_path}`"),
+            message: format!(
+                "检测到 Codex CLI：`{codex_path}`；工作目录：{}；git 初始化：{}；本地身份补齐：{}",
+                prep.target_dir.display(),
+                if prep.git_initialized { "是" } else { "否" },
+                if prep.local_identity_configured {
+                    "是"
+                } else {
+                    "否"
+                }
+            ),
         },
     )?;
+    session.set_status(SessionStatus::Planning)?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::PhaseChanged {
             phase: "规划中".to_string(),
         },
     )?;
 
+    let resumed_session = if let Some(session_id) = config.resume_session_id.as_deref() {
+        Some(load_session(&config.target_dir, Some(session_id))?)
+    } else {
+        None
+    };
     let reused_plan = find_reusable_plan_session(
         &config.target_dir,
         &config.task,
@@ -121,13 +157,43 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         &config.role_set,
     )?;
 
-    let graph = if let Some(plan_manifest) = reused_plan {
+    let (graph, seed_results) = if let Some(resume_manifest) = resumed_session {
+        if let Some(plan_todo) = resume_manifest.plan_todo.clone() {
+            session.set_plan_todo(plan_todo)?;
+        }
+        session.set_resumed_from_session_id(resume_manifest.id.clone())?;
+        record_event(
+            &mut session,
+            &mut ui,
+            RuntimeEvent::CommanderNote {
+                message: format!(
+                    "恢复 session：`{}`，将复用其执行图与已成功节点。",
+                    resume_manifest.id
+                ),
+            },
+        )?;
+        let graph = resume_manifest
+            .execution_graph
+            .clone()
+            .context("恢复 session 缺少执行图")?;
+        let contract = resume_manifest
+            .execution_contract
+            .clone()
+            .unwrap_or_else(|| derive_execution_contract(&config, &graph));
+        session.set_execution_contract(contract)?;
+        let seed_results = resume_manifest
+            .worker_results
+            .into_iter()
+            .filter(|result| result.status == WorkerStatus::Succeeded)
+            .collect::<Vec<_>>();
+        (graph, seed_results)
+    } else if let Some(plan_manifest) = reused_plan {
         if let Some(plan_todo) = plan_manifest.plan_todo.clone() {
             session.set_plan_todo(plan_todo)?;
         }
         session.set_reused_plan_session_id(plan_manifest.id.clone())?;
         record_event(
-            &session,
+            &mut session,
             &mut ui,
             RuntimeEvent::CommanderNote {
                 message: format!("复用 plan 会话：`{}`", plan_manifest.id),
@@ -140,7 +206,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
             .execution_contract
             .unwrap_or_else(|| derive_execution_contract(&config, &graph));
         session.set_execution_contract(contract)?;
-        graph
+        (graph, Vec::new())
     } else {
         let plan_todo = build_plan_todo(
             &config,
@@ -150,7 +216,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         .await?;
         session.set_plan_todo(plan_todo.clone())?;
         record_event(
-            &session,
+            &mut session,
             &mut ui,
             RuntimeEvent::CommanderNote {
                 message: format!("本次运行生成了 {} 项 todo 计划。", plan_todo.todos.len()),
@@ -166,11 +232,12 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         .await?;
         let contract = derive_execution_contract(&config, &graph);
         session.set_execution_contract(contract)?;
-        graph
+        (graph, Vec::new())
     };
 
+    session.set_status(SessionStatus::Ready)?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::GraphReady {
             nodes: graph.nodes.len(),
@@ -179,7 +246,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     )?;
     for note in &graph.planning_notes {
         record_event(
-            &session,
+            &mut session,
             &mut ui,
             RuntimeEvent::CommanderNote {
                 message: note.clone(),
@@ -195,7 +262,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     )?;
 
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::PhaseChanged {
             phase: "依赖调度中".to_string(),
@@ -203,7 +270,8 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     )?;
 
     let mut finished =
-        schedule_graph(&config, &roles, &graph, &manager, &mut session, &mut ui).await?;
+        schedule_graph(&config, &roles, &graph, &manager, &mut session, &mut ui, &seed_results)
+            .await?;
 
     if config.cleanup_success {
         for result in &finished {
@@ -212,7 +280,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
             }
         }
         record_event(
-            &session,
+            &mut session,
             &mut ui,
             RuntimeEvent::CommanderNote {
                 message: "已清理成功节点的 worker worktree。".to_string(),
@@ -220,14 +288,30 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         )?;
     }
 
+    session.set_status(SessionStatus::Reviewing)?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::PhaseChanged {
             phase: "集成应用中".to_string(),
         },
     )?;
-    session.set_status(SessionStatus::Integrating)?;
+    session.set_status(SessionStatus::Applying)?;
+    for todo in session.manifest.todo_states.clone() {
+        if matches!(
+            todo.status,
+            TodoStatus::Pending | TodoStatus::Ready | TodoStatus::Running
+        ) {
+            update_todo_status(
+                &mut session,
+                &mut ui,
+                &todo.todo_id,
+                TodoStatus::InReview,
+                "进入 reviewer gate 与集成应用阶段",
+                None,
+            )?;
+        }
+    }
 
     let ordered_worker_ids = graph.topological_order()?;
     let apply_plan = build_apply_plan(
@@ -242,7 +326,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         Some(session.manifest.apply_plan_path.clone());
     session.persist_artifact_manifest()?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::ApplyPlanReady {
             mode: apply_plan.mode,
@@ -266,18 +350,29 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
                 .execution_contract
                 .as_ref()
                 .context("当前 session 缺少 execution contract")?,
+            todo_states: &session.manifest.todo_states,
         },
     )
     .await?;
+    if let Some(review_report) = apply_result.review_report.clone() {
+        record_event(
+            &mut session,
+            &mut ui,
+            RuntimeEvent::ReviewGateReady {
+                report: Box::new(review_report),
+            },
+        )?;
+    }
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::ApplyUpdate {
             message: format!("应用阶段完成：{}", apply_result.status.label()),
         },
     )?;
+    session.set_status(SessionStatus::Verifying)?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::VerificationReady {
             stage: "全链路".to_string(),
@@ -292,9 +387,59 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     session.set_apply_result(apply_result)?;
     session.set_verification_report(verification_report)?;
     session.set_change_trust_report(change_trust_report)?;
+    if session
+        .manifest
+        .apply_result
+        .as_ref()
+        .is_some_and(|item| item.todo_commits.is_empty())
+    {
+        let fallback_status = match session
+            .manifest
+            .apply_result
+            .as_ref()
+            .map(|item| item.status)
+        {
+            Some(crate::model::ApplyStatus::Applied) => TodoStatus::Applied,
+            Some(crate::model::ApplyStatus::VerificationFailed) => TodoStatus::Failed,
+            Some(crate::model::ApplyStatus::Bundled)
+            | Some(crate::model::ApplyStatus::Skipped)
+            | Some(crate::model::ApplyStatus::SyncFailed)
+            | None => TodoStatus::NeedsManualFollowup,
+        };
+        for todo in session.manifest.todo_states.clone() {
+            if !matches!(todo.status, TodoStatus::Committed | TodoStatus::Failed | TodoStatus::Blocked)
+            {
+                update_todo_status(
+                    &mut session,
+                    &mut ui,
+                    &todo.todo_id,
+                    fallback_status,
+                    "当前 todo 尚未形成自动提交结果，请按 summary 做后续处理",
+                    None,
+                )?;
+            }
+        }
+    }
+    for record in session
+        .manifest
+        .apply_result
+        .as_ref()
+        .map(|item| item.todo_commits.clone())
+        .unwrap_or_default()
+    {
+        update_todo_status(
+            &mut session,
+            &mut ui,
+            &record.todo_id,
+            record.status,
+            record.message,
+            record.commit_hash,
+        )?;
+    }
 
+    session.set_status(SessionStatus::Summarizing)?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::PhaseChanged {
             phase: "总结中".to_string(),
@@ -305,7 +450,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         summarize_run(&config, &session.manifest, &roles, &session.commander_dir()).await?;
     session.set_summary(summary.clone())?;
     record_event(
-        &session,
+        &mut session,
         &mut ui,
         RuntimeEvent::SummaryReady {
             summary: Box::new(summary),
@@ -314,6 +459,13 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
 
     session.set_status(SessionStatus::Completed)?;
     ui.finish()?;
+    let _ = cleanup_empty_dirs(
+        &session
+            .manifest
+            .repo_snapshot
+            .repo_root
+            .join(".codex-forge"),
+    );
 
     finished.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
     Ok(session.manifest)
@@ -326,6 +478,7 @@ async fn schedule_graph(
     manager: &WorktreeManager,
     session: &mut SessionContext,
     ui: &mut UiController,
+    seed_results: &[WorkerResult],
 ) -> Result<Vec<WorkerResult>> {
     let ordered_ids = graph.topological_order()?;
     let node_map = graph
@@ -345,6 +498,33 @@ async fn schedule_graph(
     let mut results = Vec::new();
     let mut result_by_id = HashMap::<String, WorkerResult>::new();
     let mut stop_dispatch = false;
+
+    for result in seed_results {
+        pending.remove(&result.agent_id);
+        result_by_id.insert(result.agent_id.clone(), result.clone());
+        results.push(result.clone());
+        session.add_worker_result(result.clone())?;
+        if let Some(node) = node_map.get(result.agent_id.as_str()).copied()
+            && let Some(todo_id) = node.todo_id.as_deref()
+        {
+            session.mark_todo_node_completed(todo_id, &result.agent_id)?;
+            update_todo_status(
+                session,
+                ui,
+                todo_id,
+                TodoStatus::Ready,
+                format!("复用历史成功节点 {}", result.agent_id),
+                None,
+            )?;
+        }
+        record_event(
+            session,
+            ui,
+            RuntimeEvent::WorkerFinished {
+                result: Box::new(result.clone()),
+            },
+        )?;
+    }
 
     loop {
         let mut dispatched_any = false;
@@ -462,6 +642,16 @@ async fn schedule_graph(
                     worktree_path: worktree_path.clone(),
                 },
             )?;
+            if let Some(todo_id) = node.todo_id.as_deref() {
+                update_todo_status(
+                    session,
+                    ui,
+                    todo_id,
+                    TodoStatus::Running,
+                    format!("开始执行节点 {}", node.id),
+                    None,
+                )?;
+            }
 
             let model = config.model.clone();
             let tx_clone = tx.clone();
@@ -505,6 +695,44 @@ async fn schedule_graph(
         if let Some(event) = rx.recv().await {
             if let RuntimeEvent::WorkerFinished { result } = &event {
                 let result = result.as_ref().clone();
+                if let Some(node) = node_map.get(result.agent_id.as_str()).copied()
+                    && let Some(todo_id) = node.todo_id.as_deref()
+                {
+                    match result.status {
+                        WorkerStatus::Succeeded => {
+                            session.mark_todo_node_completed(todo_id, &result.agent_id)?;
+                            update_todo_status(
+                                session,
+                                ui,
+                                todo_id,
+                                TodoStatus::Running,
+                                format!("节点 {} 已完成，等待 todo 汇总验证", result.agent_id),
+                                None,
+                            )?;
+                        }
+                        WorkerStatus::Failed => {
+                            update_todo_status(
+                                session,
+                                ui,
+                                todo_id,
+                                TodoStatus::Failed,
+                                format!("节点 {} 执行失败", result.agent_id),
+                                None,
+                            )?;
+                        }
+                        WorkerStatus::Skipped => {
+                            update_todo_status(
+                                session,
+                                ui,
+                                todo_id,
+                                TodoStatus::Blocked,
+                                format!("节点 {} 被跳过", result.agent_id),
+                                None,
+                            )?;
+                        }
+                        WorkerStatus::Pending | WorkerStatus::Running => {}
+                    }
+                }
                 running.remove(&result.agent_id);
                 pending.remove(&result.agent_id);
                 result_by_id.insert(result.agent_id.clone(), result.clone());
@@ -617,10 +845,38 @@ fn skipped_result(
 }
 
 fn record_event(
-    session: &SessionContext,
+    session: &mut SessionContext,
     ui: &mut UiController,
     event: RuntimeEvent,
 ) -> Result<()> {
     session.append_timeline(&event)?;
     ui.apply(&event)
+}
+
+fn update_todo_status(
+    session: &mut SessionContext,
+    ui: &mut UiController,
+    todo_id: &str,
+    status: TodoStatus,
+    message: impl Into<String>,
+    commit_hash: Option<String>,
+) -> Result<()> {
+    if let Some(updated) =
+        session.update_todo_status(todo_id, status, message.into(), commit_hash)?
+    {
+        record_event(
+            session,
+            ui,
+            RuntimeEvent::TodoStateChanged {
+                todo_id: updated.todo_id,
+                title: updated.title,
+                status: updated.status,
+                message: updated
+                    .last_message
+                    .unwrap_or_else(|| "状态已更新".to_string()),
+                commit_hash: updated.commit_hash,
+            },
+        )?;
+    }
+    Ok(())
 }
