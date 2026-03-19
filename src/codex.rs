@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 
 use crate::model::{
@@ -17,6 +17,7 @@ use crate::model::{
 };
 use crate::worktree::capture_git_artifacts;
 
+/// 启动前先确认本机真的能调用 `codex`，避免在更深层执行中才报环境错误。
 pub fn ensure_codex_available() -> Result<String> {
     let path = which::which("codex").context("未找到 `codex` 命令，请先确认 Codex CLI 已安装")?;
     Ok(path.display().to_string())
@@ -30,6 +31,7 @@ pub async fn run_json_once(
     log_path: &Path,
     max_retries: usize,
 ) -> Result<String> {
+    // planner / summarizer 一类结构化调用都走这里，统一处理重试与日志落盘。
     let attempts = max_retries.max(1);
     let mut last_error = None;
 
@@ -78,6 +80,7 @@ async fn run_json_attempt(
     }
 
     command
+        .kill_on_drop(true)
         .arg(prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -191,7 +194,10 @@ pub async fn run_worker(
     spec: WorkerLaunchSpec,
     model: Option<&str>,
     tx: mpsc::Sender<RuntimeEvent>,
+    stop_rx: Option<watch::Receiver<bool>>,
 ) -> Result<WorkerResult> {
+    // worker 是 orchestrator 调度的最小执行单元：
+    // 负责写 prompt、运行 codex、解析事件、提取 handoff，并把状态回推给调度层。
     if let Some(parent) = spec.prompt_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建 worker 目录失败：{}", parent.display()))?;
@@ -201,9 +207,10 @@ pub async fn run_worker(
 
     let attempts = spec.max_retries.max(1);
     let mut last_error = None;
+    let stop_rx = stop_rx;
 
     for attempt in 1..=attempts {
-        let result = run_worker_attempt(&spec, model, tx.clone(), attempt).await?;
+        let result = run_worker_attempt(&spec, model, tx.clone(), attempt, stop_rx.clone()).await?;
         let retryable = result.status == WorkerStatus::Failed
             && result
                 .error
@@ -249,6 +256,7 @@ async fn run_worker_attempt(
     model: Option<&str>,
     tx: mpsc::Sender<RuntimeEvent>,
     attempt: usize,
+    mut stop_rx: Option<watch::Receiver<bool>>,
 ) -> Result<WorkerResult> {
     if spec.final_output_path.exists() {
         let _ = fs::remove_file(&spec.final_output_path);
@@ -273,6 +281,7 @@ async fn run_worker_attempt(
     }
 
     command
+        .kill_on_drop(true)
         .arg(&spec.prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -309,7 +318,37 @@ async fn run_worker_attempt(
         spec.events_path.clone(),
     ));
 
-    while let Some(line_event) = line_rx.recv().await {
+    let mut cancelled = false;
+    loop {
+        // 这里同时监听两类输入：
+        // 1. worker stdout/stderr 转出来的事件
+        // 2. 来自 orchestrator / TUI 的停止信号
+        if stop_rx
+            .as_ref()
+            .map(|receiver| *receiver.borrow())
+            .unwrap_or(false)
+        {
+            cancelled = true;
+            break;
+        }
+
+        let next_line = if let Some(receiver) = stop_rx.as_mut() {
+            tokio::select! {
+                maybe_line = line_rx.recv() => maybe_line,
+                changed = receiver.changed() => {
+                    if changed.is_ok() && *receiver.borrow() {
+                        cancelled = true;
+                    }
+                    None
+                }
+            }
+        } else {
+            line_rx.recv().await
+        };
+
+        let Some(line_event) = next_line else {
+            break;
+        };
         let (kind, message, _) = parse_event_line(&line_event.line);
         let kind = if line_event.stream == "stderr" {
             format!("stderr:{kind}")
@@ -325,7 +364,14 @@ async fn run_worker_attempt(
             .await;
     }
 
-    let status = child.wait().await.context("等待 worker 进程结束失败")?;
+    let status = if cancelled {
+        // 停止时显式 kill 子进程，避免只退出上层 future 却留下后台 codex 进程。
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        None
+    } else {
+        Some(child.wait().await.context("等待 worker 进程结束失败")?)
+    };
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
@@ -357,6 +403,11 @@ async fn run_worker_attempt(
     }
 
     let stderr_excerpt = read_tail(&spec.stderr_path, 240).unwrap_or_default();
+    if cancelled {
+        return Ok(cancelled_result(spec, attempt));
+    }
+
+    let status = status.expect("cancelled 分支已提前返回");
     let error = match (status.success(), spec.final_output_path.exists()) {
         (true, true) => None,
         (true, false) => Some("worker 返回成功但缺少结构化输出文件".to_string()),
@@ -558,6 +609,32 @@ fn failed_result(
     }
 }
 
+fn cancelled_result(spec: &WorkerLaunchSpec, attempts: usize) -> WorkerResult {
+    WorkerResult {
+        agent_id: spec.agent_id.clone(),
+        role: spec.role.clone(),
+        task_title: spec.task_title.clone(),
+        status: WorkerStatus::Skipped,
+        exit_code: None,
+        attempts,
+        diagnostic_summary: Some("用户取消执行".to_string()),
+        final_message: String::new(),
+        summary: None,
+        changed_files: Vec::new(),
+        worktree_path: spec.worktree_path.clone(),
+        prompt_path: spec.prompt_path.clone(),
+        stdout_path: spec.stdout_path.clone(),
+        stderr_path: spec.stderr_path.clone(),
+        events_path: spec.events_path.clone(),
+        final_output_path: spec.final_output_path.clone(),
+        diff_path: Some(spec.diff_path.clone()),
+        git_status_path: Some(spec.git_status_path.clone()),
+        handoff_path: None,
+        handoff: None,
+        error: Some("用户取消执行".to_string()),
+    }
+}
+
 pub fn extract_summary_section(final_message: &str) -> Option<String> {
     let marker = "# 交付摘要";
     let start = final_message.find(marker)?;
@@ -593,18 +670,12 @@ pub fn parse_handoff(
     let handoff_section = sections.get("交接").map(String::as_str).unwrap_or_default();
     let apply_decision = parse_apply_decision(handoff_section);
     let downstream_suggestions = split_non_decision_lines(handoff_section);
-    let blocking_findings = collect_prefixed_lines(
-        handoff_section,
-        &["BLOCKING_FINDING:", "blocking_finding:"],
-    );
-    let accepted_scopes = collect_prefixed_lines(
-        handoff_section,
-        &["ACCEPT_SCOPE:", "accept_scope:"],
-    );
-    let rejected_scopes = collect_prefixed_lines(
-        handoff_section,
-        &["REJECT_SCOPE:", "reject_scope:"],
-    );
+    let blocking_findings =
+        collect_prefixed_lines(handoff_section, &["BLOCKING_FINDING:", "blocking_finding:"]);
+    let accepted_scopes =
+        collect_prefixed_lines(handoff_section, &["ACCEPT_SCOPE:", "accept_scope:"]);
+    let rejected_scopes =
+        collect_prefixed_lines(handoff_section, &["REJECT_SCOPE:", "reject_scope:"]);
     let confidence_reasoning = collect_prefixed_value(
         handoff_section,
         &["CONFIDENCE_REASONING:", "confidence_reasoning:"],

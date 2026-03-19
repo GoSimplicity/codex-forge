@@ -9,7 +9,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap};
@@ -18,33 +18,36 @@ use crate::model::{
     FinalSummary, ReviewGateReport, RuntimeEvent, TodoStatus, UiMode, WorkerResult, WorkerStatus,
 };
 
+/// Dashboard 里展示的单个 worker 视图状态。
 #[derive(Debug, Clone)]
-struct WorkerView {
-    role: String,
-    title: String,
-    status: WorkerStatus,
-    last_event: String,
-    worktree_path: String,
+pub struct WorkerView {
+    pub role: String,
+    pub title: String,
+    pub status: WorkerStatus,
+    pub last_event: String,
+    pub worktree_path: String,
 }
 
+/// 运行态共享视图模型。
+/// 旧 CLI Rich UI 和 v5 AppShell 都复用这份状态，避免出现两套运行态解释逻辑。
 #[derive(Debug, Clone)]
-struct UiState {
-    session_id: String,
-    task: String,
-    phase: String,
-    started_at: Instant,
-    commander_notes: Vec<String>,
-    workers: BTreeMap<String, WorkerView>,
-    todos: BTreeMap<String, (String, TodoStatus, String)>,
-    review_report: Option<ReviewGateReport>,
-    summary: Option<FinalSummary>,
-    graph_summary: Option<String>,
-    apply_status: Option<String>,
-    verify_status: Option<String>,
+pub struct RuntimeViewState {
+    pub session_id: String,
+    pub task: String,
+    pub phase: String,
+    pub started_at: Instant,
+    pub commander_notes: Vec<String>,
+    pub workers: BTreeMap<String, WorkerView>,
+    pub todos: BTreeMap<String, (String, TodoStatus, String)>,
+    pub review_report: Option<ReviewGateReport>,
+    pub summary: Option<FinalSummary>,
+    pub graph_summary: Option<String>,
+    pub apply_status: Option<String>,
+    pub verify_status: Option<String>,
 }
 
-impl UiState {
-    fn new(session_id: &str, task: &str) -> Self {
+impl RuntimeViewState {
+    pub fn new(session_id: &str, task: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
             task: task.to_string(),
@@ -61,7 +64,13 @@ impl UiState {
         }
     }
 
-    fn apply(&mut self, event: &RuntimeEvent) {
+    pub fn set_identity(&mut self, session_id: impl Into<String>, task: impl Into<String>) {
+        self.session_id = session_id.into();
+        self.task = task.into();
+    }
+
+    pub fn apply(&mut self, event: &RuntimeEvent) {
+        // 所有 RuntimeEvent 都在这里被折叠成“终端可渲染的稳定状态”。
         match event {
             RuntimeEvent::PhaseChanged { phase } => {
                 self.phase = phase.clone();
@@ -82,10 +91,8 @@ impl UiState {
                 message,
                 commit_hash,
             } => {
-                self.todos.insert(
-                    todo_id.clone(),
-                    (title.clone(), *status, message.clone()),
-                );
+                self.todos
+                    .insert(todo_id.clone(), (title.clone(), *status, message.clone()));
                 let suffix = commit_hash
                     .as_ref()
                     .map(|hash| format!(" / commit {}", truncate(hash, 12)))
@@ -169,13 +176,14 @@ impl UiState {
 }
 
 pub struct UiController {
-    state: UiState,
+    state: RuntimeViewState,
     backend: UiBackend,
 }
 
 enum UiBackend {
     Rich(RichTerminal),
     Plain,
+    Silent,
 }
 
 struct RichTerminal {
@@ -193,7 +201,7 @@ impl Drop for RichTerminal {
 
 impl UiController {
     pub fn new(session_id: &str, task: &str, ui_mode: UiMode) -> Result<Self> {
-        let state = UiState::new(session_id, task);
+        let state = RuntimeViewState::new(session_id, task);
         let backend = match ui_mode {
             UiMode::Rich if io::stdout().is_terminal() => {
                 enable_raw_mode()?;
@@ -210,10 +218,19 @@ impl UiController {
         Ok(Self { state, backend })
     }
 
+    pub fn silent(session_id: &str, task: &str) -> Self {
+        Self {
+            state: RuntimeViewState::new(session_id, task),
+            backend: UiBackend::Silent,
+        }
+    }
+
     pub fn apply(&mut self, event: &RuntimeEvent) -> Result<()> {
         self.state.apply(event);
         match &mut self.backend {
             UiBackend::Rich(rich) => {
+                // Rich 模式做一点节流，避免高频 worker 事件把终端刷爆；
+                // 但关键节点完成、验证完成、summary 完成时仍然立即刷新。
                 if rich.last_draw.elapsed() >= Duration::from_millis(90)
                     || matches!(
                         event,
@@ -226,6 +243,7 @@ impl UiController {
                 }
             }
             UiBackend::Plain => render_plain(event),
+            UiBackend::Silent => {}
         }
         Ok(())
     }
@@ -238,235 +256,301 @@ impl UiController {
     }
 }
 
-fn render_rich(rich: &mut RichTerminal, state: &UiState) -> Result<()> {
-    rich.terminal.draw(|frame| {
-        let area = frame.area();
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(10),
-                Constraint::Length(8),
-                Constraint::Length(6),
-            ])
-            .split(area);
-
-        let success = state
-            .workers
-            .values()
-            .filter(|worker| worker.status == WorkerStatus::Succeeded)
-            .count();
-        let failed = state
-            .workers
-            .values()
-            .filter(|worker| matches!(worker.status, WorkerStatus::Failed | WorkerStatus::Skipped))
-            .count();
-        let running = state
-            .workers
-            .values()
-            .filter(|worker| worker.status == WorkerStatus::Running)
-            .count();
-
-        let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "◢ CODEX-FORGE V4 ◣",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!("Session {}", state.session_id),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]),
-            Line::from(format!("任务：{}", truncate(&state.task, 100))),
-            Line::from(format!(
-                "阶段：{}   运行中：{}   成功：{}   失败/跳过：{}   已耗时：{}s",
-                state.phase,
-                running,
-                success,
-                failed,
-                state.started_at.elapsed().as_secs()
-            )),
-            Line::from(format!(
-                "执行图：{}   应用：{}   验证：{}",
-                state
-                    .graph_summary
-                    .clone()
-                    .unwrap_or_else(|| "等待".to_string()),
-                state
-                    .apply_status
-                    .clone()
-                    .unwrap_or_else(|| "等待".to_string()),
-                state
-                    .verify_status
-                    .clone()
-                    .unwrap_or_else(|| "等待".to_string())
-            )),
+pub fn render_runtime_dashboard(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &RuntimeViewState,
+    title: &str,
+) {
+    // 这个布局是 v5 执行页主视图，也是旧 Rich UI 的基础信息源：
+    // 顶部总览 / 中间 worker+todo / 下方 commander notes / 底部状态面板。
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(8),
+            Constraint::Length(6),
         ])
-        .block(Block::default().title("总览").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-        frame.render_widget(header, sections[0]);
+        .split(area);
 
-        let middle_sections = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(sections[1]);
+    let success = state
+        .workers
+        .values()
+        .filter(|worker| worker.status == WorkerStatus::Succeeded)
+        .count();
+    let failed = state
+        .workers
+        .values()
+        .filter(|worker| matches!(worker.status, WorkerStatus::Failed | WorkerStatus::Skipped))
+        .count();
+    let running = state
+        .workers
+        .values()
+        .filter(|worker| worker.status == WorkerStatus::Running)
+        .count();
 
-        let worker_rows = state
-            .workers
-            .iter()
-            .map(|(agent_id, worker)| {
-                Row::new(vec![
-                    Cell::from(agent_id.clone()),
-                    Cell::from(worker.role.clone()),
-                    Cell::from(worker.status.label()),
-                    Cell::from(truncate(&worker.title, 24)),
-                    Cell::from(truncate(&worker.last_event, 44)),
-                ])
-                .style(style_for_status(worker.status))
-            })
-            .collect::<Vec<_>>();
-
-        let workers_table = Table::new(
-            worker_rows,
-            [
-                Constraint::Length(14),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Length(24),
-                Constraint::Min(20),
-            ],
-        )
-        .header(
-            Row::new(vec!["Agent", "角色", "状态", "任务", "最新事件"]).style(
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "◢ CODEX-FORGE V5 ◣",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-        )
-        .block(Block::default().title("Worker 矩阵").borders(Borders::ALL))
-        .column_spacing(1);
-        frame.render_widget(workers_table, middle_sections[0]);
+            Span::raw("  "),
+            Span::styled(
+                format!("Session {}", state.session_id),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(format!("任务：{}", truncate(&state.task, 100))),
+        Line::from(format!(
+            "阶段：{}   运行中：{}   成功：{}   失败/跳过：{}   已耗时：{}s",
+            state.phase,
+            running,
+            success,
+            failed,
+            state.started_at.elapsed().as_secs()
+        )),
+        Line::from(format!(
+            "执行图：{}   应用：{}   验证：{}",
+            state
+                .graph_summary
+                .clone()
+                .unwrap_or_else(|| "等待".to_string()),
+            state
+                .apply_status
+                .clone()
+                .unwrap_or_else(|| "等待".to_string()),
+            state
+                .verify_status
+                .clone()
+                .unwrap_or_else(|| "等待".to_string())
+        )),
+    ])
+    .block(Block::default().title(title).borders(Borders::ALL))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(header, sections[0]);
 
-        let todo_items = state
-            .todos
-            .iter()
-            .map(|(todo_id, (title, status, message))| {
-                ListItem::new(Line::from(format!(
-                    "{} {} / {} / {}",
-                    todo_id,
-                    truncate(title, 18),
-                    status.label(),
-                    truncate(message, 22)
-                )))
-            })
-            .collect::<Vec<_>>();
-        let review_lines = if let Some(report) = &state.review_report {
-            vec![
-                Line::from(format!("结论：{}", report.decision.label())),
-                Line::from(format!(
-                    "说明：{}",
-                    truncate(
-                        report
-                            .confidence_reasoning
-                            .as_deref()
-                            .unwrap_or("无补充说明"),
-                        44
-                    )
-                )),
-                Line::from(format!(
-                    "阻断项：{}",
-                    truncate(&report.blocking_findings.join("；"), 44)
-                )),
-            ]
-        } else {
-            vec![
-                Line::from("结论：等待 reviewer"),
-                Line::from("说明：尚未形成 gate"),
-                Line::from("阻断项：无"),
-            ]
-        };
-        let right_sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .split(middle_sections[1]);
-        frame.render_widget(
-            List::new(todo_items)
-                .block(Block::default().title("Todo 态势").borders(Borders::ALL)),
-            right_sections[0],
-        );
-        frame.render_widget(
-            Paragraph::new(review_lines)
-                .block(Block::default().title("Review Gate").borders(Borders::ALL))
-                .wrap(Wrap { trim: true }),
-            right_sections[1],
-        );
+    let middle_sections = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(sections[1]);
 
-        let note_items = state
-            .commander_notes
-            .iter()
-            .rev()
-            .map(|note| ListItem::new(Line::from(Span::raw(note.clone()))))
-            .collect::<Vec<_>>();
-        let notes = List::new(note_items).block(
-            Block::default()
-                .title("Commander 决策流")
-                .borders(Borders::ALL),
-        );
-        frame.render_widget(notes, sections[2]);
+    let worker_rows = state
+        .workers
+        .iter()
+        .map(|(agent_id, worker)| {
+            Row::new(vec![
+                Cell::from(agent_id.clone()),
+                Cell::from(worker.role.clone()),
+                Cell::from(worker.status.label()),
+                Cell::from(truncate(&worker.title, 24)),
+                Cell::from(truncate(&worker.last_event, 44)),
+            ])
+            .style(style_for_status(worker.status))
+        })
+        .collect::<Vec<_>>();
 
-        let summary_text = if let Some(summary) = &state.summary {
-            vec![
-                Line::from(Span::styled(
-                    "最终收敛摘要",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(summary.overview.clone()),
-                Line::from(format!(
-                    "接收文件：{}",
-                    if summary.accepted_files.is_empty() {
-                        "无".to_string()
-                    } else {
-                        truncate(&summary.accepted_files.join("；"), 120)
-                    }
-                )),
-                Line::from(format!(
-                    "人工复核：{}",
-                    if summary.manual_review_files.is_empty() {
-                        "无".to_string()
-                    } else {
-                        truncate(&summary.manual_review_files.join("；"), 120)
-                    }
-                )),
-                Line::from(format!(
-                    "风险：{}",
-                    if summary.open_risks.is_empty() {
-                        "无".to_string()
-                    } else {
-                        truncate(&summary.open_risks.join("；"), 120)
-                    }
-                )),
-            ]
-        } else if let Some(worker) = state.workers.values().last() {
-            vec![
-                Line::from("等待最终收敛摘要…"),
-                Line::from(format!(
-                    "最近 worktree：{}",
-                    truncate(&worker.worktree_path, 100)
-                )),
-            ]
-        } else {
-            vec![Line::from("等待 worker 启动…")]
-        };
-        let footer = Paragraph::new(summary_text)
-            .block(Block::default().title("状态面板").borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(footer, sections[3]);
+    let workers_table = Table::new(
+        worker_rows,
+        [
+            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(24),
+            Constraint::Min(20),
+        ],
+    )
+    .header(
+        Row::new(vec!["Agent", "角色", "状态", "任务", "最新事件"]).style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(Block::default().title("Worker 矩阵").borders(Borders::ALL))
+    .column_spacing(1);
+    frame.render_widget(workers_table, middle_sections[0]);
+
+    let todo_items = state
+        .todos
+        .iter()
+        .map(|(todo_id, (title, status, message))| {
+            ListItem::new(Line::from(format!(
+                "{} {} / {} / {}",
+                todo_id,
+                truncate(title, 18),
+                status.label(),
+                truncate(message, 22)
+            )))
+        })
+        .collect::<Vec<_>>();
+    let review_lines = if let Some(report) = &state.review_report {
+        vec![
+            Line::from(format!("结论：{}", report.decision.label())),
+            Line::from(format!(
+                "说明：{}",
+                truncate(
+                    report
+                        .confidence_reasoning
+                        .as_deref()
+                        .unwrap_or("无补充说明"),
+                    44
+                )
+            )),
+            Line::from(format!(
+                "阻断项：{}",
+                truncate(&report.blocking_findings.join("；"), 44)
+            )),
+        ]
+    } else {
+        vec![
+            Line::from("结论：等待 reviewer"),
+            Line::from("说明：尚未形成 gate"),
+            Line::from("阻断项：无"),
+        ]
+    };
+    let right_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(middle_sections[1]);
+    frame.render_widget(
+        List::new(todo_items).block(Block::default().title("Todo 态势").borders(Borders::ALL)),
+        right_sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new(review_lines)
+            .block(Block::default().title("Review Gate").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        right_sections[1],
+    );
+
+    let note_items = state
+        .commander_notes
+        .iter()
+        .rev()
+        .map(|note| ListItem::new(Line::from(Span::raw(note.clone()))))
+        .collect::<Vec<_>>();
+    let notes = List::new(note_items).block(
+        Block::default()
+            .title("Commander 决策流")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(notes, sections[2]);
+
+    let summary_text = if let Some(summary) = &state.summary {
+        vec![
+            Line::from(Span::styled(
+                "最终收敛摘要",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(summary.overview.clone()),
+            Line::from(format!(
+                "接收文件：{}",
+                if summary.accepted_files.is_empty() {
+                    "无".to_string()
+                } else {
+                    truncate(&summary.accepted_files.join("；"), 120)
+                }
+            )),
+            Line::from(format!(
+                "人工复核：{}",
+                if summary.manual_review_files.is_empty() {
+                    "无".to_string()
+                } else {
+                    truncate(&summary.manual_review_files.join("；"), 120)
+                }
+            )),
+            Line::from(format!(
+                "风险：{}",
+                if summary.open_risks.is_empty() {
+                    "无".to_string()
+                } else {
+                    truncate(&summary.open_risks.join("；"), 120)
+                }
+            )),
+        ]
+    } else if let Some(worker) = state.workers.values().last() {
+        vec![
+            Line::from("等待最终收敛摘要…"),
+            Line::from(format!(
+                "最近 worktree：{}",
+                truncate(&worker.worktree_path, 100)
+            )),
+        ]
+    } else {
+        vec![Line::from("等待 worker 启动…")]
+    };
+    let footer = Paragraph::new(summary_text)
+        .block(Block::default().title("状态面板").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, sections[3]);
+}
+
+pub fn describe_runtime_event(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::PhaseChanged { phase } => format!("阶段切换 -> {phase}"),
+        RuntimeEvent::CommanderNote { message } => format!("指挥备注：{message}"),
+        RuntimeEvent::GraphReady {
+            nodes,
+            dependencies,
+        } => format!("执行图就绪：节点 {nodes} / 依赖 {dependencies}"),
+        RuntimeEvent::TodoStateChanged {
+            todo_id,
+            title,
+            status,
+            message,
+            ..
+        } => format!("{todo_id} {title} -> {} / {message}", status.label()),
+        RuntimeEvent::WorkerDispatched {
+            agent_id,
+            role,
+            title,
+            ..
+        } => format!("启动 {agent_id} / {role} / {title}"),
+        RuntimeEvent::WorkerUpdate {
+            agent_id,
+            kind,
+            message,
+        } => format!("{agent_id} [{kind}] {}", truncate(message, 96)),
+        RuntimeEvent::HandoffReady {
+            agent_id,
+            handoff_path,
+        } => format!("交接就绪 {agent_id} -> {}", handoff_path.display()),
+        RuntimeEvent::WorkerFinished { result } => {
+            format!("{} 完成：{}", result.agent_id, result.status.label())
+        }
+        RuntimeEvent::ApplyPlanReady { mode, operations } => {
+            format!("apply 计划：{} / {} 个 patch", mode, operations)
+        }
+        RuntimeEvent::ReviewGateReady { report } => format!(
+            "review gate：{} / {}",
+            report.decision.label(),
+            report
+                .confidence_reasoning
+                .clone()
+                .unwrap_or_else(|| "无补充说明".to_string())
+        ),
+        RuntimeEvent::ApplyUpdate { message } => format!("应用更新：{message}"),
+        RuntimeEvent::VerificationReady {
+            stage,
+            success,
+            message,
+        } => format!(
+            "验证 {stage}：{} / {message}",
+            if *success { "成功" } else { "失败" }
+        ),
+        RuntimeEvent::SummaryReady { summary } => format!("总结：{}", summary.overview),
+    }
+}
+
+fn render_rich(rich: &mut RichTerminal, state: &RuntimeViewState) -> Result<()> {
+    rich.terminal.draw(|frame| {
+        render_runtime_dashboard(frame, frame.area(), state, "总览");
     })?;
     rich.last_draw = Instant::now();
     Ok(())

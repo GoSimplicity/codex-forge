@@ -10,11 +10,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    Tui(TuiArgs),
     Run(RunArgs),
     Plan(PlanArgs),
     Replay(ReplayArgs),
@@ -48,7 +49,11 @@ pub struct SharedTaskArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub shared: SharedTaskArgs,
-    #[arg(long, value_enum, help = "使用内置运行预设；feature-demo 适合黑客松现场展示")]
+    #[arg(
+        long,
+        value_enum,
+        help = "使用内置运行预设；feature-demo 适合黑客松现场展示"
+    )]
     pub preset: Option<PresetArg>,
     #[arg(long, help = "从指定 session 恢复运行，优先复用其执行图与已成功节点")]
     pub resume: Option<String>,
@@ -60,6 +65,12 @@ pub struct RunArgs {
     pub fail_fast: bool,
     #[arg(long, help = "成功完成后自动清理 worker worktree")]
     pub cleanup_success: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TuiArgs {
+    #[arg(long, help = "主界面默认打开的目标仓库目录；不传则优先复用上次目录")]
+    pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

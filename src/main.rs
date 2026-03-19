@@ -1,4 +1,5 @@
 mod app;
+mod app_shell;
 mod apply;
 mod cli;
 mod codex;

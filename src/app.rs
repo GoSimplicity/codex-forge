@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use crate::app_shell::run_app_shell;
 use crate::cli::{
     AgentCommands, AgentListArgs, ApplyModeArg, Cli, Commands, ConfigCommands, ConfigValidateArgs,
-    DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs, UiModeArg,
+    DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs, TuiArgs, UiModeArg,
 };
 use crate::config::{load_project_config, validate_project_config};
 use crate::doctor::run_doctor;
@@ -16,11 +17,13 @@ use crate::workspace::{describe_git_readiness, resolve_target_dir};
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run(args) => {
+        None => run_tui(TuiArgs { target_dir: None }).await?,
+        Some(Commands::Tui(args)) => run_tui(args).await?,
+        Some(Commands::Run(args)) => {
             let (config, roles) = resolve_run_config(args)?;
             let _manifest = run_session(config, roles).await?;
         }
-        Commands::Plan(args) => {
+        Some(Commands::Plan(args)) => {
             if args.config_only {
                 run_config_validate(ConfigValidateArgs {
                     target_dir: args.shared.target_dir,
@@ -31,19 +34,29 @@ pub async fn run() -> Result<()> {
                 let _manifest = plan_session(config, roles).await?;
             }
         }
-        Commands::Replay(args) => run_replay(args).await?,
-        Commands::Agents(args) => match args.command {
+        Some(Commands::Replay(args)) => run_replay(args).await?,
+        Some(Commands::Agents(args)) => match args.command {
             AgentCommands::List(list_args) => print_agents(list_args)?,
         },
-        Commands::Doctor(args) => run_doctor_command(args).await?,
-        Commands::Config(args) => match args.command {
+        Some(Commands::Doctor(args)) => run_doctor_command(args).await?,
+        Some(Commands::Config(args)) => match args.command {
             ConfigCommands::Validate(validate_args) => run_config_validate(validate_args)?,
         },
     }
     Ok(())
 }
 
-fn resolve_run_config(args: RunArgs) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+async fn run_tui(args: TuiArgs) -> Result<()> {
+    let initial_target_dir = match args.target_dir {
+        Some(path) => Some(resolve_target_dir(Some(path.as_path()))?.path),
+        None => None,
+    };
+    run_app_shell(initial_target_dir).await
+}
+
+pub(crate) fn resolve_run_config(
+    args: RunArgs,
+) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
     let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
     let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
     let resources = load_resource_catalog(&target_dir)?;
@@ -86,7 +99,9 @@ fn resolve_run_config(args: RunArgs) -> Result<(SessionConfig, Vec<crate::model:
     Ok((apply_run_preset(config), roles))
 }
 
-fn resolve_plan_config(args: PlanArgs) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+pub(crate) fn resolve_plan_config(
+    args: PlanArgs,
+) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
     let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
     let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
     let resources = load_resource_catalog(&target_dir)?;
@@ -207,7 +222,7 @@ fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
 fn print_agents(args: AgentListArgs) -> Result<()> {
     let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
     let resources = load_resource_catalog(&target_dir)?;
-    println!("codex-forge v4 可用角色：");
+    println!("codex-forge v5 可用角色：");
     let mut role_items = resources.roles.values().collect::<Vec<_>>();
     role_items.sort_by(|left, right| left.role.key.cmp(&right.role.key));
     for role in role_items {

@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{
+    mpsc::{self, UnboundedSender},
+    watch,
+};
 
 use crate::apply::{ApplyExecutionContext, build_apply_plan, execute_apply_plan};
 use crate::codex::{ensure_codex_available, run_worker};
@@ -18,19 +21,41 @@ use crate::ui::UiController;
 use crate::workspace::{cleanup_empty_dirs, prepare_target_dir};
 use crate::worktree::{WorktreeManager, git_is_clean, materialize_dependency_patches};
 
+/// 传统 CLI `plan` 入口，直接返回最终 manifest。
 pub async fn plan_session(
     config: SessionConfig,
     roles: Vec<RoleConfig>,
 ) -> Result<SessionManifest> {
+    plan_session_inner(config, roles, None).await
+}
+
+pub async fn plan_session_embedded(
+    config: SessionConfig,
+    roles: Vec<RoleConfig>,
+    event_tx: UnboundedSender<RuntimeEvent>,
+) -> Result<SessionManifest> {
+    plan_session_inner(config, roles, Some(event_tx)).await
+}
+
+async fn plan_session_inner(
+    config: SessionConfig,
+    roles: Vec<RoleConfig>,
+    event_tx: Option<UnboundedSender<RuntimeEvent>>,
+) -> Result<SessionManifest> {
     let prep = prepare_target_dir(&config.target_dir).await?;
     let repo_snapshot = discover_repo(&config.target_dir)?;
     let mut session = SessionContext::init(&config, repo_snapshot)?;
-    let mut ui = UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?;
+    let mut ui = if event_tx.is_some() {
+        UiController::silent(&session.manifest.id, &session.manifest.task)
+    } else {
+        UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?
+    };
 
     session.set_status(SessionStatus::Planning)?;
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::PhaseChanged {
             phase: "规划中".to_string(),
         },
@@ -38,6 +63,7 @@ pub async fn plan_session(
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::CommanderNote {
             message: format!(
                 "开始生成用户规划清单与 commander 执行图。工作目录：{}；git 初始化：{}；本地身份补齐：{}。",
@@ -62,6 +88,7 @@ pub async fn plan_session(
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::CommanderNote {
             message: format!("计划清单已生成，共 {} 项 todo。", plan_todo.todos.len()),
         },
@@ -78,6 +105,7 @@ pub async fn plan_session(
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::GraphReady {
             nodes: graph.nodes.len(),
             dependencies: graph.dependency_count(),
@@ -96,16 +124,40 @@ pub async fn plan_session(
             .join(".codex-forge"),
     );
 
-    println!("计划已生成：`{}`", session.manifest.id);
-    println!(
-        "计划清单文件：`{}`",
-        session.plan_todo_json_path().display()
-    );
-    println!("执行图文件：`{}`", session.manifest.graph_path.display());
+    if event_tx.is_none() {
+        println!("计划已生成：`{}`", session.manifest.id);
+        println!(
+            "计划清单文件：`{}`",
+            session.plan_todo_json_path().display()
+        );
+        println!("执行图文件：`{}`", session.manifest.graph_path.display());
+    }
     Ok(session.manifest)
 }
 
 pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Result<SessionManifest> {
+    Ok(run_session_inner(config, roles, None, None).await?.manifest)
+}
+
+/// 给内嵌 TUI 使用的执行入口。
+/// 除了返回 manifest 外，还会：
+/// - 向外推送实时 RuntimeEvent
+/// - 接受停止信号，用于运行中安全取消
+pub async fn run_session_embedded(
+    config: SessionConfig,
+    roles: Vec<RoleConfig>,
+    event_tx: UnboundedSender<RuntimeEvent>,
+    stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<EmbeddedRunOutcome> {
+    run_session_inner(config, roles, Some(event_tx), stop_rx).await
+}
+
+async fn run_session_inner(
+    config: SessionConfig,
+    roles: Vec<RoleConfig>,
+    event_tx: Option<UnboundedSender<RuntimeEvent>>,
+    stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<EmbeddedRunOutcome> {
     let prep = prepare_target_dir(&config.target_dir).await?;
     let codex_path = ensure_codex_available()?;
     if matches!(config.apply_mode, crate::model::ApplyMode::AutoSafe) {
@@ -117,12 +169,17 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
 
     let repo_snapshot = discover_repo(&config.target_dir)?;
     let mut session = SessionContext::init(&config, repo_snapshot)?;
-    let mut ui = UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?;
+    let mut ui = if event_tx.is_some() {
+        UiController::silent(&session.manifest.id, &session.manifest.task)
+    } else {
+        UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?
+    };
     session.set_status(SessionStatus::Preflight)?;
 
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::CommanderNote {
             message: format!(
                 "检测到 Codex CLI：`{codex_path}`；工作目录：{}；git 初始化：{}；本地身份补齐：{}",
@@ -140,6 +197,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::PhaseChanged {
             phase: "规划中".to_string(),
         },
@@ -165,6 +223,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         record_event(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             RuntimeEvent::CommanderNote {
                 message: format!(
                     "恢复 session：`{}`，将复用其执行图与已成功节点。",
@@ -195,6 +254,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         record_event(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             RuntimeEvent::CommanderNote {
                 message: format!("复用 plan 会话：`{}`", plan_manifest.id),
             },
@@ -218,6 +278,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         record_event(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             RuntimeEvent::CommanderNote {
                 message: format!("本次运行生成了 {} 项 todo 计划。", plan_todo.todos.len()),
             },
@@ -239,6 +300,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::GraphReady {
             nodes: graph.nodes.len(),
             dependencies: graph.dependency_count(),
@@ -248,6 +310,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         record_event(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             RuntimeEvent::CommanderNote {
                 message: note.clone(),
             },
@@ -264,14 +327,28 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::PhaseChanged {
             phase: "依赖调度中".to_string(),
         },
     )?;
 
-    let mut finished =
-        schedule_graph(&config, &roles, &graph, &manager, &mut session, &mut ui, &seed_results)
-            .await?;
+    // 调度阶段负责并发 worker、依赖推进和停止收敛。
+    let ScheduleOutcome {
+        results: mut finished,
+        stopped,
+    } = schedule_graph(
+        &config,
+        &roles,
+        &graph,
+        &manager,
+        &mut session,
+        &mut ui,
+        event_tx.as_ref(),
+        &seed_results,
+        stop_rx.clone(),
+    )
+    .await?;
 
     if config.cleanup_success {
         for result in &finished {
@@ -282,16 +359,76 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         record_event(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             RuntimeEvent::CommanderNote {
                 message: "已清理成功节点的 worker worktree。".to_string(),
             },
         )?;
     }
 
+    if stopped {
+        // 用户主动停止时，不再继续进入 apply / verify / summary 正常收敛链路；
+        // 但仍尽量把现有中间状态落盘，保证历史查看和 replay 不丢信息。
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::PhaseChanged {
+                phase: "已停止".to_string(),
+            },
+        )?;
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::CommanderNote {
+                message: "收到停止信号，已跳过 apply / verify / summary 收敛阶段。".to_string(),
+            },
+        )?;
+        for todo in session.manifest.todo_states.clone() {
+            let next_status = match todo.status {
+                TodoStatus::Pending | TodoStatus::Ready | TodoStatus::Running => {
+                    Some(TodoStatus::Blocked)
+                }
+                TodoStatus::InReview | TodoStatus::Verifying => {
+                    Some(TodoStatus::NeedsManualFollowup)
+                }
+                _ => None,
+            };
+            if let Some(status) = next_status {
+                update_todo_status(
+                    &mut session,
+                    &mut ui,
+                    event_tx.as_ref(),
+                    &todo.todo_id,
+                    status,
+                    "用户停止运行，保留当前产物供后续继续处理",
+                    None,
+                )?;
+            }
+        }
+        session.set_status(SessionStatus::Blocked)?;
+        ui.finish()?;
+        let _ = cleanup_empty_dirs(
+            &session
+                .manifest
+                .repo_snapshot
+                .repo_root
+                .join(".codex-forge"),
+        );
+
+        finished.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        return Ok(EmbeddedRunOutcome {
+            manifest: session.manifest,
+            stopped: true,
+        });
+    }
+
     session.set_status(SessionStatus::Reviewing)?;
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::PhaseChanged {
             phase: "集成应用中".to_string(),
         },
@@ -305,6 +442,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
             update_todo_status(
                 &mut session,
                 &mut ui,
+                event_tx.as_ref(),
                 &todo.todo_id,
                 TodoStatus::InReview,
                 "进入 reviewer gate 与集成应用阶段",
@@ -328,6 +466,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::ApplyPlanReady {
             mode: apply_plan.mode,
             operations: apply_plan.operations.len(),
@@ -358,6 +497,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         record_event(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             RuntimeEvent::ReviewGateReady {
                 report: Box::new(review_report),
             },
@@ -366,6 +506,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::ApplyUpdate {
             message: format!("应用阶段完成：{}", apply_result.status.label()),
         },
@@ -374,6 +515,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::VerificationReady {
             stage: "全链路".to_string(),
             success: matches!(
@@ -407,11 +549,14 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
             | None => TodoStatus::NeedsManualFollowup,
         };
         for todo in session.manifest.todo_states.clone() {
-            if !matches!(todo.status, TodoStatus::Committed | TodoStatus::Failed | TodoStatus::Blocked)
-            {
+            if !matches!(
+                todo.status,
+                TodoStatus::Committed | TodoStatus::Failed | TodoStatus::Blocked
+            ) {
                 update_todo_status(
                     &mut session,
                     &mut ui,
+                    event_tx.as_ref(),
                     &todo.todo_id,
                     fallback_status,
                     "当前 todo 尚未形成自动提交结果，请按 summary 做后续处理",
@@ -430,6 +575,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
         update_todo_status(
             &mut session,
             &mut ui,
+            event_tx.as_ref(),
             &record.todo_id,
             record.status,
             record.message,
@@ -441,6 +587,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::PhaseChanged {
             phase: "总结中".to_string(),
         },
@@ -452,6 +599,7 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     record_event(
         &mut session,
         &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::SummaryReady {
             summary: Box::new(summary),
         },
@@ -468,7 +616,24 @@ pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Resul
     );
 
     finished.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
-    Ok(session.manifest)
+    Ok(EmbeddedRunOutcome {
+        manifest: session.manifest,
+        stopped: false,
+    })
+}
+
+#[derive(Debug)]
+pub struct EmbeddedRunOutcome {
+    /// 无论成功、失败还是停止，都返回当前时刻的 manifest。
+    pub manifest: SessionManifest,
+    /// `true` 表示用户主动停止，而不是执行失败。
+    pub stopped: bool,
+}
+
+#[derive(Debug)]
+struct ScheduleOutcome {
+    results: Vec<WorkerResult>,
+    stopped: bool,
 }
 
 async fn schedule_graph(
@@ -478,8 +643,10 @@ async fn schedule_graph(
     manager: &WorktreeManager,
     session: &mut SessionContext,
     ui: &mut UiController,
+    event_tx: Option<&UnboundedSender<RuntimeEvent>>,
     seed_results: &[WorkerResult],
-) -> Result<Vec<WorkerResult>> {
+    stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<ScheduleOutcome> {
     let ordered_ids = graph.topological_order()?;
     let node_map = graph
         .nodes
@@ -498,6 +665,7 @@ async fn schedule_graph(
     let mut results = Vec::new();
     let mut result_by_id = HashMap::<String, WorkerResult>::new();
     let mut stop_dispatch = false;
+    let mut stopped = false;
 
     for result in seed_results {
         pending.remove(&result.agent_id);
@@ -511,6 +679,7 @@ async fn schedule_graph(
             update_todo_status(
                 session,
                 ui,
+                event_tx,
                 todo_id,
                 TodoStatus::Ready,
                 format!("复用历史成功节点 {}", result.agent_id),
@@ -520,6 +689,7 @@ async fn schedule_graph(
         record_event(
             session,
             ui,
+            event_tx,
             RuntimeEvent::WorkerFinished {
                 result: Box::new(result.clone()),
             },
@@ -527,6 +697,21 @@ async fn schedule_graph(
     }
 
     loop {
+        if !stop_dispatch && stop_requested(stop_rx.as_ref()) {
+            stop_dispatch = true;
+            stopped = true;
+            // 收到 stop 后先停止派发新节点，已在跑的 worker 则依赖同一个 stop signal 自行退出。
+            record_event(
+                session,
+                ui,
+                event_tx,
+                RuntimeEvent::CommanderNote {
+                    message: "收到停止信号，停止继续派发新节点，并等待在跑 worker 安全退出。"
+                        .to_string(),
+                },
+            )?;
+        }
+
         let mut dispatched_any = false;
         while !stop_dispatch && running.len() < config.workers {
             let Some(node_id) = next_ready_node(
@@ -554,6 +739,7 @@ async fn schedule_graph(
                 record_event(
                     session,
                     ui,
+                    event_tx,
                     RuntimeEvent::WorkerFinished {
                         result: Box::new(skipped),
                     },
@@ -579,6 +765,7 @@ async fn schedule_graph(
                     record_event(
                         session,
                         ui,
+                        event_tx,
                         RuntimeEvent::CommanderNote {
                             message: format!(
                                 "已为 `{}` 预铺依赖 patch：{}",
@@ -592,6 +779,7 @@ async fn schedule_graph(
                     record_event(
                         session,
                         ui,
+                        event_tx,
                         RuntimeEvent::CommanderNote {
                             message: format!(
                                 "为 `{}` 预铺依赖 patch 时有冲突，交由下游节点审阅：{}",
@@ -635,6 +823,7 @@ async fn schedule_graph(
             record_event(
                 session,
                 ui,
+                event_tx,
                 RuntimeEvent::WorkerDispatched {
                     agent_id: node.id.clone(),
                     role: node.role.clone(),
@@ -646,6 +835,7 @@ async fn schedule_graph(
                 update_todo_status(
                     session,
                     ui,
+                    event_tx,
                     todo_id,
                     TodoStatus::Running,
                     format!("开始执行节点 {}", node.id),
@@ -656,10 +846,10 @@ async fn schedule_graph(
             let model = config.model.clone();
             let tx_clone = tx.clone();
             let agent_id = node.id.clone();
-            let handle =
-                tokio::spawn(
-                    async move { run_worker(launch_spec, model.as_deref(), tx_clone).await },
-                );
+            let worker_stop_rx = stop_rx.clone();
+            let handle = tokio::spawn(async move {
+                run_worker(launch_spec, model.as_deref(), tx_clone, worker_stop_rx).await
+            });
             handles.insert(agent_id.clone(), handle);
             pending.remove(&agent_id);
             running.insert(agent_id);
@@ -668,6 +858,9 @@ async fn schedule_graph(
 
         if running.is_empty() {
             if pending.is_empty() {
+                break;
+            }
+            if stop_dispatch {
                 break;
             }
             if !dispatched_any {
@@ -683,6 +876,7 @@ async fn schedule_graph(
                     record_event(
                         session,
                         ui,
+                        event_tx,
                         RuntimeEvent::WorkerFinished {
                             result: Box::new(skipped),
                         },
@@ -704,6 +898,7 @@ async fn schedule_graph(
                             update_todo_status(
                                 session,
                                 ui,
+                                event_tx,
                                 todo_id,
                                 TodoStatus::Running,
                                 format!("节点 {} 已完成，等待 todo 汇总验证", result.agent_id),
@@ -714,6 +909,7 @@ async fn schedule_graph(
                             update_todo_status(
                                 session,
                                 ui,
+                                event_tx,
                                 todo_id,
                                 TodoStatus::Failed,
                                 format!("节点 {} 执行失败", result.agent_id),
@@ -724,6 +920,7 @@ async fn schedule_graph(
                             update_todo_status(
                                 session,
                                 ui,
+                                event_tx,
                                 todo_id,
                                 TodoStatus::Blocked,
                                 format!("节点 {} 被跳过", result.agent_id),
@@ -743,7 +940,7 @@ async fn schedule_graph(
                     stop_dispatch = true;
                 }
             }
-            record_event(session, ui, event)?;
+            record_event(session, ui, event_tx, event)?;
         }
     }
 
@@ -752,7 +949,11 @@ async fn schedule_graph(
         let _ = handle.await;
     }
 
-    Ok(results)
+    Ok(ScheduleOutcome { results, stopped })
+}
+
+fn stop_requested(stop_rx: Option<&watch::Receiver<bool>>) -> bool {
+    stop_rx.map(|receiver| *receiver.borrow()).unwrap_or(false)
 }
 
 fn next_ready_node(
@@ -847,15 +1048,20 @@ fn skipped_result(
 fn record_event(
     session: &mut SessionContext,
     ui: &mut UiController,
+    event_tx: Option<&UnboundedSender<RuntimeEvent>>,
     event: RuntimeEvent,
 ) -> Result<()> {
     session.append_timeline(&event)?;
+    if let Some(tx) = event_tx {
+        let _ = tx.send(event.clone());
+    }
     ui.apply(&event)
 }
 
 fn update_todo_status(
     session: &mut SessionContext,
     ui: &mut UiController,
+    event_tx: Option<&UnboundedSender<RuntimeEvent>>,
     todo_id: &str,
     status: TodoStatus,
     message: impl Into<String>,
@@ -867,6 +1073,7 @@ fn update_todo_status(
         record_event(
             session,
             ui,
+            event_tx,
             RuntimeEvent::TodoStateChanged {
                 todo_id: updated.todo_id,
                 title: updated.title,

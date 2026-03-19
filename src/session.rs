@@ -7,10 +7,10 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use crate::model::{
-    ApplyMode, ApplyResult, ArtifactEntry, ArtifactIndexEntry, ArtifactManifest,
-    ChangeTrustReport, ExecutionContract, ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot,
-    RuntimeEvent, RuntimeEventRecord, SessionConfig, SessionManifest, SessionStatus,
-    TimelineEventSummary, TodoStateRecord, TodoStatus, VerificationReport, WorkerResult,
+    ApplyMode, ApplyResult, ArtifactEntry, ArtifactIndexEntry, ArtifactManifest, ChangeTrustReport,
+    ExecutionContract, ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot, RuntimeEvent,
+    RuntimeEventRecord, SessionConfig, SessionManifest, SessionStatus, TimelineEventSummary,
+    TodoStateRecord, TodoStatus, VerificationReport, WorkerResult,
 };
 
 #[derive(Debug, Clone)]
@@ -543,7 +543,10 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
         .map(|report| {
             let accepted = render_bullets(&report.accepted_scopes);
             let rejected = render_bullets(&report.rejected_scopes);
-            format!("**放行范围**\n\n{}\n\n**拦截范围**\n\n{}", accepted, rejected)
+            format!(
+                "**放行范围**\n\n{}\n\n**拦截范围**\n\n{}",
+                accepted, rejected
+            )
         })
         .unwrap_or_else(|| "**放行范围**\n\n- 无\n\n**拦截范围**\n\n- 无".to_string());
 
@@ -751,6 +754,7 @@ fn build_artifact_index(manifest: &SessionManifest) -> Vec<ArtifactIndexEntry> {
 
 fn build_demo_summary(manifest: &SessionManifest, summary: &FinalSummary) -> Vec<String> {
     let mut lines = Vec::new();
+    lines.push(format!("会话状态：{}", manifest.status.label()));
     if let Some(preset) = manifest.preset {
         lines.push(format!("运行预设：{}", preset.label()));
     }
@@ -802,9 +806,7 @@ fn timeline_detail(event: &RuntimeEvent) -> String {
         RuntimeEvent::WorkerUpdate { kind, message, .. } => {
             format!("{kind} / {}", message.replace('\n', " "))
         }
-        RuntimeEvent::HandoffReady {
-            handoff_path, ..
-        } => handoff_path.display().to_string(),
+        RuntimeEvent::HandoffReady { handoff_path, .. } => handoff_path.display().to_string(),
         RuntimeEvent::WorkerFinished { result } => {
             format!("{} / {}", result.task_title, result.status.label())
         }

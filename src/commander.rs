@@ -1261,7 +1261,11 @@ fn build_evidence_summary(
     blocked_verifications: &[String],
 ) -> Vec<String> {
     let mut evidence = Vec::new();
-    if let Some(report) = manifest.apply_result.as_ref().and_then(|item| item.review_report.as_ref()) {
+    if let Some(report) = manifest
+        .apply_result
+        .as_ref()
+        .and_then(|item| item.review_report.as_ref())
+    {
         evidence.push(format!("reviewer 结论：{}", report.decision.label()));
         if let Some(reason) = &report.confidence_reasoning {
             evidence.push(format!("reviewer 说明：{reason}"));

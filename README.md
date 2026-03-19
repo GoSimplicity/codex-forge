@@ -386,65 +386,249 @@ V3 不再内置 `.skills/` 文本资源，而是按三层优先级加载 `.roles
 - Codex 自己负责外部 skills 的挂载与触发
 - 仓库资源层不再重复实现一套本地 `.skills` 注入机制
 
-## 快速开始
+## 安装与启动
 
-### 1. 查看当前可用角色
+### 1. 准备环境
+
+你需要本地已经可用：
+
+- Rust 工具链
+- Git
+- `codex` CLI
+
+先确认 `codex` 已安装：
+
+```bash
+codex --help
+```
+
+如果你是本仓库开发者，最直接的启动方式是：
+
+```bash
+cargo run --
+```
+
+或者先构建，再用裸命令启动：
+
+```bash
+cargo build
+./target/debug/codex-forge
+```
+
+> 从 v5 开始，直接执行 `codex-forge` 会默认进入终端产品主界面，而不是要求你先输入某个子命令。
+
+### 2. 查看当前可用角色
 
 ```bash
 cargo run -- agents list
 ```
 
-### 2. 先规划
+### 3. 首次指定目标仓库
+
+```bash
+cargo run -- doctor --target-dir /path/to/project
+```
+
+第一次显式传入 `--target-dir` 后，后续 `plan`、`run`、`doctor`、`config validate`、`replay` 不传时会默认复用它。
+
+## v5 终端产品模式教程
+
+这一节是**完整演示教程**。如果你要给团队、评委或同事现场展示，直接照着这一节走即可。
+
+### 第 0 步：启动主界面
+
+```bash
+codex-forge
+```
+
+启动后会看到 5 个主页面：
+
+- `首页`：项目概览、最近 session、当前配置来源
+- `新任务`：填写目标仓库、任务、并发数、角色集、应用模式
+- `执行`：运行态页面，支持 `Dashboard / Timeline / Summary` 三个子视图
+- `历史`：查看历史 session 列表
+- `结果`：查看最终 summary、apply 结果、风险与交付信息
+
+### 第 1 步：在“新任务”页配置任务
+
+按键：
+
+- `1`~`5`：切换主页面
+- `2`：进入“新任务”
+- `↑` / `↓`：切换字段
+- `←` / `→`：切换枚举字段
+- `e` 或 `Enter`：编辑当前字段
+- `Esc`：结束编辑
+
+建议至少填好这些字段：
+
+- `目标仓库`
+- `任务描述`
+- `角色集合`
+- `并发 Worker`
+- `应用模式`
+
+如果你只是演示产品能力，推荐这样配置：
+
+- `角色集合`：`default`
+- `并发 Worker`：`4`
+- `应用模式`：`auto-safe` 或 `bundle`
+- `运行预设`：`FeatureDemo`
+
+### 第 2 步：先做 doctor 预检
+
+在任何页面都可以直接按：
+
+```text
+d
+```
+
+这一步会做目标仓库、配置、资源和验证命令的预检。  
+演示时建议先跑一次，因为它能提前暴露环境问题，避免一上来 `run` 就失败。
+
+### 第 3 步：先 plan，再 run
+
+推荐演示顺序：
+
+1. 先按 `p` 生成 plan
+2. 再按 `r` 启动 run
+
+这样有两个好处：
+
+- 评委能先看到**面向用户的 todo 清单**
+- 再看到系统如何把 todo 派生为内部 `ExecutionGraph`
+
+如果你时间很紧，也可以直接按 `r` 运行，系统会在内部补齐 plan。
+
+### 第 4 步：在“执行”页观察实时过程
+
+按 `3` 进入“执行”页后，现在有三个子视图：
+
+#### 4.1 `实时 Dashboard`
+
+这是主演示面板，会实时展示：
+
+- 当前 session 与任务
+- 当前阶段
+- worker 矩阵
+- todo 态势
+- review gate
+- commander 决策流
+- apply / verify / summary 收敛状态
+
+适合展示“它不是简单 shell 日志，而是真的内嵌运行态 dashboard”。
+
+#### 4.2 `Timeline`
+
+这是按事件流观察系统推进的视图。  
+你可以看到：
+
+- worker 启动
+- worker 更新
+- handoff 就绪
+- todo 状态变化
+- 阶段切换
+- review / apply / verify 事件
+
+适合展示“整个系统可回放、可审计、可追踪”。
+
+#### 4.3 `Summary`
+
+这是执行中的收敛视图：
+
+- 如果 final summary 已生成，会展示最终总览、接收文件、人工复核项、开放风险
+- 如果还没生成，会展示当前阶段、apply 状态和验证状态
+
+适合展示“系统不仅会跑，还会形成交付摘要”。
+
+### 第 5 步：切换子视图
+
+在“执行”页中，使用以下快捷键切换：
+
+- `Tab`：下一个子视图
+- `[`：上一个子视图
+- `]`：下一个子视图
+
+推荐现场演示节奏：
+
+1. 先停留在 `Dashboard`
+2. 再切到 `Timeline`
+3. 最后切到 `Summary`
+
+这样最容易把产品价值讲清楚。
+
+### 第 6 步：运行中停止 / 取消
+
+在 `Run` 或 `Replay` 执行中，按：
+
+```text
+s
+```
+
+系统会发送停止信号，并执行以下动作：
+
+- 停止继续派发新节点
+- 通知正在运行的 worker 安全退出
+- 中止 replay 的继续推送
+- 把当前 session 收敛成可查看、可继续分析的中间状态
+- 跳过 apply / verify / summary 的正常收敛链路
+
+注意：
+
+- 当前**安全停止**支持 `Run` 与 `Replay`
+- `Doctor` 与 `Plan` 目前还不支持中途停止
+
+### 第 7 步：查看结果页与历史页
+
+执行结束后：
+
+- 按 `5` 看“结果”页，展示最终交付摘要
+- 按 `4` 看“历史”页，选择历史 session
+- 按 `l` 回放选中的 session
+
+这是演示“同一条执行链路可以复盘和 replay”的关键一步。
+
+## 命令行模式教程
+
+如果你不想进入 TUI，也可以继续使用传统 CLI 子命令。
+
+### 先规划
 
 ```bash
 cargo run -- plan "我现在要创建一个简单的 web 博客，给我规划" --ui minimal
 ```
 
-### 3. 再执行
+### 再执行
 
 ```bash
 cargo run -- run "我现在要创建一个简单的 web 博客，给我规划" --workers 4 --ui rich
 ```
 
-### 4. 指定目标目录执行
+### 指定目标目录执行
 
 ```bash
 cargo run -- run "为这个项目补登录功能" --target-dir /path/to/project --ui minimal
 ```
 
-第一次显式传入 `--target-dir` 后，后续 `plan`、`run`、`doctor`、`config validate`、`replay` 不传时会默认复用它。
-
-### 5. 回放最近一次 session
+### 回放最近一次 session
 
 ```bash
 cargo run -- replay --ui minimal
 ```
 
-## 如何使用
-
-### 典型工作流
-
-1. 准备一个目标仓库
-2. 根据任务规模选择合适的 `role_set`
-3. 先运行 `plan`
-4. 检查 todo 清单与 execution graph
-5. 再运行 `run`
-6. 查看 apply 结果、verification report 和 summary
-7. 必要时用 `replay` 回放过程
-
-### 常用命令
+## 常用命令
 
 ```bash
 cargo run -- agents list
+cargo run -- doctor
+cargo run -- config validate
 cargo run -- plan "创建一个简单博客" --ui minimal
 cargo run -- run "创建一个简单博客" --workers 4 --ui rich
 cargo run -- run "创建一个简单博客" --apply-mode auto-safe --max-retries 2
-cargo run -- doctor
-cargo run -- config validate
 cargo run -- replay --ui minimal
 ```
 
-### 常用参数
+## 常用参数
 
 - `--config <path>`：显式指定项目配置文件
 - `--workers <n>`：并发 worker 数量
@@ -456,6 +640,32 @@ cargo run -- replay --ui minimal
 - `--ui rich|minimal`：终端展示模式
 - `--target-dir <path>`：目标仓库路径；显式传入后会被记住
 - `--cleanup-success`：成功完成后自动清理 worker worktree
+
+## 演示推荐脚本
+
+如果你要做一段 3~5 分钟的完整演示，推荐按下面顺序：
+
+1. 启动 `codex-forge`
+2. 切到“新任务”，填写一个清晰任务
+3. 按 `d` 跑 doctor
+4. 按 `p` 让系统先生成 plan
+5. 按 `r` 启动 run
+6. 在“执行”页展示 `Dashboard`
+7. 切到 `Timeline`
+8. 按 `s` 展示可停止运行
+9. 再从“历史”页选择一个 session，按 `l` 做 replay
+10. 最后切到“结果”页总结
+
+这一套路径可以完整覆盖：
+
+- 任务配置
+- 预检
+- 规划
+- 调度
+- 实时 dashboard
+- timeline 回放
+- 中途停止
+- 最终 summary
 
 ## 默认自动化行为
 

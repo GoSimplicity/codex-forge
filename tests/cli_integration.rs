@@ -254,6 +254,26 @@ fn config_validate_and_doctor_work() {
 }
 
 #[test]
+fn doctor_demo_outputs_readiness_and_recommendation() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let doctor = command(bin, repo.path())
+        .args([
+            "doctor",
+            "--demo",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run doctor demo");
+    assert!(doctor.status.success(), "{:?}", doctor);
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(stdout.contains("doctor 结论"));
+    assert!(stdout.contains("推荐 role_set"));
+}
+
+#[test]
 fn run_auto_safe_applies_and_replay() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
@@ -299,6 +319,19 @@ fn run_auto_safe_applies_and_replay() {
         .expect("replay");
     assert!(replay_output.status.success(), "{:?}", replay_output);
     assert!(String::from_utf8_lossy(&replay_output.stdout).contains("回放完成"));
+
+    let timeline_output = command(bin, repo.path())
+        .args([
+            "replay",
+            &session_id,
+            "--timeline",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("replay timeline");
+    assert!(timeline_output.status.success(), "{:?}", timeline_output);
+    assert!(String::from_utf8_lossy(&timeline_output.stdout).contains("阶段切换"));
 }
 
 #[test]
@@ -370,6 +403,31 @@ fn run_retries_then_succeeds() {
         .and_then(|item| item["attempts"].as_u64())
         .expect("attempts");
     assert_eq!(attempts, 2);
+}
+
+#[test]
+fn run_with_feature_demo_preset_persists_preset() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let output = command(bin, repo.path())
+        .args([
+            "run",
+            "黑客松主路径",
+            "--preset",
+            "feature-demo",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run preset");
+    assert!(output.status.success(), "{:?}", output);
+
+    let manifest = load_manifest(repo.path());
+    assert_eq!(manifest["preset"], "feature-demo");
+    assert!(manifest["demo_summary"].as_array().is_some());
 }
 
 #[test]
@@ -645,6 +703,47 @@ fn run_reuses_latest_matching_plan_session() {
         Some(plan_session_id.as_str())
     );
     assert_eq!(manifest["plan_todo"]["summary"], "todo summary");
+}
+
+#[test]
+fn run_can_resume_previous_session() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let first = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("first run");
+    assert!(first.status.success(), "{:?}", first);
+    let first_session_id = latest_session_id(repo.path());
+
+    let resumed = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--resume",
+            &first_session_id,
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("resume run");
+    assert!(resumed.status.success(), "{:?}", resumed);
+
+    let manifest = load_manifest(repo.path());
+    assert_eq!(
+        manifest["resumed_from_session_id"].as_str(),
+        Some(first_session_id.as_str())
+    );
 }
 
 #[test]

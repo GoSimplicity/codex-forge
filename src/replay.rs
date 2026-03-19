@@ -3,11 +3,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::{mpsc::UnboundedSender, watch};
 use tokio::time::sleep;
 
-use crate::model::{RuntimeEventRecord, UiMode};
+use crate::model::{RuntimeEvent, RuntimeEventRecord, SessionManifest, UiMode};
 use crate::session::load_session;
-use crate::ui::UiController;
+use crate::ui::{UiController, describe_runtime_event};
 
 pub async fn replay_session(
     target_dir: &Path,
@@ -62,59 +63,50 @@ pub async fn replay_session(
     Ok(())
 }
 
-fn describe_timeline_event(event: &crate::model::RuntimeEvent) -> String {
-    match event {
-        crate::model::RuntimeEvent::PhaseChanged { phase } => format!("阶段切换 -> {phase}"),
-        crate::model::RuntimeEvent::CommanderNote { message } => format!("指挥备注：{message}"),
-        crate::model::RuntimeEvent::GraphReady {
-            nodes,
-            dependencies,
-        } => format!("执行图就绪：节点 {nodes} / 依赖 {dependencies}"),
-        crate::model::RuntimeEvent::TodoStateChanged {
-            todo_id,
-            title,
-            status,
-            message,
-            ..
-        } => format!("{todo_id} {title} -> {} / {message}", status.label()),
-        crate::model::RuntimeEvent::WorkerDispatched {
-            agent_id,
-            role,
-            title,
-            ..
-        } => format!("启动 {agent_id} / {role} / {title}"),
-        crate::model::RuntimeEvent::WorkerUpdate {
-            agent_id,
-            kind,
-            message,
-        } => format!("{agent_id} [{kind}] {message}"),
-        crate::model::RuntimeEvent::HandoffReady {
-            agent_id,
-            handoff_path,
-        } => format!("交接就绪 {agent_id} -> {}", handoff_path.display()),
-        crate::model::RuntimeEvent::WorkerFinished { result } => {
-            format!("{} 完成：{}", result.agent_id, result.status.label())
+pub async fn replay_session_embedded(
+    target_dir: &Path,
+    session_id: Option<&str>,
+    event_tx: UnboundedSender<RuntimeEvent>,
+    mut stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<(SessionManifest, bool)> {
+    // 内嵌回放和 Rich UI 回放的区别在于：
+    // 这里只负责把 timeline 重新转成 RuntimeEvent，供 AppShell 自己渲染。
+    let manifest = load_session(target_dir, session_id)?;
+    let timeline = fs::read_to_string(&manifest.timeline_path)
+        .with_context(|| format!("读取 timeline 失败：{}", manifest.timeline_path.display()))?;
+    let mut stopped = false;
+
+    for line in timeline.lines().filter(|line| !line.trim().is_empty()) {
+        if stop_rx
+            .as_ref()
+            .map(|receiver| *receiver.borrow())
+            .unwrap_or(false)
+        {
+            stopped = true;
+            break;
         }
-        crate::model::RuntimeEvent::ApplyPlanReady { mode, operations } => {
-            format!("apply 计划：{} / {} 个 patch", mode, operations)
+        let record: RuntimeEventRecord =
+            serde_json::from_str(line).context("解析 timeline 事件失败")?;
+        let _ = event_tx.send(record.payload.clone());
+        // 回放也支持“中途停止”，因此等待期间同样要监听 stop signal。
+        if let Some(receiver) = stop_rx.as_mut() {
+            tokio::select! {
+                _ = sleep(Duration::from_millis(80)) => {}
+                changed = receiver.changed() => {
+                    if changed.is_ok() && *receiver.borrow() {
+                        stopped = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            sleep(Duration::from_millis(80)).await;
         }
-        crate::model::RuntimeEvent::ReviewGateReady { report } => format!(
-            "review gate：{} / {}",
-            report.decision.label(),
-            report
-                .confidence_reasoning
-                .clone()
-                .unwrap_or_else(|| "无补充说明".to_string())
-        ),
-        crate::model::RuntimeEvent::ApplyUpdate { message } => format!("应用更新：{message}"),
-        crate::model::RuntimeEvent::VerificationReady {
-            stage,
-            success,
-            message,
-        } => format!(
-            "验证 {stage}：{} / {message}",
-            if *success { "成功" } else { "失败" }
-        ),
-        crate::model::RuntimeEvent::SummaryReady { summary } => format!("总结：{}", summary.overview),
     }
+
+    Ok((manifest, stopped))
+}
+
+fn describe_timeline_event(event: &crate::model::RuntimeEvent) -> String {
+    describe_runtime_event(event)
 }

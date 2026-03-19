@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use tokio::process::Command;
 
 use crate::model::{
-    EnvironmentBlock, VerificationCommandResult, VerificationOverallStatus, VerificationReport,
-    VerificationStatus, TodoVerificationEvidence, WorkerLocalVerification, WorkerResult,
-    WorkerStatus,
+    EnvironmentBlock, TodoVerificationEvidence, VerificationCommandResult,
+    VerificationOverallStatus, VerificationReport, VerificationStatus, WorkerLocalVerification,
+    WorkerResult, WorkerStatus,
 };
 
 pub async fn run_stage_verification(
