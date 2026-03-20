@@ -388,15 +388,17 @@ async fn run_session_inner(
         results: mut finished,
         stopped,
     } = schedule_graph(
-        &config,
-        &roles,
-        &graph,
-        &manager,
+        ScheduleInputs {
+            config: &config,
+            roles: &roles,
+            graph: &graph,
+            manager: &manager,
+            seed_results: &seed_results,
+            stop_rx: stop_rx.clone(),
+        },
         &mut session,
         &mut ui,
         event_tx.as_ref(),
-        &seed_results,
-        stop_rx.clone(),
     )
     .await?;
 
@@ -686,24 +688,30 @@ struct ScheduleOutcome {
     stopped: bool,
 }
 
+struct ScheduleInputs<'a> {
+    config: &'a SessionConfig,
+    roles: &'a [RoleConfig],
+    graph: &'a ExecutionGraph,
+    manager: &'a WorktreeManager,
+    seed_results: &'a [WorkerResult],
+    stop_rx: Option<watch::Receiver<bool>>,
+}
+
 async fn schedule_graph(
-    config: &SessionConfig,
-    roles: &[RoleConfig],
-    graph: &ExecutionGraph,
-    manager: &WorktreeManager,
+    inputs: ScheduleInputs<'_>,
     session: &mut SessionContext,
     ui: &mut UiController,
     event_tx: Option<&UnboundedSender<RuntimeEvent>>,
-    seed_results: &[WorkerResult],
-    stop_rx: Option<watch::Receiver<bool>>,
 ) -> Result<ScheduleOutcome> {
-    let ordered_ids = graph.topological_order()?;
-    let node_map = graph
+    let ordered_ids = inputs.graph.topological_order()?;
+    let node_map = inputs
+        .graph
         .nodes
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<HashMap<_, _>>();
-    let role_map = roles
+    let role_map = inputs
+        .roles
         .iter()
         .map(|role| (role.key.as_str(), role))
         .collect::<HashMap<_, _>>();
@@ -717,7 +725,7 @@ async fn schedule_graph(
     let mut stop_dispatch = false;
     let mut stopped = false;
 
-    for result in seed_results {
+    for result in inputs.seed_results {
         pending.remove(&result.agent_id);
         result_by_id.insert(result.agent_id.clone(), result.clone());
         results.push(result.clone());
@@ -747,7 +755,7 @@ async fn schedule_graph(
     }
 
     loop {
-        if !stop_dispatch && stop_requested(stop_rx.as_ref()) {
+        if !stop_dispatch && stop_requested(inputs.stop_rx.as_ref()) {
             stop_dispatch = true;
             stopped = true;
             // 收到 stop 后先停止派发新节点，已在跑的 worker 则依赖同一个 stop signal 自行退出。
@@ -763,7 +771,7 @@ async fn schedule_graph(
         }
 
         let mut dispatched_any = false;
-        while !stop_dispatch && running.len() < config.workers {
+        while !stop_dispatch && running.len() < inputs.config.workers {
             let Some(node_id) = next_ready_node(
                 &ordered_ids,
                 &pending,
@@ -800,8 +808,8 @@ async fn schedule_graph(
             let worker_dir = session.worker_dir(&node.id);
             fs::create_dir_all(&worker_dir)
                 .with_context(|| format!("创建 worker 输出目录失败：{}", worker_dir.display()))?;
-            let worktree_path = manager.create(&node.id).await?;
-            let role = find_role(roles, &node.role)
+            let worktree_path = inputs.manager.create(&node.id).await?;
+            let role = find_role(inputs.roles, &node.role)
                 .with_context(|| format!("未找到角色模板：{}", node.role))?;
             let dependency_results = node
                 .dependencies
@@ -849,7 +857,7 @@ async fn schedule_graph(
             let prompt = render_worker_prompt(
                 &role,
                 node,
-                config,
+                inputs.config,
                 &session.manifest.repo_snapshot,
                 &upstream_handoffs,
             );
@@ -867,7 +875,7 @@ async fn schedule_graph(
                 diff_path: worker_dir.join("changes.patch"),
                 git_status_path: worker_dir.join("git-status.txt"),
                 handoff_path: worker_dir.join("handoff.json"),
-                max_retries: config.max_retries,
+                max_retries: inputs.config.max_retries,
             };
 
             record_event(
@@ -893,10 +901,10 @@ async fn schedule_graph(
                 )?;
             }
 
-            let model = config.model.clone();
+            let model = inputs.config.model.clone();
             let tx_clone = tx.clone();
             let agent_id = node.id.clone();
-            let worker_stop_rx = stop_rx.clone();
+            let worker_stop_rx = inputs.stop_rx.clone();
             let handle = tokio::spawn(async move {
                 run_worker(launch_spec, model.as_deref(), tx_clone, worker_stop_rx).await
             });
@@ -986,7 +994,7 @@ async fn schedule_graph(
                 results.push(result.clone());
                 session.add_worker_result(result.clone())?;
                 handles.remove(&result.agent_id);
-                if config.fail_fast && result.status == WorkerStatus::Failed {
+                if inputs.config.fail_fast && result.status == WorkerStatus::Failed {
                     stop_dispatch = true;
                 }
             }

@@ -788,41 +788,6 @@ fn compact_summary_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'stat
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{RuntimeViewState, planning_activity_lines};
-    use crate::model::{RuntimeEvent, TodoStatus};
-
-    #[test]
-    fn planning_activity_lines_show_todos_and_notes_without_workers() {
-        let mut state = RuntimeViewState::new("session-1", "规划一个任务");
-        state.apply(&RuntimeEvent::PhaseChanged {
-            phase: "规划清单已生成".to_string(),
-        });
-        state.apply(&RuntimeEvent::CommanderNote {
-            message: "计划清单已生成，共 2 项 todo。".to_string(),
-        });
-        state.apply(&RuntimeEvent::TodoStateChanged {
-            todo_id: "todo-1".to_string(),
-            title: "修复 TUI".to_string(),
-            status: TodoStatus::Pending,
-            message: "规划完成，等待调度".to_string(),
-            commit_hash: None,
-        });
-
-        let lines = planning_activity_lines(&state, true);
-        let rendered = lines
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("规划清单已生成"));
-        assert!(rendered.contains("todo-1"));
-        assert!(rendered.contains("计划清单已生成，共 2 项 todo。"));
-    }
-}
-
 pub fn describe_runtime_event(event: &RuntimeEvent) -> String {
     match event {
         RuntimeEvent::PhaseChanged { phase } => format!("阶段切换 -> {phase}"),
@@ -1029,5 +994,40 @@ fn push_note(notes: &mut Vec<String>, note: &str) {
     if notes.len() > 8 {
         let overflow = notes.len() - 8;
         notes.drain(0..overflow);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeViewState, planning_activity_lines};
+    use crate::model::{RuntimeEvent, TodoStatus};
+
+    #[test]
+    fn planning_activity_lines_show_todos_and_notes_without_workers() {
+        let mut state = RuntimeViewState::new("session-1", "规划一个任务");
+        state.apply(&RuntimeEvent::PhaseChanged {
+            phase: "规划清单已生成".to_string(),
+        });
+        state.apply(&RuntimeEvent::CommanderNote {
+            message: "计划清单已生成，共 2 项 todo。".to_string(),
+        });
+        state.apply(&RuntimeEvent::TodoStateChanged {
+            todo_id: "todo-1".to_string(),
+            title: "修复 TUI".to_string(),
+            status: TodoStatus::Pending,
+            message: "规划完成，等待调度".to_string(),
+            commit_hash: None,
+        });
+
+        let lines = planning_activity_lines(&state, true);
+        let rendered = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("规划清单已生成"));
+        assert!(rendered.contains("todo-1"));
+        assert!(rendered.contains("计划清单已生成，共 2 项 todo。"));
     }
 }

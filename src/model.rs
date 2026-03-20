@@ -12,10 +12,11 @@ pub enum UiMode {
     Minimal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThinkingMode {
     Quick,
+    #[default]
     Balanced,
     HardThink,
 }
@@ -43,12 +44,6 @@ impl ThinkingMode {
             Self::Balanced => "平衡速度、质量和验证，适合默认场景。",
             Self::HardThink => "强化拆解、边界检查和风险识别，适合复杂任务。",
         }
-    }
-}
-
-impl Default for ThinkingMode {
-    fn default() -> Self {
-        Self::Balanced
     }
 }
 

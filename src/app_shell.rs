@@ -180,7 +180,7 @@ enum RunnerEvent {
     Doctor(DoctorReport),
     Finished {
         state: CommandState,
-        manifest: Option<SessionManifest>,
+        manifest: Box<Option<SessionManifest>>,
     },
 }
 
@@ -1421,7 +1421,7 @@ impl AppShell {
                     }
                     RunnerEvent::Finished { state, manifest } => {
                         command.state = state;
-                        finished = Some((command.action, state, manifest));
+                        finished = Some((command.action, state, *manifest));
                     }
                 }
             }
@@ -1443,8 +1443,6 @@ impl AppShell {
                     && matches!(action, ShellAction::Run | ShellAction::Plan)
                 {
                     self.navigate_to(Route::History);
-                } else if matches!(action, ShellAction::ReplaySelected) {
-                    self.navigate_to(Route::Run);
                 } else {
                     self.navigate_to(Route::Run);
                 }
@@ -1822,13 +1820,16 @@ fn spawn_embedded_action(
 
         match outcome {
             Ok((state, manifest)) => {
-                let _ = tx.send(RunnerEvent::Finished { state, manifest });
+                let _ = tx.send(RunnerEvent::Finished {
+                    state,
+                    manifest: Box::new(manifest),
+                });
             }
             Err(error) => {
                 let _ = tx.send(RunnerEvent::Line(format!("执行失败：{error:#}")));
                 let _ = tx.send(RunnerEvent::Finished {
                     state: CommandState::Failed,
-                    manifest: None,
+                    manifest: Box::new(None),
                 });
             }
         }
@@ -2283,12 +2284,10 @@ fn contextual_help_lines(
             } else {
                 "编辑中：Enter 换行，Esc 保存退出，Ctrl+P 先看方案，Ctrl+R 直接执行。"
             }
+        } else if width < 72 {
+            "编辑中：Enter 保存，Esc 取消。"
         } else {
-            if width < 72 {
-                "编辑中：Enter 保存，Esc 取消。"
-            } else {
-                "编辑中：Enter 保存，Esc 取消，Backspace/Delete 删除。"
-            }
+            "编辑中：Enter 保存，Esc 取消，Backspace/Delete 删除。"
         };
         return vec![Line::from(hint)];
     }
@@ -3148,7 +3147,7 @@ mod tests {
 
         let _ = tx.send(super::RunnerEvent::Finished {
             state: CommandState::Succeeded,
-            manifest: None,
+            manifest: Box::new(None),
         });
 
         shell.poll_command_output().unwrap();
