@@ -390,23 +390,6 @@ fn validated_task_input(task: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validated_task_input;
-
-    #[test]
-    fn rejects_empty_task_input() {
-        let error = validated_task_input("   \n\t").expect_err("should reject empty task");
-        assert!(error.to_string().contains("任务描述不能为空"));
-    }
-
-    #[test]
-    fn trims_valid_task_input() {
-        let task = validated_task_input("  修复 TUI 交互  ").expect("valid task");
-        assert_eq!(task, "修复 TUI 交互");
-    }
-}
-
 fn into_ui_mode(mode: UiModeArg) -> UiMode {
     match mode {
         UiModeArg::Rich => UiMode::Rich,
@@ -503,4 +486,21 @@ fn apply_run_preset(mut config: SessionConfig) -> SessionConfig {
         None => {}
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_task_input;
+
+    #[test]
+    fn rejects_empty_task_input() {
+        let error = validated_task_input("   \n\t").expect_err("should reject empty task");
+        assert!(error.to_string().contains("任务描述不能为空"));
+    }
+
+    #[test]
+    fn trims_valid_task_input() {
+        let task = validated_task_input("  修复 TUI 交互  ").expect("valid task");
+        assert_eq!(task, "修复 TUI 交互");
+    }
 }

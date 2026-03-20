@@ -15,6 +15,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthChar;
 
@@ -38,6 +39,7 @@ use crate::workspace::{remember_target_dir, resolve_target_dir};
 
 const MAX_LOG_LINES: usize = 240;
 const MAX_NOTICE_LINES: usize = 8;
+const HISTORY_DETAIL_PAGE_LINES: usize = 220;
 
 /// v6 终端产品主导航。保留固定 3 个页面，确保演示路径稳定可记忆。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +186,121 @@ impl RunSubview {
     }
 }
 
+/// 历史详情弹层里的细分阅读视图。
+/// 目标是把 session 已落盘的计划、运行轨迹、worker 输出和关键产物完整串起来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryDetailTab {
+    Overview,
+    Plan,
+    Runtime,
+    Workers,
+    Artifacts,
+}
+
+impl HistoryDetailTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "总览",
+            Self::Plan => "计划",
+            Self::Runtime => "运行",
+            Self::Workers => "Workers",
+            Self::Artifacts => "产物",
+        }
+    }
+
+    fn all() -> [Self; 5] {
+        [
+            Self::Overview,
+            Self::Plan,
+            Self::Runtime,
+            Self::Workers,
+            Self::Artifacts,
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryDetailState {
+    session: SessionManifest,
+    active_tab: HistoryDetailTab,
+    body: String,
+    page: usize,
+    scroll: u16,
+}
+
+impl HistoryDetailState {
+    fn from_session(session: &SessionManifest) -> Self {
+        let active_tab = HistoryDetailTab::Overview;
+        Self {
+            session: session.clone(),
+            active_tab,
+            body: build_history_detail_body(session, active_tab),
+            page: 0,
+            scroll: 0,
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        &self.session.id
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let tabs = HistoryDetailTab::all();
+        let current = tabs
+            .iter()
+            .position(|item| *item == self.active_tab)
+            .unwrap_or(0);
+        self.active_tab = tabs[cycle_index(current, tabs.len(), forward)];
+        self.body = build_history_detail_body(&self.session, self.active_tab);
+        self.page = 0;
+        self.scroll = 0;
+    }
+
+    fn scroll_lines(&mut self, delta: i32) {
+        if delta >= 0 {
+            self.scroll = self.scroll.saturating_add(delta as u16);
+        } else {
+            self.scroll = self.scroll.saturating_sub((-delta) as u16);
+        }
+    }
+
+    fn page_count(&self) -> usize {
+        page_count_for_text(&self.body, HISTORY_DETAIL_PAGE_LINES)
+    }
+
+    fn current_page_text(&self) -> String {
+        page_text(&self.body, self.page, HISTORY_DETAIL_PAGE_LINES)
+    }
+
+    fn page_summary(&self) -> String {
+        let total = self.page_count();
+        format!("第 {}/{} 页", self.page.saturating_add(1), total.max(1))
+    }
+
+    fn next_page(&mut self) {
+        let max_index = self.page_count().saturating_sub(1);
+        if self.page < max_index {
+            self.page += 1;
+        }
+        self.scroll = 0;
+    }
+
+    fn previous_page(&mut self) {
+        self.page = self.page.saturating_sub(1);
+        self.scroll = 0;
+    }
+
+    fn first_page(&mut self) {
+        self.page = 0;
+        self.scroll = 0;
+    }
+
+    fn last_page(&mut self) {
+        self.page = self.page_count().saturating_sub(1);
+        self.scroll = 0;
+    }
+}
+
 /// 后台任务推回到 UI 线程的统一事件。
 /// AppShell 不直接关心底层实现细节，只消费这层抽象后的运行消息。
 #[derive(Debug)]
@@ -291,6 +408,7 @@ struct AppShell {
     form: FormState,
     project: ProjectContext,
     selected_session: Option<SessionManifest>,
+    history_detail: Option<HistoryDetailState>,
     runtime_state: Option<RuntimeViewState>,
     run_subview: RunSubview,
     last_doctor_report: Option<DoctorReport>,
@@ -368,11 +486,12 @@ impl AppShell {
             history_index: 0,
             notices: vec![
                 "默认只需要两步：先写任务，再选择“先看方案”或“开始执行”。".to_string(),
-                "历史页新增 `c`：可基于已完成 session 继续反馈和迭代。".to_string(),
+                "历史页支持 `v` 查看完整详情，`c` 继续迭代，`l` 回放过程。".to_string(),
             ],
             form,
             project,
             selected_session,
+            history_detail: None,
             runtime_state: None,
             run_subview: RunSubview::Dashboard,
             last_doctor_report: None,
@@ -401,6 +520,16 @@ impl AppShell {
             );
             frame.render_widget(Clear, popup);
             self.render_edit_popup(frame, popup);
+        }
+
+        if self.history_detail.is_some() {
+            let popup = centered_rect(
+                popup_percent(area.width, 90, 98),
+                popup_percent(area.height, 88, 96),
+                area,
+            );
+            frame.render_widget(Clear, popup);
+            self.render_history_detail_popup(frame, popup);
         }
     }
 
@@ -1044,15 +1173,86 @@ impl AppShell {
                 }
             )));
             lines.push(Line::from(
-                "操作：←/→ 切换继续模式，`Enter`/`c` 继续，`e` 编辑反馈，`l` 回放过程。",
+                "操作：`v` 查看完整详情，←/→ 切换继续模式，`Enter`/`c` 继续，`e` 编辑反馈，`l` 回放过程。",
             ));
             lines
         } else {
-            vec![Line::from("先选中一个会话，再按 `Enter` 继续或按 `l` 回放。")]
+            vec![Line::from(
+                "先选中一个会话，再按 `v` 查看详情，或按 `Enter` 继续 / `l` 回放。",
+            )]
         };
         Paragraph::new(lines)
             .block(Block::default().title("历史结果详情").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
+    }
+
+    fn render_history_detail_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let Some(detail) = &self.history_detail else {
+            return;
+        };
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Length(3),
+                Constraint::Min(8),
+            ])
+            .split(area);
+
+        let active_label = detail.active_tab.label();
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!(
+                        "历史详情 / {} / {} / {}",
+                        truncate(detail.session_id(), 28),
+                        active_label,
+                        detail.page_summary()
+                    ),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from("已加载当前 session 的计划、运行时间线、worker 原始输出和关键产物。"),
+                Line::from("热键：Tab/[ ]/←→ 切标签，↑↓ 或 j/k 滚动，PgUp/PgDn 翻页，Home/End 首尾页，Esc 关闭。"),
+            ])
+            .block(Block::default().title("历史会话完整详情").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+            sections[0],
+        );
+        frame.render_widget(self.history_detail_tabs_widget(area.width), sections[1]);
+
+        frame.render_widget(
+            Paragraph::new(detail.current_page_text())
+                .block(Block::default().title("内容").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((detail.scroll, 0)),
+            sections[2],
+        );
+    }
+
+    fn history_detail_tabs_widget(&self, width: u16) -> Tabs<'static> {
+        let titles = history_detail_tab_titles(width)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        let selected = self
+            .history_detail
+            .as_ref()
+            .and_then(|detail| {
+                HistoryDetailTab::all()
+                    .iter()
+                    .position(|item| *item == detail.active_tab)
+            })
+            .unwrap_or(0);
+        Tabs::new(titles)
+            .select(selected)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::ALL).title("详情分页"))
     }
 
     fn render_edit_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -1136,6 +1336,10 @@ impl AppShell {
             return self.handle_edit_key(key).await;
         }
 
+        if self.history_detail.is_some() {
+            return self.handle_history_detail_key(key);
+        }
+
         match key.code {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -1173,6 +1377,9 @@ impl AppShell {
             }
             KeyCode::Char('l') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::ReplaySelected).await?
+            }
+            KeyCode::Char('v') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_history_detail()
             }
             KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.stop_active_command()
@@ -1243,6 +1450,49 @@ impl AppShell {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn handle_history_detail_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(detail) = &mut self.history_detail else {
+            return Ok(());
+        };
+        let mut should_close = false;
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('v') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                should_close = true;
+            }
+            KeyCode::Tab | KeyCode::Char(']') | KeyCode::Right
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                detail.cycle_tab(true);
+            }
+            KeyCode::BackTab | KeyCode::Char('[') | KeyCode::Left
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                detail.cycle_tab(false);
+            }
+            KeyCode::Up => detail.scroll_lines(-1),
+            KeyCode::Down => detail.scroll_lines(1),
+            KeyCode::PageUp => detail.previous_page(),
+            KeyCode::PageDown => detail.next_page(),
+            KeyCode::Home => detail.first_page(),
+            KeyCode::End => detail.last_page(),
+            KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                detail.scroll_lines(-1)
+            }
+            KeyCode::Char('j') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                detail.scroll_lines(1)
+            }
+            _ => {}
+        }
+
+        if should_close {
+            self.history_detail = None;
+            self.push_notice("已关闭历史详情。");
+        }
+
         Ok(())
     }
 
@@ -1342,6 +1592,7 @@ impl AppShell {
                 if let Some(item) = self.project.sessions.get(self.history_index) {
                     self.selected_session =
                         load_session(&self.project.target_dir, Some(&item.id)).ok();
+                    self.refresh_history_detail_if_needed();
                 }
             }
             _ => {}
@@ -1562,6 +1813,7 @@ impl AppShell {
                     runtime_state.set_identity(manifest.id.clone(), manifest.task.clone());
                 }
                 self.selected_session = Some(manifest);
+                self.refresh_history_detail_if_needed();
             }
             self.push_notice(&format!("{} 已结束：{}", action.label(), state.label()));
             self.refresh_project(false)?;
@@ -1701,6 +1953,7 @@ impl AppShell {
         }
         if let Some(item) = self.project.sessions.get(self.history_index) {
             self.selected_session = load_session(&self.project.target_dir, Some(&item.id)).ok();
+            self.refresh_history_detail_if_needed();
         }
         Ok(())
     }
@@ -1708,9 +1961,39 @@ impl AppShell {
     fn open_history_selection(&mut self) -> Result<()> {
         if let Some(item) = self.project.sessions.get(self.history_index) {
             self.selected_session = Some(load_session(&self.project.target_dir, Some(&item.id))?);
+            self.refresh_history_detail_if_needed();
             self.navigate_to(Route::History);
         }
         Ok(())
+    }
+
+    fn open_history_detail(&mut self) {
+        if self.route != Route::History {
+            self.navigate_to(Route::History);
+        }
+        if let Some(session) = &self.selected_session {
+            self.history_detail = Some(HistoryDetailState::from_session(session));
+            self.push_notice("已打开历史详情，可切换查看计划、运行和产物原文。");
+        } else {
+            self.push_notice("请先在历史页选中一个会话。");
+        }
+    }
+
+    fn refresh_history_detail_if_needed(&mut self) {
+        let current_session_id = self
+            .history_detail
+            .as_ref()
+            .map(|detail| detail.session_id().to_string());
+        let Some(current_session_id) = current_session_id else {
+            return;
+        };
+        let Some(session) = &self.selected_session else {
+            self.history_detail = None;
+            return;
+        };
+        if current_session_id != session.id {
+            self.history_detail = Some(HistoryDetailState::from_session(session));
+        }
     }
 
     fn push_notice(&mut self, message: &str) {
@@ -2596,9 +2879,9 @@ fn contextual_help_lines(
             run_subview.label()
         ))],
         Route::History => vec![Line::from(if compact {
-            "历史页：↑↓ 预览，←→ 切模式，c 继续，Esc 返回上一级。"
+            "历史页：↑↓ 预览，v 详情，←→ 切模式，c 继续，Esc 返回上一级。"
         } else {
-            "历史页：↑↓ 预览会话，←→ 切继续模式，`c` 继续优化当前项，`l` 回放当前项，`Esc` 返回上一级。"
+            "历史页：↑↓ 预览会话，`v` 查看完整详情，←→ 切继续模式，`c` 继续优化当前项，`l` 回放当前项，`Esc` 返回上一级。"
         })],
     }
 }
@@ -2636,6 +2919,17 @@ fn run_subview_titles(width: u16) -> Vec<&'static str> {
         vec!["态势", "事件", "摘要"]
     } else {
         RunSubview::all().iter().map(|item| item.label()).collect()
+    }
+}
+
+fn history_detail_tab_titles(width: u16) -> Vec<&'static str> {
+    if width < 72 {
+        vec!["览", "计", "跑", "工", "物"]
+    } else {
+        HistoryDetailTab::all()
+            .iter()
+            .map(|item| item.label())
+            .collect()
     }
 }
 
@@ -2901,6 +3195,290 @@ fn move_cursor_vertical(edit: &mut EditState, forward: bool) {
     edit.preferred_column = Some(desired_col);
 }
 
+fn build_history_detail_body(session: &SessionManifest, tab: HistoryDetailTab) -> String {
+    let mut sections = Vec::<String>::new();
+    match tab {
+        HistoryDetailTab::Overview => {
+            sections.push(format!(
+                "会话：{}\n任务：{}\n状态：{}\n版本：V{}\n根会话：{}\n来源会话：{}\n创建时间：{}\n目标仓库：{}\n协作模板：{}\n任务强度：{}\n结果落地：{}\n可继续反馈：{}\nSession 目录：{}",
+                session.id,
+                session.task,
+                session.status.label(),
+                session.iteration_index_value(),
+                session.root_session_id_ref(),
+                session.parent_session_id.as_deref().unwrap_or("无"),
+                format_beijing(session.created_at, "%Y-%m-%d %H:%M:%S"),
+                session.repo_snapshot.repo_root.display(),
+                session.role_set,
+                thinking_mode_user_title(session.thinking_mode),
+                apply_mode_user_label(session.apply_mode),
+                if session.continuable() { "是" } else { "否" },
+                session.session_dir.display()
+            ));
+            append_serialized_section(&mut sections, "Repo Snapshot", &session.repo_snapshot);
+            append_serialized_section(&mut sections, "Lineage", &session.lineage);
+            append_serialized_section(&mut sections, "Feedback History", &session.feedback_history);
+            append_serialized_section(&mut sections, "Final Summary", &session.final_summary);
+            append_serialized_section(&mut sections, "Doctor Report", &session.doctor_report);
+            append_serialized_section(&mut sections, "Artifact Index", &session.artifact_index);
+            append_serialized_section(
+                &mut sections,
+                "Artifact Manifest",
+                &session.artifact_manifest,
+            );
+        }
+        HistoryDetailTab::Plan => {
+            append_file_section_if_exists(
+                &mut sections,
+                "Plan Todo Markdown",
+                session.session_dir.join("commander").join("plan-todo.md"),
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Plan Todo JSON",
+                session.artifact_manifest.plan_todo_path.clone(),
+            );
+            append_serialized_section(&mut sections, "Plan Todo (Manifest)", &session.plan_todo);
+            append_file_section_if_exists(
+                &mut sections,
+                "Execution Graph JSON",
+                &session.graph_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Execution Graph (Manifest)",
+                &session.execution_graph,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Execution Contract JSON",
+                &session.execution_contract_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Execution Contract (Manifest)",
+                &session.execution_contract,
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Todo State JSON",
+                session.artifact_manifest.todo_state_path.clone(),
+            );
+            append_serialized_section(
+                &mut sections,
+                "Todo States (Manifest)",
+                &session.todo_states,
+            );
+        }
+        HistoryDetailTab::Runtime => {
+            append_file_section_if_exists(&mut sections, "Timeline JSONL", &session.timeline_path);
+            append_serialized_section(
+                &mut sections,
+                "Timeline Summary (Manifest)",
+                &session.timeline_events,
+            );
+            append_serialized_section(&mut sections, "Demo Summary", &session.demo_summary);
+            append_serialized_section(&mut sections, "Doctor Report", &session.doctor_report);
+        }
+        HistoryDetailTab::Workers => {
+            if session.worker_results.is_empty() {
+                sections.push("当前 session 没有 worker 运行输出。".to_string());
+            }
+            for worker in &session.worker_results {
+                sections.push(format!(
+                    "Worker：{}\n角色：{}\n标题：{}\n状态：{}\n尝试次数：{}\n退出码：{}\n改动文件：{}\n错误：{}",
+                    worker.agent_id,
+                    worker.role,
+                    worker.task_title,
+                    worker.status.label(),
+                    worker.attempts,
+                    worker
+                        .exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "无".to_string()),
+                    if worker.changed_files.is_empty() {
+                        "无".to_string()
+                    } else {
+                        worker.changed_files.join("；")
+                    },
+                    worker.error.clone().unwrap_or_else(|| "无".to_string())
+                ));
+                append_serialized_section(
+                    &mut sections,
+                    &format!("Worker {} Result JSON", worker.agent_id),
+                    worker,
+                );
+                append_optional_file_section(
+                    &mut sections,
+                    &format!("Worker {} Diff", worker.agent_id),
+                    worker.diff_path.clone(),
+                );
+                append_optional_file_section(
+                    &mut sections,
+                    &format!("Worker {} Git Status", worker.agent_id),
+                    worker.git_status_path.clone(),
+                );
+                append_optional_file_section(
+                    &mut sections,
+                    &format!("Worker {} Handoff", worker.agent_id),
+                    worker.handoff_path.clone(),
+                );
+                append_file_section_if_exists(
+                    &mut sections,
+                    &format!("Worker {} Final Output", worker.agent_id),
+                    &worker.final_output_path,
+                );
+                append_file_section_if_exists(
+                    &mut sections,
+                    &format!("Worker {} Stdout", worker.agent_id),
+                    &worker.stdout_path,
+                );
+                append_file_section_if_exists(
+                    &mut sections,
+                    &format!("Worker {} Stderr", worker.agent_id),
+                    &worker.stderr_path,
+                );
+            }
+        }
+        HistoryDetailTab::Artifacts => {
+            append_file_section_if_exists(
+                &mut sections,
+                "Summary Markdown",
+                &session.summary_markdown_path,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Summary JSON",
+                &session.summary_json_path,
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Apply Plan JSON",
+                session.artifact_manifest.apply_plan_path.clone(),
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Apply Result JSON",
+                &session.apply_result_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Apply Result (Manifest)",
+                &session.apply_result,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Verification Report JSON",
+                &session.verification_report_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Verification Report (Manifest)",
+                &session.verification_report,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Change Trust Report JSON",
+                &session.change_trust_report_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Change Trust Report (Manifest)",
+                &session.change_trust_report,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Artifact Manifest JSON",
+                &session.artifact_manifest_path,
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Feedback Markdown",
+                session.artifact_manifest.feedback_markdown_path.clone(),
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Feedback JSON",
+                session.artifact_manifest.feedback_json_path.clone(),
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Iteration Summary Markdown",
+                session.artifact_manifest.iteration_summary_path.clone(),
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Lineage JSON",
+                session.artifact_manifest.lineage_path.clone(),
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Latest Pointer Markdown",
+                session.artifact_manifest.latest_pointer_path.clone(),
+            );
+        }
+    }
+
+    sections.join("\n\n")
+}
+
+fn append_serialized_section<T>(sections: &mut Vec<String>, title: &str, value: &T)
+where
+    T: Serialize,
+{
+    let body = serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| format!("序列化失败：{error:#}"));
+    sections.push(format!("===== {title} =====\n\n{body}"));
+}
+
+fn append_optional_file_section(sections: &mut Vec<String>, title: &str, path: Option<PathBuf>) {
+    match path {
+        Some(path) => append_file_section_if_exists(sections, title, path),
+        None => sections.push(format!("===== {title} =====\n\n未生成该文件。")),
+    }
+}
+
+fn append_file_section_if_exists<P>(sections: &mut Vec<String>, title: &str, path: P)
+where
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+    let body = if path.exists() {
+        read_text_lossy(path)
+    } else {
+        "文件不存在。".to_string()
+    };
+    sections.push(format!(
+        "===== {title} =====\n路径：{}\n\n{}",
+        path.display(),
+        body
+    ));
+}
+
+fn read_text_lossy(path: &Path) -> String {
+    match fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(error) => format!("读取失败：{error:#}"),
+    }
+}
+
+fn page_count_for_text(text: &str, lines_per_page: usize) -> usize {
+    let total_lines = text.lines().count().max(1);
+    total_lines.div_ceil(lines_per_page.max(1))
+}
+
+fn page_text(text: &str, page: usize, lines_per_page: usize) -> String {
+    let lines_per_page = lines_per_page.max(1);
+    let start = page.saturating_mul(lines_per_page);
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start = start.min(lines.len().saturating_sub(1));
+    let end = (start + lines_per_page).min(lines.len());
+    lines[start..end].join("\n")
+}
+
 fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(format!("会话：{}", session.id)),
@@ -2983,8 +3561,8 @@ mod tests {
     use super::{
         ActiveCommand, AppShell, CommandState, FormField, FormState, ProjectContext, Route,
         RunSubview, ShellAction, build_command_preview, build_continue_args, contextual_help_lines,
-        history_back_route, next_history_return_route, next_run_return_route,
-        preferred_run_subview, prepare_runtime_state, route_titles, run_back_route,
+        history_back_route, next_history_return_route, next_run_return_route, page_count_for_text,
+        page_text, preferred_run_subview, prepare_runtime_state, route_titles, run_back_route,
         run_subview_titles, split_main_sections, wrapped_cursor_row_col,
     };
     use crate::cli::ContinueModeArg;
@@ -3020,6 +3598,7 @@ mod tests {
                 last_error: None,
             },
             selected_session: None,
+            history_detail: None,
             runtime_state: None,
             run_subview: RunSubview::Dashboard,
             last_doctor_report: None,
@@ -3767,5 +4346,122 @@ mod tests {
 
         shell.handle_key(key(KeyCode::Left)).await.unwrap();
         assert_eq!(shell.form.continue_mode, ContinueModeArg::Auto);
+    }
+
+    #[tokio::test]
+    async fn history_v_opens_and_esc_closes_detail_popup() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.selected_session = Some(sample_session("session-1"));
+
+        shell.handle_key(key(KeyCode::Char('v'))).await.unwrap();
+        assert!(shell.history_detail.is_some());
+
+        shell.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(shell.history_detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn history_detail_left_right_switch_tabs() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.selected_session = Some(sample_session("session-1"));
+
+        shell.handle_key(key(KeyCode::Char('v'))).await.unwrap();
+        assert_eq!(
+            shell
+                .history_detail
+                .as_ref()
+                .map(|detail| detail.active_tab),
+            Some(super::HistoryDetailTab::Overview)
+        );
+
+        shell.handle_key(key(KeyCode::Right)).await.unwrap();
+        assert_eq!(
+            shell
+                .history_detail
+                .as_ref()
+                .map(|detail| detail.active_tab),
+            Some(super::HistoryDetailTab::Plan)
+        );
+
+        shell.handle_key(key(KeyCode::Left)).await.unwrap();
+        assert_eq!(
+            shell
+                .history_detail
+                .as_ref()
+                .map(|detail| detail.active_tab),
+            Some(super::HistoryDetailTab::Overview)
+        );
+    }
+
+    #[tokio::test]
+    async fn history_detail_lazy_loads_current_tab_only() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.selected_session = Some(sample_session("session-1"));
+
+        shell.handle_key(key(KeyCode::Char('v'))).await.unwrap();
+        let initial = shell
+            .history_detail
+            .as_ref()
+            .map(|detail| detail.body.clone())
+            .unwrap_or_default();
+        assert!(initial.contains("会话：session-1"));
+
+        shell.handle_key(key(KeyCode::Right)).await.unwrap();
+        let switched = shell
+            .history_detail
+            .as_ref()
+            .map(|detail| detail.body.clone())
+            .unwrap_or_default();
+        assert_ne!(initial, switched);
+        assert!(switched.contains("Execution Graph"));
+    }
+
+    #[test]
+    fn page_text_slices_lines_by_page() {
+        let text = (0..6)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(page_count_for_text(&text, 2), 3);
+        assert_eq!(page_text(&text, 0, 2), "line-0\nline-1");
+        assert_eq!(page_text(&text, 1, 2), "line-2\nline-3");
+        assert_eq!(page_text(&text, 2, 2), "line-4\nline-5");
+    }
+
+    #[tokio::test]
+    async fn history_detail_page_down_switches_page_slice() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.selected_session = Some(sample_session("session-1"));
+        shell.open_history_detail();
+
+        if let Some(detail) = shell.history_detail.as_mut() {
+            detail.body = (0..(super::HISTORY_DETAIL_PAGE_LINES + 5))
+                .map(|i| format!("line-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+
+        let before = shell
+            .history_detail
+            .as_ref()
+            .map(|detail| detail.current_page_text())
+            .unwrap_or_default();
+        assert!(before.contains("line-0"));
+        assert!(!before.contains(&format!("line-{}", super::HISTORY_DETAIL_PAGE_LINES)));
+
+        shell.handle_key(key(KeyCode::PageDown)).await.unwrap();
+
+        let after = shell
+            .history_detail
+            .as_ref()
+            .map(|detail| detail.current_page_text())
+            .unwrap_or_default();
+        assert!(after.contains(&format!("line-{}", super::HISTORY_DETAIL_PAGE_LINES)));
+        assert!(!after.contains("line-0"));
     }
 }

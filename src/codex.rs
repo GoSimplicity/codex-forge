@@ -64,6 +64,7 @@ async fn run_json_attempt(
     log_path: &Path,
 ) -> Result<String> {
     let mut command = Command::new("codex");
+    configure_codex_command(&mut command);
     command
         .arg("exec")
         .arg("--skip-git-repo-check")
@@ -98,9 +99,10 @@ async fn run_json_attempt(
         .with_context(|| format!("写入 Codex 调用日志失败：{}", log_path.display()))?;
 
     if !output.status.success() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "Codex JSON 调用失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{}",
+            format_codex_failure("Codex JSON 调用失败", &stderr_text)
         );
     }
 
@@ -263,6 +265,7 @@ async fn run_worker_attempt(
     }
 
     let mut command = Command::new("codex");
+    configure_codex_command(&mut command);
     command
         .arg("exec")
         .arg("--json")
@@ -411,17 +414,15 @@ async fn run_worker_attempt(
     let error = match (status.success(), spec.final_output_path.exists()) {
         (true, true) => None,
         (true, false) => Some("worker 返回成功但缺少结构化输出文件".to_string()),
-        (false, _) => Some(format!(
-            "worker 退出码异常：{}{}",
-            status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "被信号终止".to_string()),
-            if stderr_excerpt.is_empty() {
-                String::new()
-            } else {
-                format!("；stderr: {stderr_excerpt}")
-            }
+        (false, _) => Some(format_codex_failure(
+            &format!(
+                "worker 退出码异常：{}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "被信号终止".to_string())
+            ),
+            &stderr_excerpt,
         )),
     };
 
@@ -599,7 +600,10 @@ fn summarize_event_message(value: &Value) -> Option<String> {
 }
 
 fn summarize_item_event(event_type: &str, item: &Value) -> Option<String> {
-    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("unknown");
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     match item_type {
         "agent_message" => item
             .get("text")
@@ -643,7 +647,11 @@ fn summarize_command_execution_event(event_type: &str, item: &Value) -> Option<S
                 .unwrap_or_default();
             Some(format!(
                 "命令{}：{}{}{}",
-                if status == "completed" { "完成" } else { status },
+                if status == "completed" {
+                    "完成"
+                } else {
+                    status
+                },
                 command,
                 exit_code,
                 output_hint
@@ -971,6 +979,45 @@ fn build_diagnostic_summary(
     })
 }
 
+fn configure_codex_command(command: &mut Command) {
+    // 在允许外网的真实运行环境中，禁用 SDK telemetry 可减少无关初始化噪音。
+    command.env("OTEL_SDK_DISABLED", "true");
+}
+
+fn format_codex_failure(prefix: &str, stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    let mut message = if trimmed.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}：{trimmed}")
+    };
+    if let Some(hint) = codex_environment_hint(stderr) {
+        message.push('；');
+        message.push_str(&hint);
+    }
+    message
+}
+
+fn codex_environment_hint(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    if lower.contains("attempted to create a null object")
+        || lower.contains("could not create otel exporter")
+        || lower.contains("event loop thread panicked")
+    {
+        return Some(
+            "检测到 Codex CLI 在受限运行环境中初始化网络或遥测失败；如果当前在沙箱或受限 CI 中运行，请改为允许外网的环境后重试".to_string(),
+        );
+    }
+    if lower.contains("stream disconnected before completion")
+        || lower.contains("error sending request for url")
+    {
+        return Some(
+            "检测到 Codex 上游请求未完成；请优先检查当前环境的外网访问，再决定是否重试".to_string(),
+        );
+    }
+    None
+}
+
 fn read_tail(path: &Path, max_chars: usize) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
     let trimmed = content.trim();
@@ -984,6 +1031,12 @@ fn read_tail(path: &Path, max_chars: usize) -> Option<String> {
 
 fn classify_retryable(message: &str) -> bool {
     let lower = message.to_lowercase();
+    if lower.contains("attempted to create a null object")
+        || lower.contains("could not create otel exporter")
+        || lower.contains("event loop thread panicked")
+    {
+        return false;
+    }
     [
         "timeout",
         "timed out",
@@ -994,6 +1047,7 @@ fn classify_retryable(message: &str) -> bool {
         "429",
         "missing output",
         "缺少结构化输出文件",
+        "stream disconnected before completion",
     ]
     .iter()
     .any(|keyword| lower.contains(keyword))
@@ -1007,8 +1061,8 @@ fn backoff_for(attempt: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_json, extract_json_document, extract_summary_section, parse_event_line,
-        parse_handoff,
+        classify_retryable, codex_environment_hint, compact_json, extract_json_document,
+        extract_summary_section, parse_event_line, parse_handoff,
     };
     use crate::model::ApplyDecision;
     use serde_json::json;
@@ -1138,5 +1192,23 @@ mod tests {
         let text = "我会按要求输出。\n{\"ok\":\"hello\",\"items\":[1,2,3]}\n请查收";
         let json = extract_json_document(text).expect("json");
         assert!(json.contains("\"ok\":\"hello\""));
+    }
+
+    #[test]
+    fn codex_environment_hint_detects_sandbox_runtime_failure() {
+        let hint = codex_environment_hint(
+            "Attempted to create a NULL object. Could not create otel exporter: panicked during initialization",
+        );
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn classify_retryable_excludes_sandbox_runtime_failure() {
+        assert!(!classify_retryable(
+            "Attempted to create a NULL object. Could not create otel exporter"
+        ));
+        assert!(classify_retryable(
+            "stream disconnected before completion: error sending request for url"
+        ));
     }
 }
