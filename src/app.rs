@@ -4,11 +4,11 @@ use clap::Parser;
 use crate::app_shell::run_app_shell;
 use crate::cli::{
     AgentCommands, AgentListArgs, ApplyModeArg, Cli, Commands, ConfigCommands, ConfigValidateArgs,
-    DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs, TuiArgs, UiModeArg,
+    DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs, ThinkingModeArg, TuiArgs, UiModeArg,
 };
 use crate::config::{load_project_config, validate_project_config};
 use crate::doctor::run_doctor;
-use crate::model::{ApplyMode, SessionConfig, SessionPreset, UiMode};
+use crate::model::{ApplyMode, SessionConfig, SessionPreset, ThinkingMode, UiMode};
 use crate::orchestrator::{plan_session, run_session};
 use crate::replay::replay_session;
 use crate::resources::{load_resource_catalog, resolve_role_set};
@@ -79,6 +79,11 @@ pub(crate) fn resolve_run_config(
             .max(1),
         role_set,
         model: args.shared.model.or(loaded.settings.model.clone()),
+        thinking_mode: args
+            .shared
+            .thinking_mode
+            .map(into_thinking_mode)
+            .unwrap_or(loaded.settings.thinking_mode),
         ui_mode: into_ui_mode(args.shared.ui),
         target_dir,
         cleanup_success: args.cleanup_success || loaded.settings.cleanup_success,
@@ -121,6 +126,11 @@ pub(crate) fn resolve_plan_config(
             .max(1),
         role_set,
         model: args.shared.model.or(loaded.settings.model.clone()),
+        thinking_mode: args
+            .shared
+            .thinking_mode
+            .map(into_thinking_mode)
+            .unwrap_or(loaded.settings.thinking_mode),
         ui_mode: into_ui_mode(args.shared.ui),
         target_dir,
         cleanup_success: false,
@@ -208,6 +218,7 @@ fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
             .unwrap_or_else(|| "使用内置默认值".to_string())
     );
     println!("默认 workers：{}", loaded.settings.workers);
+    println!("默认 thinking_mode：{}", loaded.settings.thinking_mode);
     println!("默认 apply_mode：{}", loaded.settings.apply_mode);
     println!("默认 max_retries：{}", loaded.settings.max_retries);
     println!("默认 role_set：{}", loaded.settings.role_set);
@@ -262,6 +273,14 @@ fn into_apply_mode(mode: ApplyModeArg) -> ApplyMode {
         ApplyModeArg::AutoSafe => ApplyMode::AutoSafe,
         ApplyModeArg::Bundle => ApplyMode::Bundle,
         ApplyModeArg::None => ApplyMode::None,
+    }
+}
+
+fn into_thinking_mode(mode: ThinkingModeArg) -> ThinkingMode {
+    match mode {
+        ThinkingModeArg::Quick => ThinkingMode::Quick,
+        ThinkingModeArg::Balanced => ThinkingMode::Balanced,
+        ThinkingModeArg::HardThink => ThinkingMode::HardThink,
     }
 }
 

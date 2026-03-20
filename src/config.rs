@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::model::ApplyMode;
+use crate::model::{ApplyMode, ThinkingMode};
 
 pub const DEFAULT_RUST_VERIFICATION_COMMANDS: &[&str] = &[
     "cargo fmt --check",
@@ -22,6 +22,7 @@ pub struct LoadedProjectConfig {
 pub struct ProjectSettings {
     pub role_set: String,
     pub model: Option<String>,
+    pub thinking_mode: ThinkingMode,
     pub workers: usize,
     pub apply_mode: ApplyMode,
     pub max_retries: usize,
@@ -42,6 +43,7 @@ struct RawProjectConfig {
 struct RawDefaults {
     role_set: Option<String>,
     model: Option<String>,
+    thinking_mode: Option<ThinkingMode>,
     workers: Option<usize>,
     apply_mode: Option<ApplyModeSerde>,
     max_retries: Option<usize>,
@@ -114,6 +116,7 @@ impl Default for ProjectSettings {
         Self {
             role_set: "default".to_string(),
             model: None,
+            thinking_mode: ThinkingMode::Balanced,
             workers: 4,
             apply_mode: ApplyMode::AutoSafe,
             max_retries: 2,
@@ -149,6 +152,7 @@ fn validate_and_build(raw: RawProjectConfig) -> Result<ProjectSettings> {
     Ok(ProjectSettings {
         role_set: raw.defaults.role_set.unwrap_or(defaults.role_set),
         model: raw.defaults.model.or(defaults.model),
+        thinking_mode: raw.defaults.thinking_mode.unwrap_or(defaults.thinking_mode),
         workers,
         apply_mode: raw
             .defaults

@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "codex-forge",
     version,
-    about = "一个多 Agent Codex 指挥台 CLI，支持显式执行图、自动收敛与验证"
+    about = "一个多 Agent 协作终端，默认低负担启动，高级参数按需展开"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -30,15 +30,20 @@ pub struct SharedTaskArgs {
     pub task: String,
     #[arg(
         long,
-        help = "项目配置文件路径；默认优先读取目标仓库下的 codex-forge.toml"
+        help = "高级参数：项目配置文件路径；默认优先读取目标仓库下的 codex-forge.toml"
     )]
     pub config: Option<PathBuf>,
-    #[arg(long, help = "并发 worker 数量；不传时走配置文件或默认值")]
+    #[arg(long, help = "高级参数：并发 worker 数量；通常不需要手动指定")]
     pub workers: Option<usize>,
-    #[arg(long, help = "角色集合标识；默认读取 `.roles/sets.toml` 中的 default")]
+    #[arg(
+        long,
+        help = "高级参数：角色集合标识；默认读取 `.roles/sets.toml` 中的 default"
+    )]
     pub role_set: Option<String>,
-    #[arg(long, help = "统一指定 Codex model")]
+    #[arg(long, help = "高级参数：统一指定 Codex model")]
     pub model: Option<String>,
+    #[arg(long, value_enum, help = "任务强度模式：quick、balanced、hard-think")]
+    pub thinking_mode: Option<ThinkingModeArg>,
     #[arg(long, value_enum, default_value_t = UiModeArg::Rich, help = "终端展示模式")]
     pub ui: UiModeArg,
     #[arg(long, help = "要协同开发的目标仓库目录；不传则优先复用上次指定目录")]
@@ -52,18 +57,25 @@ pub struct RunArgs {
     #[arg(
         long,
         value_enum,
-        help = "使用内置运行预设；feature-demo 适合黑客松现场展示"
+        help = "高级参数：使用内置运行预设；feature-demo 适合黑客松现场展示"
     )]
     pub preset: Option<PresetArg>,
-    #[arg(long, help = "从指定 session 恢复运行，优先复用其执行图与已成功节点")]
+    #[arg(
+        long,
+        help = "高级参数：从指定 session 恢复运行，优先复用其执行图与已成功节点"
+    )]
     pub resume: Option<String>,
-    #[arg(long, value_enum, help = "结果应用模式：auto-safe、bundle、none")]
+    #[arg(
+        long,
+        value_enum,
+        help = "高级参数：结果应用模式：auto-safe、bundle、none"
+    )]
     pub apply_mode: Option<ApplyModeArg>,
-    #[arg(long, help = "worker 最大重试次数")]
+    #[arg(long, help = "高级参数：worker 最大重试次数")]
     pub max_retries: Option<usize>,
-    #[arg(long, help = "任一节点失败后尽快停止调度")]
+    #[arg(long, help = "高级参数：任一节点失败后尽快停止调度")]
     pub fail_fast: bool,
-    #[arg(long, help = "成功完成后自动清理 worker worktree")]
+    #[arg(long, help = "高级参数：成功完成后自动清理 worker worktree")]
     pub cleanup_success: bool,
 }
 
@@ -148,6 +160,14 @@ pub struct ConfigValidateArgs {
 pub enum UiModeArg {
     Rich,
     Minimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ThinkingModeArg {
+    Quick,
+    Balanced,
+    #[value(name = "hard-think")]
+    HardThink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

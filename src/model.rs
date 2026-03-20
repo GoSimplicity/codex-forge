@@ -13,6 +13,52 @@ pub enum UiMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingMode {
+    Quick,
+    Balanced,
+    HardThink,
+}
+
+impl ThinkingMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Balanced => "balanced",
+            Self::HardThink => "hard-think",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Quick => "Quick",
+            Self::Balanced => "Balanced",
+            Self::HardThink => "Hard Think",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Quick => "快速收敛，优先推进，减少过度分析。",
+            Self::Balanced => "平衡速度、质量和验证，适合默认场景。",
+            Self::HardThink => "强化拆解、边界检查和风险识别，适合复杂任务。",
+        }
+    }
+}
+
+impl Default for ThinkingMode {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+impl Display for ThinkingMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyMode {
     AutoSafe,
@@ -297,6 +343,7 @@ pub struct SessionConfig {
     pub workers: usize,
     pub role_set: String,
     pub model: Option<String>,
+    pub thinking_mode: ThinkingMode,
     pub ui_mode: UiMode,
     pub target_dir: PathBuf,
     pub cleanup_success: bool,
@@ -882,6 +929,8 @@ pub struct SessionManifest {
     pub workers_requested: usize,
     pub role_set: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub thinking_mode: ThinkingMode,
     pub cleanup_success: bool,
     pub apply_mode: ApplyMode,
     pub max_retries: usize,

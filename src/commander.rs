@@ -323,6 +323,7 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
         "你现在是 codex-forge V4 的 planner，需要先输出一份**面向用户可读**的计划 TODO 清单。\n\
 请只输出符合 schema 的 JSON，不要输出 Markdown，也不要输出执行角色。\n\n\
 全局任务：{}\n\
+思考强度：{}（{}）\n\
 目标仓库：{}\n\
 技术栈：{}\n\n\
 仓库摘要：\n\
@@ -335,6 +336,8 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
 - 风险要简洁，优先列真正会阻塞执行的点。\n\
 - 保持最小可执行规划，不要过度设计。\n",
         config.task,
+        config.thinking_mode.title(),
+        config.thinking_mode.label(),
         repo.display_name,
         if repo.detected_stacks.is_empty() {
             "未知".to_string()
@@ -398,6 +401,8 @@ fn build_planner_prompt(
         "你现在是 codex-forge V4 的 commander agent，需要为多个 Codex worker 规划显式执行图。\n\
 请只输出符合 schema 的 JSON，不要输出 Markdown。\n\n\
 全局任务：{}\n\
+思考强度：{}（{}）\n\
+思考模式要求：\n{}\n\
 目标仓库：{}\n\
 技术栈：{}\n\
 期望 worker 数量上限：{}\n\
@@ -418,6 +423,9 @@ fn build_planner_prompt(
 - input_artifacts / output_artifacts / completion_criteria 必须具体，便于下游 handoff。\n\
 - 优先保证可执行性和自动收敛，不要设计过度。\n",
         config.task,
+        config.thinking_mode.title(),
+        config.thinking_mode.label(),
+        thinking_mode_prompt_guidance(config.thinking_mode),
         repo.display_name,
         if repo.detected_stacks.is_empty() {
             "未知".to_string()
@@ -433,6 +441,20 @@ fn build_planner_prompt(
         todo_context,
         config.workers,
     )
+}
+
+fn thinking_mode_prompt_guidance(mode: crate::model::ThinkingMode) -> &'static str {
+    match mode {
+        crate::model::ThinkingMode::Quick => {
+            "- 用最短路径完成拆解。\n- 降低节点数量和分析成本，优先可执行性。\n- 非关键风险不必展开成长篇说明。"
+        }
+        crate::model::ThinkingMode::Balanced => {
+            "- 兼顾拆解质量和执行效率。\n- 对关键依赖、验证和风险做适度显式化。\n- 不过度拆分节点，也不省略必要 gate。"
+        }
+        crate::model::ThinkingMode::HardThink => {
+            "- 更深入分析边界、依赖、失败模式和验证路径。\n- 对 reviewer gate、apply 风险和 handoff 要更具体。\n- 宁可更细致，也不要为了省节点而牺牲收敛安全。"
+        }
+    }
 }
 
 fn bind_json_schema(prompt: &str, schema: &str) -> String {
@@ -1683,7 +1705,7 @@ mod tests {
         PlanTodoOutput, PlanTodoOutputItem, PlannerNode, PlannerOutput, fallback_plan,
         normalize_plan, normalize_plan_todo, summarize_error,
     };
-    use crate::model::{ApplyMode, RoleConfig, SessionConfig, UiMode};
+    use crate::model::{ApplyMode, RoleConfig, SessionConfig, ThinkingMode, UiMode};
     use std::path::PathBuf;
 
     fn sample_roles() -> Vec<RoleConfig> {
@@ -1731,6 +1753,7 @@ mod tests {
             workers: 3,
             role_set: "default".to_string(),
             model: None,
+            thinking_mode: ThinkingMode::Balanced,
             ui_mode: UiMode::Minimal,
             target_dir: PathBuf::from("."),
             cleanup_success: false,

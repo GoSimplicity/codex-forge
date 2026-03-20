@@ -72,15 +72,18 @@ pub fn render_worker_prompt(
     } else {
         ""
     };
+    let thinking_mode = config.thinking_mode;
     format!(
         "{prompt_preamble}\n\
 角色：{}（{}）\n\
 职责：{}\n\
 可用 Codex Skills：{}\n\
 工作风格：{}\n\
+思考强度：{}（{}）\n\
 编辑权限：{}\n\n\
 全局规则：\n{}\n\n\
 角色专项规则：\n{}\n\n\
+思考模式要求：\n{}\n\n\
 全局任务：{}\n\
 当前节点：{}\n\
 节点目标：{}\n\
@@ -118,6 +121,8 @@ pub fn render_worker_prompt(
             role.skills.join("、")
         },
         role.working_style,
+        thinking_mode.title(),
+        thinking_mode.label(),
         edit_policy,
         if global_rules.is_empty() {
             "无".to_string()
@@ -129,6 +134,7 @@ pub fn render_worker_prompt(
         } else {
             reviewer_rules.to_string()
         },
+        thinking_mode_instructions(thinking_mode),
         config.task,
         node.title,
         node.objective,
@@ -143,6 +149,20 @@ pub fn render_worker_prompt(
         stacks,
         repo.top_level_entries.join("、"),
     )
+}
+
+fn thinking_mode_instructions(mode: crate::model::ThinkingMode) -> &'static str {
+    match mode {
+        crate::model::ThinkingMode::Quick => {
+            "- 优先快速定位最小可行方案。\n- 减少铺陈，尽快给出可执行结论。\n- 只有在明显阻塞时才扩展分析。"
+        }
+        crate::model::ThinkingMode::Balanced => {
+            "- 平衡速度、质量和验证证据。\n- 先做最小充分分析，再推进实现。\n- 对风险给出简洁但明确的说明。"
+        }
+        crate::model::ThinkingMode::HardThink => {
+            "- 先充分拆解边界、依赖和失败模式，再做实现判断。\n- 主动审视潜在回归、契约漂移和验证缺口。\n- 输出更强调推理链路、风险判断和收敛策略。"
+        }
+    }
 }
 
 fn render_bullets(items: &[String], empty_text: &str) -> String {

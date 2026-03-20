@@ -44,6 +44,7 @@ impl SessionContext {
             workers_requested: config.workers,
             role_set: config.role_set.clone(),
             model: config.model.clone(),
+            thinking_mode: config.thinking_mode,
             cleanup_success: config.cleanup_success,
             apply_mode: config.apply_mode,
             max_retries: config.max_retries,

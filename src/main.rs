@@ -13,6 +13,7 @@ mod repo;
 mod resources;
 mod roles;
 mod session;
+mod time;
 mod ui;
 mod verify;
 mod workspace;

@@ -262,6 +262,11 @@ pub fn render_runtime_dashboard(
     state: &RuntimeViewState,
     title: &str,
 ) {
+    if area.width < 100 || area.height < 24 {
+        render_runtime_dashboard_compact(frame, area, state, title);
+        return;
+    }
+
     // 这个布局是 v5 执行页主视图，也是旧 Rich UI 的基础信息源：
     // 顶部总览 / 中间 worker+todo / 下方 commander notes / 底部状态面板。
     let sections = Layout::default()
@@ -338,41 +343,50 @@ pub fn render_runtime_dashboard(
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(sections[1]);
 
-    let worker_rows = state
-        .workers
-        .iter()
-        .map(|(agent_id, worker)| {
-            Row::new(vec![
-                Cell::from(agent_id.clone()),
-                Cell::from(worker.role.clone()),
-                Cell::from(worker.status.label()),
-                Cell::from(truncate(&worker.title, 24)),
-                Cell::from(truncate(&worker.last_event, 44)),
-            ])
-            .style(style_for_status(worker.status))
-        })
-        .collect::<Vec<_>>();
+    if state.workers.is_empty() {
+        frame.render_widget(
+            Paragraph::new(planning_activity_lines(state, false))
+                .block(Block::default().title("规划动态").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            middle_sections[0],
+        );
+    } else {
+        let worker_rows = state
+            .workers
+            .iter()
+            .map(|(agent_id, worker)| {
+                Row::new(vec![
+                    Cell::from(agent_id.clone()),
+                    Cell::from(worker.role.clone()),
+                    Cell::from(worker.status.label()),
+                    Cell::from(truncate(&worker.title, 24)),
+                    Cell::from(truncate(&worker.last_event, 44)),
+                ])
+                .style(style_for_status(worker.status))
+            })
+            .collect::<Vec<_>>();
 
-    let workers_table = Table::new(
-        worker_rows,
-        [
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(24),
-            Constraint::Min(20),
-        ],
-    )
-    .header(
-        Row::new(vec!["Agent", "角色", "状态", "任务", "最新事件"]).style(
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(Block::default().title("Worker 矩阵").borders(Borders::ALL))
-    .column_spacing(1);
-    frame.render_widget(workers_table, middle_sections[0]);
+        let workers_table = Table::new(
+            worker_rows,
+            [
+                Constraint::Length(14),
+                Constraint::Length(12),
+                Constraint::Length(10),
+                Constraint::Length(24),
+                Constraint::Min(20),
+            ],
+        )
+        .header(
+            Row::new(vec!["Agent", "角色", "状态", "任务", "最新事件"]).style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(Block::default().title("Worker 矩阵").borders(Borders::ALL))
+        .column_spacing(1);
+        frame.render_widget(workers_table, middle_sections[0]);
+    }
 
     let todo_items = state
         .todos
@@ -489,6 +503,324 @@ pub fn render_runtime_dashboard(
         .block(Block::default().title("状态面板").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(footer, sections[3]);
+}
+
+fn render_runtime_dashboard_compact(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &RuntimeViewState,
+    title: &str,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(compact_dashboard_constraints(area))
+        .split(area);
+
+    let success = state
+        .workers
+        .values()
+        .filter(|worker| worker.status == WorkerStatus::Succeeded)
+        .count();
+    let failed = state
+        .workers
+        .values()
+        .filter(|worker| matches!(worker.status, WorkerStatus::Failed | WorkerStatus::Skipped))
+        .count();
+    let running = state
+        .workers
+        .values()
+        .filter(|worker| worker.status == WorkerStatus::Running)
+        .count();
+
+    let header_lines = if area.width < 72 {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "◢ CF V5 ◣",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    truncate(&state.session_id, 16),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Line::from(format!(
+                "{} | 运行{} 成功{} 失败{}",
+                truncate(&state.phase, 10),
+                running,
+                success,
+                failed
+            )),
+            Line::from(format!("任务：{}", truncate(&state.task, 36))),
+        ]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "◢ CODEX-FORGE V5 ◣",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("Session {}", state.session_id),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Line::from(format!("任务：{}", truncate(&state.task, 72))),
+            Line::from(format!(
+                "阶段：{}   运行中：{}   成功：{}   失败/跳过：{}   {}s",
+                state.phase,
+                running,
+                success,
+                failed,
+                state.started_at.elapsed().as_secs()
+            )),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(header_lines)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        sections[0],
+    );
+
+    if state.workers.is_empty() {
+        frame.render_widget(
+            Paragraph::new(planning_activity_lines(state, true))
+                .block(Block::default().title("规划动态").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            sections[1],
+        );
+    } else {
+        let worker_items = state
+            .workers
+            .iter()
+            .take(if area.height < 20 { 4 } else { 6 })
+            .map(|(agent_id, worker)| {
+                ListItem::new(Line::from(format!(
+                    "{} {} / {} / {}",
+                    truncate(agent_id, 10),
+                    truncate(&worker.role, 8),
+                    worker.status.label(),
+                    truncate(&worker.last_event, if area.width < 72 { 20 } else { 42 })
+                )))
+                .style(style_for_status(worker.status))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(worker_items).block(Block::default().title("Workers").borders(Borders::ALL)),
+            sections[1],
+        );
+    }
+
+    let status_lines = compact_status_lines(state, area.width);
+    frame.render_widget(
+        Paragraph::new(status_lines)
+            .block(
+                Block::default()
+                    .title("Todo / Gate / 状态")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        sections[2],
+    );
+
+    if sections.len() > 3 {
+        let summary_lines = compact_summary_lines(state, area.width);
+        frame.render_widget(
+            Paragraph::new(summary_lines)
+                .block(Block::default().title("摘要").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            sections[3],
+        );
+    }
+}
+
+fn compact_dashboard_constraints(area: Rect) -> Vec<Constraint> {
+    if area.height < 18 {
+        vec![
+            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Min(4),
+        ]
+    } else {
+        vec![
+            Constraint::Length(5),
+            Constraint::Min(5),
+            Constraint::Length(6),
+            Constraint::Min(4),
+        ]
+    }
+}
+
+fn compact_status_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'static>> {
+    let todo_limit = if width < 72 { 2 } else { 3 };
+    let mut lines = vec![
+        Line::from(format!(
+            "执行图：{}",
+            state
+                .graph_summary
+                .clone()
+                .unwrap_or_else(|| "等待".to_string())
+        )),
+        Line::from(format!(
+            "应用：{}",
+            truncate(
+                &state
+                    .apply_status
+                    .clone()
+                    .unwrap_or_else(|| "等待".to_string()),
+                if width < 72 { 24 } else { 48 }
+            )
+        )),
+        Line::from(format!(
+            "验证：{}",
+            truncate(
+                &state
+                    .verify_status
+                    .clone()
+                    .unwrap_or_else(|| "等待".to_string()),
+                if width < 72 { 24 } else { 48 }
+            )
+        )),
+    ];
+    for (todo_id, (title, status, message)) in state.todos.iter().take(todo_limit) {
+        lines.push(Line::from(format!(
+            "{} {} / {}",
+            todo_id,
+            truncate(title, if width < 72 { 10 } else { 18 }),
+            truncate(
+                &format!("{} / {}", status.label(), message),
+                if width < 72 { 20 } else { 42 }
+            )
+        )));
+    }
+    if let Some(report) = &state.review_report {
+        lines.push(Line::from(format!(
+            "Gate：{} / {}",
+            report.decision.label(),
+            truncate(
+                report
+                    .confidence_reasoning
+                    .as_deref()
+                    .unwrap_or("无补充说明"),
+                if width < 72 { 18 } else { 36 }
+            )
+        )));
+    }
+    lines
+}
+
+fn planning_activity_lines(state: &RuntimeViewState, compact: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("当前阶段：{}", state.phase)),
+        Line::from(format!(
+            "执行图：{}",
+            state
+                .graph_summary
+                .clone()
+                .unwrap_or_else(|| "尚未生成".to_string())
+        )),
+    ];
+
+    if state.todos.is_empty() {
+        lines.push(Line::from("Todo：等待规划结果…"));
+    } else {
+        let todo_limit = if compact { 3 } else { 6 };
+        for (todo_id, (title, status, message)) in state.todos.iter().take(todo_limit) {
+            lines.push(Line::from(format!(
+                "{} {} / {} / {}",
+                todo_id,
+                truncate(title, if compact { 10 } else { 20 }),
+                status.label(),
+                truncate(message, if compact { 18 } else { 42 })
+            )));
+        }
+    }
+
+    if state.commander_notes.is_empty() {
+        lines.push(Line::from("指挥动态：等待更多规划事件…"));
+    } else {
+        let note_limit = if compact { 2 } else { 4 };
+        for note in state.commander_notes.iter().rev().take(note_limit).rev() {
+            lines.push(Line::from(format!(
+                "指挥：{}",
+                truncate(note, if compact { 28 } else { 72 })
+            )));
+        }
+    }
+
+    lines
+}
+
+fn compact_summary_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'static>> {
+    if let Some(summary) = &state.summary {
+        vec![
+            Line::from(summary.overview.clone()),
+            Line::from(format!(
+                "结果：{} / Apply：{}",
+                summary.result_status.label(),
+                summary.apply_status.label()
+            )),
+            Line::from(format!(
+                "风险：{}",
+                truncate(
+                    &summary.open_risks.join("；"),
+                    if width < 72 { 26 } else { 56 }
+                )
+            )),
+        ]
+    } else if let Some(note) = state.commander_notes.last() {
+        vec![
+            Line::from("等待最终摘要…"),
+            Line::from(format!(
+                "最近决策：{}",
+                truncate(note, if width < 72 { 26 } else { 56 })
+            )),
+        ]
+    } else {
+        vec![Line::from("等待更多运行事件…")]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeViewState, planning_activity_lines};
+    use crate::model::{RuntimeEvent, TodoStatus};
+
+    #[test]
+    fn planning_activity_lines_show_todos_and_notes_without_workers() {
+        let mut state = RuntimeViewState::new("session-1", "规划一个任务");
+        state.apply(&RuntimeEvent::PhaseChanged {
+            phase: "规划清单已生成".to_string(),
+        });
+        state.apply(&RuntimeEvent::CommanderNote {
+            message: "计划清单已生成，共 2 项 todo。".to_string(),
+        });
+        state.apply(&RuntimeEvent::TodoStateChanged {
+            todo_id: "todo-1".to_string(),
+            title: "修复 TUI".to_string(),
+            status: TodoStatus::Pending,
+            message: "规划完成，等待调度".to_string(),
+            commit_hash: None,
+        });
+
+        let lines = planning_activity_lines(&state, true);
+        let rendered = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("规划清单已生成"));
+        assert!(rendered.contains("todo-1"));
+        assert!(rendered.contains("计划清单已生成，共 2 项 todo。"));
+    }
 }
 
 pub fn describe_runtime_event(event: &RuntimeEvent) -> String {

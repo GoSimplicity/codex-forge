@@ -114,55 +114,82 @@ fn normalize_existing_dir(path: &Path) -> Result<PathBuf> {
     fs::canonicalize(&absolute).with_context(|| format!("规范化目录失败：{}", absolute.display()))
 }
 
-fn state_root() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CODEX_FORGE_HOME") {
-        let root = PathBuf::from(path);
-        fs::create_dir_all(&root)
-            .with_context(|| format!("创建 CODEX_FORGE_HOME 失败：{}", root.display()))?;
-        return Ok(root);
-    }
-
-    if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        let root = PathBuf::from(path).join("codex-forge");
-        if fs::create_dir_all(&root).is_ok() {
-            return Ok(root);
-        }
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        let root = PathBuf::from(home).join(".codex-forge");
-        if fs::create_dir_all(&root).is_ok() {
-            return Ok(root);
-        }
-    }
-
-    let fallback = env::temp_dir().join("codex-forge-state");
-    fs::create_dir_all(&fallback)
-        .with_context(|| format!("创建回退状态目录失败：{}", fallback.display()))?;
-    Ok(fallback)
+fn state_root_candidates() -> Vec<PathBuf> {
+    collect_state_roots(
+        env::var_os("CODEX_FORGE_HOME").map(PathBuf::from),
+        env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+        env::temp_dir(),
+    )
 }
 
-fn state_path() -> Result<PathBuf> {
-    Ok(state_root()?.join("workspace-state.json"))
+fn collect_state_roots(
+    codex_forge_home: Option<PathBuf>,
+    xdg_state_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp_dir: PathBuf,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(path) = codex_forge_home {
+        roots.push(path);
+    }
+    if let Some(path) = xdg_state_home {
+        roots.push(path.join("codex-forge"));
+    }
+    if let Some(path) = home {
+        roots.push(path.join(".codex-forge"));
+    }
+
+    roots.push(temp_dir.join("codex-forge-state"));
+    roots.dedup();
+    roots
 }
 
 fn load_workspace_state() -> Result<WorkspaceState> {
-    let path = state_path()?;
-    if !path.exists() {
-        return Ok(WorkspaceState::default());
+    for root in state_root_candidates() {
+        let path = root.join("workspace-state.json");
+        if !path.exists() {
+            continue;
+        }
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        if let Ok(state) = serde_json::from_str(&raw) {
+            return Ok(state);
+        }
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("读取工作目录状态失败：{}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("解析工作目录状态失败：{}", path.display()))
+
+    Ok(WorkspaceState::default())
 }
 
 fn save_workspace_state(state: &WorkspaceState) -> Result<()> {
-    let path = state_path()?;
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(state).context("序列化工作目录状态失败")?,
+    let payload = serde_json::to_vec_pretty(state).context("序列化工作目录状态失败")?;
+    let mut last_error = None;
+
+    for root in state_root_candidates() {
+        if let Err(error) = fs::create_dir_all(&root) {
+            last_error = Some(format!("创建状态目录失败：{} / {}", root.display(), error));
+            continue;
+        }
+        let path = root.join("workspace-state.json");
+        match fs::write(&path, &payload) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last_error = Some(format!(
+                    "写入工作目录状态失败：{} / {}",
+                    path.display(),
+                    error
+                ))
+            }
+        }
+    }
+
+    bail!(
+        "{}",
+        last_error.unwrap_or_else(|| "写入工作目录状态失败：没有可用状态目录".to_string())
     )
-    .with_context(|| format!("写入工作目录状态失败：{}", path.display()))
 }
 
 fn git_is_inside_work_tree(target_dir: &Path) -> Result<bool> {
@@ -255,4 +282,42 @@ fn cleanup_empty_dirs_inner(path: &Path) -> Result<()> {
         let _ = fs::remove_dir(path);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_state_roots;
+    use std::path::PathBuf;
+
+    #[test]
+    fn collects_state_roots_in_priority_order_with_temp_fallback() {
+        let roots = collect_state_roots(
+            Some(PathBuf::from("/cfg")),
+            Some(PathBuf::from("/xdg")),
+            Some(PathBuf::from("/home/demo")),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/cfg"),
+                PathBuf::from("/xdg/codex-forge"),
+                PathBuf::from("/home/demo/.codex-forge"),
+                PathBuf::from("/tmp/codex-forge-state"),
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_overlapping_state_roots() {
+        let roots = collect_state_roots(
+            Some(PathBuf::from("/tmp/codex-forge-state")),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(roots, vec![PathBuf::from("/tmp/codex-forge-state")]);
+    }
 }

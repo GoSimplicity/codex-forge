@@ -11,21 +11,25 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use tokio::sync::{mpsc, watch};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{resolve_plan_config, resolve_run_config};
-use crate::cli::{ApplyModeArg, PlanArgs, RunArgs, SharedTaskArgs, UiModeArg};
+use crate::cli::{ApplyModeArg, PlanArgs, RunArgs, SharedTaskArgs, ThinkingModeArg, UiModeArg};
 use crate::config::{LoadedProjectConfig, load_project_config};
 use crate::doctor::run_doctor;
-use crate::model::{ApplyMode, DoctorReport, RuntimeEvent, SessionManifest, SessionPreset};
+use crate::model::{
+    ApplyMode, DoctorReport, RuntimeEvent, SessionManifest, SessionPreset, ThinkingMode,
+};
 use crate::orchestrator::{EmbeddedRunOutcome, plan_session_embedded, run_session_embedded};
 use crate::replay::replay_session_embedded;
 use crate::resources::{ResourceCatalog, load_resource_catalog};
 use crate::session::load_session;
+use crate::time::format_beijing;
 use crate::ui::{RuntimeViewState, describe_runtime_event, render_runtime_dashboard};
 use crate::workspace::{remember_target_dir, resolve_target_dir};
 
@@ -35,32 +39,22 @@ const MAX_NOTICE_LINES: usize = 8;
 /// v5 终端产品主导航。保留固定 5 个页面，确保演示路径稳定可记忆。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
-    Home,
-    Compose,
+    Start,
     Run,
     History,
-    Result,
 }
 
 impl Route {
     fn label(self) -> &'static str {
         match self {
-            Self::Home => "首页",
-            Self::Compose => "新任务",
-            Self::Run => "执行",
-            Self::History => "历史",
-            Self::Result => "结果",
+            Self::Start => "开始",
+            Self::Run => "执行中",
+            Self::History => "历史结果",
         }
     }
 
-    fn all() -> [Self; 5] {
-        [
-            Self::Home,
-            Self::Compose,
-            Self::Run,
-            Self::History,
-            Self::Result,
-        ]
+    fn all() -> [Self; 3] {
+        [Self::Start, Self::Run, Self::History]
     }
 }
 
@@ -71,6 +65,7 @@ enum FormField {
     TargetDir,
     ConfigPath,
     Task,
+    ThinkingMode,
     RoleSet,
     Workers,
     MaxRetries,
@@ -88,33 +83,17 @@ impl FormField {
             Self::TargetDir => "目标仓库",
             Self::ConfigPath => "配置文件",
             Self::Task => "任务描述",
-            Self::RoleSet => "角色集合",
+            Self::ThinkingMode => "任务强度",
+            Self::RoleSet => "协作模板",
             Self::Workers => "并发 Worker",
             Self::MaxRetries => "最大重试",
             Self::Model => "模型",
-            Self::ApplyMode => "应用模式",
-            Self::Preset => "运行预设",
+            Self::ApplyMode => "结果落地",
+            Self::Preset => "演示预设",
             Self::FailFast => "Fail Fast",
             Self::CleanupSuccess => "清理成功 worktree",
-            Self::ResumeSession => "恢复 Session",
+            Self::ResumeSession => "继续上次会话",
         }
-    }
-
-    fn all() -> [Self; 12] {
-        [
-            Self::TargetDir,
-            Self::ConfigPath,
-            Self::Task,
-            Self::RoleSet,
-            Self::Workers,
-            Self::MaxRetries,
-            Self::Model,
-            Self::ApplyMode,
-            Self::Preset,
-            Self::FailFast,
-            Self::CleanupSuccess,
-            Self::ResumeSession,
-        ]
     }
 }
 
@@ -131,10 +110,10 @@ enum ShellAction {
 impl ShellAction {
     fn label(self) -> &'static str {
         match self {
-            Self::Doctor => "Doctor",
-            Self::Plan => "Plan",
-            Self::Run => "Run",
-            Self::ReplaySelected => "Replay",
+            Self::Doctor => "检查环境",
+            Self::Plan => "先看方案",
+            Self::Run => "开始执行",
+            Self::ReplaySelected => "回放过程",
         }
     }
 
@@ -181,9 +160,9 @@ enum RunSubview {
 impl RunSubview {
     fn label(self) -> &'static str {
         match self {
-            Self::Dashboard => "实时 Dashboard",
-            Self::Timeline => "Timeline",
-            Self::Summary => "Summary",
+            Self::Dashboard => "实时态势",
+            Self::Timeline => "事件流",
+            Self::Summary => "交付摘要",
         }
     }
 
@@ -234,8 +213,6 @@ struct ProjectContext {
     config_source: String,
     verification_commands: Vec<String>,
     role_sets: Vec<String>,
-    rule_source: String,
-    reviewer_rule_source: String,
     sessions: Vec<SessionSummary>,
     last_error: Option<String>,
 }
@@ -245,6 +222,7 @@ struct FormState {
     target_dir: String,
     config_path: String,
     task: String,
+    thinking_mode: ThinkingMode,
     role_set: String,
     workers: String,
     max_retries: String,
@@ -262,6 +240,7 @@ impl Default for FormState {
             target_dir: String::new(),
             config_path: String::new(),
             task: String::new(),
+            thinking_mode: ThinkingMode::Balanced,
             role_set: "default".to_string(),
             workers: "4".to_string(),
             max_retries: "2".to_string(),
@@ -275,10 +254,21 @@ impl Default for FormState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EditState {
+    field: FormField,
+    buffer: String,
+    cursor: usize,
+    preferred_column: Option<usize>,
+}
+
 struct AppShell {
     route: Route,
+    history_return_route: Route,
+    run_return_route: Route,
     selected_field: usize,
-    editing: bool,
+    advanced_settings_open: bool,
+    edit_state: Option<EditState>,
     history_index: usize,
     notices: Vec<String>,
     form: FormState,
@@ -352,13 +342,16 @@ impl AppShell {
             .and_then(|item| load_session(&project.target_dir, Some(&item.id)).ok());
 
         Ok(Self {
-            route: Route::Home,
+            route: Route::Start,
+            history_return_route: Route::Start,
+            run_return_route: Route::Start,
             selected_field: 0,
-            editing: false,
+            advanced_settings_open: false,
+            edit_state: None,
             history_index: 0,
             notices: vec![
-                "v5 已启用：`codex-forge` 裸命令直接进入主界面。".to_string(),
-                "快捷键：1-5 切页，e 编辑，r 运行，p 规划，d 预检，l 回放，s 停止，[ / ] / Tab 切执行子视图。".to_string(),
+                "默认只需要两步：先写任务，再选择“先看方案”或“开始执行”。".to_string(),
+                "按 `a` 展开高级设置；旧的 CLI 参数和运行能力仍然保留兼容。".to_string(),
             ],
             form,
             project,
@@ -375,27 +368,26 @@ impl AppShell {
         let area = frame.area();
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(4),
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(6),
-            ])
+            .constraints(shell_layout_constraints(area))
             .split(area);
 
-        frame.render_widget(self.header_widget(), layout[0]);
-        frame.render_widget(self.tabs_widget(), layout[1]);
+        frame.render_widget(self.header_widget(area.width), layout[0]);
+        frame.render_widget(self.tabs_widget(area.width), layout[1]);
         self.render_body(frame, layout[2]);
-        frame.render_widget(self.footer_widget(), layout[3]);
+        frame.render_widget(self.footer_widget(area.width), layout[3]);
 
-        if self.editing {
-            let popup = centered_rect(70, 22, area);
+        if self.edit_state.is_some() {
+            let popup = centered_rect(
+                popup_percent(area.width, 70, 96),
+                popup_percent(area.height, 22, 90),
+                area,
+            );
             frame.render_widget(Clear, popup);
-            frame.render_widget(self.edit_popup(), popup);
+            self.render_edit_popup(frame, popup);
         }
     }
 
-    fn header_widget(&self) -> Paragraph<'static> {
+    fn header_widget(&self, width: u16) -> Paragraph<'static> {
         let status = self
             .active_command
             .as_ref()
@@ -408,37 +400,87 @@ impl AppShell {
                 )
             })
             .unwrap_or_else(|| "动作：空闲".to_string());
+        let doctor_status = self
+            .last_doctor_report
+            .as_ref()
+            .map(|report| format!("环境：{} / {}", report.readiness.label(), report.summary))
+            .unwrap_or_else(|| "环境：未检查".to_string());
+        let advanced_status = if self.advanced_settings_open {
+            "高级设置：已展开"
+        } else {
+            "高级设置：已收起"
+        };
 
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "◢ CODEX-FORGE V5 ◣",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("Terminal Product Shell", Style::default().fg(Color::Yellow)),
-            ]),
-            Line::from(format!(
-                "目标仓库：{}",
-                truncate(&self.project.display_target, 100)
-            )),
-            Line::from(format!(
-                "会话数：{}   角色集合：{}   {}",
-                self.project.sessions.len(),
-                self.form.role_set,
-                status
-            )),
-        ])
-        .block(Block::default().title("总览").borders(Borders::ALL))
-        .wrap(Wrap { trim: true })
+        let lines = if width < 72 {
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        "◢ CF V5 ◣",
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        thinking_mode_user_title(self.form.thinking_mode),
+                        Style::default()
+                            .fg(thinking_mode_color(self.form.thinking_mode))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(format!(
+                    "{} | {} | {}",
+                    truncate(&self.project.display_target, 20),
+                    truncate(advanced_status, 12),
+                    truncate(&status, 16)
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        "◢ CODEX-FORGE V5 ◣",
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("低负担协作入口", Style::default().fg(Color::Yellow)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!(
+                            "{} / {}",
+                            thinking_mode_user_title(self.form.thinking_mode),
+                            thinking_mode_user_hint(self.form.thinking_mode)
+                        ),
+                        Style::default()
+                            .fg(thinking_mode_color(self.form.thinking_mode))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(format!(
+                    "目标仓库：{}  |  {}",
+                    truncate(&self.project.display_target, 56),
+                    doctor_status,
+                )),
+                Line::from(format!(
+                    "会话数：{}   {}   {}",
+                    self.project.sessions.len(),
+                    advanced_status,
+                    status
+                )),
+            ]
+        };
+
+        Paragraph::new(lines)
+            .block(Block::default().title("总览").borders(Borders::ALL))
+            .wrap(Wrap { trim: true })
     }
 
-    fn tabs_widget(&self) -> Tabs<'static> {
-        let titles = Route::all()
-            .iter()
-            .map(|route| Line::from(route.label()))
+    fn tabs_widget(&self, width: u16) -> Tabs<'static> {
+        let titles = route_titles(width)
+            .into_iter()
+            .map(Line::from)
             .collect::<Vec<_>>();
         Tabs::new(titles)
             .select(
@@ -455,13 +497,28 @@ impl AppShell {
             .block(Block::default().borders(Borders::ALL).title("导航"))
     }
 
-    fn footer_widget(&self) -> Paragraph<'_> {
-        let lines = self
-            .notices
-            .iter()
-            .rev()
-            .map(|item| Line::from(item.clone()))
-            .collect::<Vec<_>>();
+    fn footer_widget(&self, width: u16) -> Paragraph<'_> {
+        let mut lines = contextual_help_lines(
+            self.route,
+            self.edit_state.as_ref(),
+            self.run_subview,
+            width,
+        );
+        lines.push(Line::from(""));
+        let notice_limit = if width < 72 {
+            1
+        } else if width < 100 {
+            2
+        } else {
+            4
+        };
+        lines.extend(
+            self.notices
+                .iter()
+                .rev()
+                .take(notice_limit)
+                .map(|item| Line::from(item.clone())),
+        );
         Paragraph::new(lines)
             .block(Block::default().title("操作 / 提示").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
@@ -473,50 +530,46 @@ impl AppShell {
             return;
         }
 
-        let sections = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-            .split(area);
+        let sections = split_main_sections(area);
 
         match self.route {
-            Route::Home => {
-                frame.render_widget(self.home_left_widget(), sections[0]);
-                frame.render_widget(self.home_right_widget(), sections[1]);
-            }
-            Route::Compose => {
-                frame.render_widget(self.compose_left_widget(), sections[0]);
-                frame.render_widget(self.compose_right_widget(), sections[1]);
-            }
+            Route::Start => self.render_start_route(frame, sections),
             Route::Run => unreachable!("run route 由 render_run_route 单独渲染"),
             Route::History => {
                 frame.render_widget(self.history_left_widget(), sections[0]);
                 frame.render_widget(self.history_right_widget(), sections[1]);
             }
-            Route::Result => {
-                frame.render_widget(self.result_left_widget(), sections[0]);
-                frame.render_widget(self.result_right_widget(), sections[1]);
-            }
+        }
+    }
+
+    fn render_start_route(&self, frame: &mut ratatui::Frame<'_>, sections: Vec<Rect>) {
+        frame.render_widget(self.start_main_widget(), sections[0]);
+        if self.advanced_settings_open {
+            let right_sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(sections[1]);
+            frame.render_widget(self.advanced_settings_widget(), right_sections[0]);
+            frame.render_widget(self.advanced_details_widget(), right_sections[1]);
+        } else {
+            frame.render_widget(self.start_side_widget(), sections[1]);
         }
     }
 
     fn render_run_route(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(16),
-                Constraint::Length(9),
-            ])
+            .constraints(run_route_constraints(area))
             .split(area);
 
-        frame.render_widget(self.run_subview_tabs(), sections[0]);
+        frame.render_widget(self.run_subview_tabs(area.width), sections[0]);
 
         // 执行页始终保持“一个顶部子视图栏 + 一个主面板 + 一个底部状态日志”结构，
         // 这样用户切换视图时不会丢失全局控制信息。
         match self.run_subview {
             RunSubview::Dashboard => {
                 if let Some(runtime_state) = &self.runtime_state {
-                    render_runtime_dashboard(frame, sections[1], runtime_state, "实时 Dashboard");
+                    render_runtime_dashboard(frame, sections[1], runtime_state, "实时态势");
                 } else {
                     frame.render_widget(self.run_placeholder_widget(), sections[1]);
                 }
@@ -532,10 +585,10 @@ impl AppShell {
         frame.render_widget(self.run_log_widget(), sections[2]);
     }
 
-    fn run_subview_tabs(&self) -> Tabs<'static> {
-        let titles = RunSubview::all()
-            .iter()
-            .map(|item| Line::from(item.label()))
+    fn run_subview_tabs(&self, width: u16) -> Tabs<'static> {
+        let titles = run_subview_titles(width)
+            .into_iter()
+            .map(Line::from)
             .collect::<Vec<_>>();
         Tabs::new(titles)
             .select(
@@ -552,26 +605,52 @@ impl AppShell {
             .block(Block::default().borders(Borders::ALL).title("执行子视图"))
     }
 
-    fn home_left_widget(&self) -> Paragraph<'_> {
+    fn start_main_widget(&self) -> Paragraph<'_> {
+        let primary_preview = self.command_preview_lines(ShellAction::Run);
+        let plan_preview = self.command_preview_lines(ShellAction::Plan);
         let mut lines = vec![
             Line::from(Span::styled(
-                "演示闭环",
+                "新任务",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("1. 在“新任务”页改仓库、任务和运行参数"),
-            Line::from("2. 按 `d` 做 doctor 预检"),
-            Line::from("3. 按 `p` 生成计划，按 `r` 直接运行"),
-            Line::from("4. 在“执行”页看日志，在“结果”页看 summary"),
-            Line::from("5. 在“历史”页随时回放之前的 session"),
-            Line::from(""),
-            Line::from(format!("配置来源：{}", self.project.config_source)),
-            Line::from(format!("全局规则：{}", self.project.rule_source)),
             Line::from(format!(
-                "Reviewer 规则：{}",
-                self.project.reviewer_rule_source
+                "任务：{}",
+                if self.form.task.trim().is_empty() {
+                    "还没有输入任务，按 `e` 开始写".to_string()
+                } else {
+                    truncate(&self.form.task, 160)
+                }
             )),
+            Line::from(format!(
+                "任务强度：{} / {}",
+                thinking_mode_user_title(self.form.thinking_mode),
+                thinking_mode_user_hint(self.form.thinking_mode)
+            )),
+            Line::from(format!(
+                "强度说明：{}",
+                self.form.thinking_mode.description()
+            )),
+            Line::from(format!(
+                "默认系统会自动处理：{}",
+                advanced_settings_summary(&self.form)
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "主路径",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("1) 按 `e` 写下你要完成的任务"),
+            Line::from("   编辑中：`Esc` 保存退出，`Ctrl+P` 直接先看方案，`Ctrl+R` 直接开始"),
+            Line::from(format!("2) 按 `p` 先看方案：{}", plan_preview.summary)),
+            Line::from(format!("3) 按 `r` 直接开始：{}", primary_preview.summary)),
+            Line::from("4) 需要更细控制时，再按 `a` 展开高级设置"),
+            Line::from(""),
+            Line::from(format!("目标仓库：{}", self.project.display_target)),
+            Line::from(format!("配置来源：{}", self.project.config_source)),
         ];
         if let Some(error) = &self.project.last_error {
             lines.push(Line::from(""));
@@ -583,55 +662,68 @@ impl AppShell {
         if let Some(report) = &self.last_doctor_report {
             lines.push(Line::from(""));
             lines.push(Line::from(format!(
-                "最近 Doctor：{} / {}",
+                "最近环境检查：{} / {}",
                 report.readiness.label(),
                 report.summary
             )));
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("产品入口").borders(Borders::ALL))
+            .block(Block::default().title("任务主路径").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
     }
 
-    fn home_right_widget(&self) -> Table<'_> {
-        let rows = self
-            .project
-            .sessions
-            .iter()
-            .take(8)
-            .map(|item| {
-                Row::new(vec![
-                    item.id.clone(),
-                    item.status.clone(),
-                    truncate(&item.task, 30),
-                    truncate(&item.result, 14),
-                ])
-            })
-            .collect::<Vec<_>>();
-
-        Table::new(
-            rows,
-            [
-                Constraint::Length(18),
-                Constraint::Length(10),
-                Constraint::Length(32),
-                Constraint::Min(12),
-            ],
-        )
-        .header(
-            Row::new(vec!["Session", "状态", "任务", "结果"]).style(
+    fn start_side_widget(&self) -> Paragraph<'_> {
+        let preview = self.command_preview_lines(ShellAction::Run);
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "默认模式",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .block(Block::default().title("最近 Session").borders(Borders::ALL))
-        .column_spacing(1)
+            )),
+            Line::from("默认只暴露最少决策：任务、任务强度、先方案/直接执行。"),
+            Line::from("其它并发、模板、落地策略默认自动处理。"),
+            Line::from("按 `a` 才展开高级设置；不展开也能直接运行。"),
+            Line::from("任务编辑时也能直接操作：`Esc` 保存，`Ctrl+P` 规划，`Ctrl+R` 执行。"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "即将执行",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(truncate(&preview.summary, 120)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "最近 Session",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ];
+
+        if self.project.sessions.is_empty() {
+            lines.push(Line::from("还没有会话记录。"));
+        } else {
+            for item in self.project.sessions.iter().take(6) {
+                lines.push(Line::from(format!(
+                    "{}  {}  {}  / {}",
+                    item.created_at,
+                    truncate(&item.status, 8),
+                    truncate(&item.task, 32),
+                    truncate(&item.result, 14)
+                )));
+            }
+        }
+
+        Paragraph::new(lines)
+            .block(Block::default().title("默认摘要").borders(Borders::ALL))
+            .wrap(Wrap { trim: true })
     }
 
-    fn compose_left_widget(&self) -> List<'_> {
-        let items = FormField::all()
+    fn advanced_settings_widget(&self) -> List<'_> {
+        let items = advanced_fields()
             .iter()
             .enumerate()
             .map(|(index, field)| {
@@ -650,23 +742,19 @@ impl AppShell {
             })
             .collect::<Vec<_>>();
 
-        List::new(items).block(Block::default().title("配置表单").borders(Borders::ALL))
+        List::new(items).block(
+            Block::default()
+                .title("高级设置（按 `a` 收起）")
+                .borders(Borders::ALL),
+        )
     }
 
-    fn compose_right_widget(&self) -> Paragraph<'_> {
+    fn advanced_details_widget(&self) -> Paragraph<'_> {
         let preview = self.command_preview_lines(ShellAction::Run);
         let lines = vec![
-            Line::from(format!("命中配置：{}", self.project.config_source)),
+            Line::from(format!("验证命令：{}", verification_summary(&self.project))),
             Line::from(format!(
-                "验证命令：{}",
-                if self.project.verification_commands.is_empty() {
-                    "无".to_string()
-                } else {
-                    truncate(&self.project.verification_commands.join("  |  "), 100)
-                }
-            )),
-            Line::from(format!(
-                "可选 role_set：{}",
+                "可选协作模板：{}",
                 if self.project.role_sets.is_empty() {
                     "无".to_string()
                 } else {
@@ -674,28 +762,32 @@ impl AppShell {
                 }
             )),
             Line::from(""),
+            Line::from("字段操作：↑↓ 选择，←→ 切换，e/Enter 编辑。"),
+            Line::from("任务通常不用来这里调；这里只放速度、风险和兼容项。"),
+            Line::from(""),
             Line::from(Span::styled(
-                "即将执行",
+                "完整命令预览",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(preview.commandline),
-            Line::from(""),
-            Line::from("字段操作：↑↓ 选择，←→ 切换选项，e/Enter 编辑，Esc 结束编辑"),
-            Line::from("动作快捷键：d doctor，p plan，r run，g 刷新项目上下文"),
+            Line::from(truncate(&preview.commandline, 120)),
         ];
-
         Paragraph::new(lines)
-            .block(Block::default().title("配置预览").borders(Borders::ALL))
+            .block(Block::default().title("高级说明").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
     }
 
     fn run_placeholder_widget(&self) -> Paragraph<'_> {
         let mut lines = vec![
-            Line::from("当前没有运行中的内嵌会话。"),
-            Line::from("按 `d` 运行 doctor，按 `p` 先看计划，按 `r` 直接执行。"),
-            Line::from("一旦启动，可在 Dashboard / Timeline / Summary 三个子视图间切换。"),
+            Line::from("当前没有正在进行的协作执行。"),
+            Line::from(format!(
+                "任务强度：{} / {}",
+                thinking_mode_user_title(self.form.thinking_mode),
+                thinking_mode_user_hint(self.form.thinking_mode)
+            )),
+            Line::from("按 `d` 检查环境，按 `p` 先看方案，按 `r` 直接开始。"),
+            Line::from("开始后，可在“实时态势 / 事件流 / 交付摘要”之间切换。"),
         ];
         if let Some(session) = &self.selected_session {
             lines.push(Line::from(""));
@@ -707,11 +799,29 @@ impl AppShell {
     }
 
     fn run_log_widget(&self) -> Paragraph<'_> {
+        Paragraph::new(self.run_log_lines())
+            .block(
+                Block::default()
+                    .title("执行状态 / 事件")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false })
+    }
+
+    fn run_log_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if let Some(command) = &self.active_command {
+            let hotkey_hint = if command.state.is_running() && command.action.supports_stop() {
+                "热键：Tab / [ / ] 切换，s 停止"
+            } else if command.state.is_running() {
+                "热键：Tab / [ / ] 切换，当前动作暂不支持中途停止"
+            } else {
+                "热键：Tab / [ / ] 切换，Esc 返回上一级"
+            };
             lines.push(Line::from(format!(
-                "子视图：{}   热键：Tab / [ / ] 切换，s 停止",
-                self.run_subview.label()
+                "子视图：{}   {}",
+                self.run_subview.label(),
+                hotkey_hint
             )));
             lines.push(Line::from(format!("动作：{}", command.action.label())));
             lines.push(Line::from(format!("状态：{}", command.state.label())));
@@ -725,22 +835,17 @@ impl AppShell {
             }
         } else {
             lines.push(Line::from(format!(
-                "子视图：{}   热键：Tab / [ / ] 切换",
+                "子视图：{}   热键：Tab / [ / ] 切换，Esc 返回上一级",
                 self.run_subview.label()
             )));
             lines.push(Line::from("当前没有运行中的动作。"));
             lines.push(Line::from("可在任意页面直接按 `d` / `p` / `r` 启动。"));
+            lines.push(Line::from("历史页可按 `l` 回放已完成会话。"));
             lines.push(Line::from(
-                "运行中可按 `s` 发送停止信号（Run / Replay 支持）。",
+                "运行中可按 `s` 发送停止信号（开始执行 / 回放过程支持）。",
             ));
         }
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title("执行状态 / 日志")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false })
+        lines
     }
 
     fn run_timeline_widget(&self) -> Paragraph<'_> {
@@ -757,29 +862,27 @@ impl AppShell {
                 lines.push(Line::from(line.clone()));
             }
         } else if let Some(session) = &self.selected_session {
-            lines.push(Line::from(format!("Session：{}", session.id)));
+            lines.push(Line::from(format!("历史会话：{}", session.id)));
             lines.push(Line::from(""));
             if session.timeline_events.is_empty() {
-                lines.push(Line::from("该 session 还没有 timeline 事件。"));
+                lines.push(Line::from("该会话还没有事件流记录。"));
             } else {
                 for item in session.timeline_events.iter().rev().take(36).rev() {
                     lines.push(Line::from(format!(
                         "{}  {} / {}",
-                        item.ts.format("%H:%M:%S"),
+                        format_beijing(item.ts, "%H:%M:%S"),
                         item.title,
                         truncate(&item.detail, 88)
                     )));
                 }
             }
         } else {
-            lines.push(Line::from("暂无可展示的 timeline。"));
-            lines.push(Line::from(
-                "先执行一次 Run / Plan / Replay，即可在这里回看事件流。",
-            ));
+            lines.push(Line::from("暂无可展示的事件流。"));
+            lines.push(Line::from("先执行或回放一次任务，即可在这里回看关键过程。"));
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("Timeline").borders(Borders::ALL))
+            .block(Block::default().title("事件流").borders(Borders::ALL))
             .wrap(Wrap { trim: false })
     }
 
@@ -836,7 +939,7 @@ impl AppShell {
                 }
             )));
         } else if let Some(runtime_state) = &self.runtime_state {
-            lines.push(Line::from("Summary 尚未生成。"));
+            lines.push(Line::from("交付摘要尚未生成。"));
             lines.push(Line::from(format!("当前阶段：{}", runtime_state.phase)));
             lines.push(Line::from(format!(
                 "Apply：{}",
@@ -853,21 +956,19 @@ impl AppShell {
                     .unwrap_or_else(|| "等待".to_string())
             )));
             lines.push(Line::from(
-                "可先切到 Dashboard 查看 worker / todo / review 实时态势。",
+                "可先切到“实时态势”查看 worker / todo / review 的当前进展。",
             ));
         } else if let Some(session) = &self.selected_session {
-            lines.push(Line::from(format!("Session：{}", session.id)));
+            lines.push(Line::from(format!("历史会话：{}", session.id)));
             lines.push(Line::from(format!("状态：{}", session.status.label())));
-            lines.push(Line::from("该 session 还没有 final summary。"));
+            lines.push(Line::from("该会话还没有最终交付摘要。"));
         } else {
-            lines.push(Line::from("暂无 summary。"));
-            lines.push(Line::from(
-                "先运行或回放一个 session，再来这里看最终收敛结果。",
-            ));
+            lines.push(Line::from("暂无交付摘要。"));
+            lines.push(Line::from("先运行或回放一个会话，再来这里查看最终结果。"));
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("Summary").borders(Borders::ALL))
+            .block(Block::default().title("交付摘要").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
     }
 
@@ -896,101 +997,82 @@ impl AppShell {
                 ]))
             })
             .collect::<Vec<_>>();
-        List::new(items).block(Block::default().title("历史 Session").borders(Borders::ALL))
+        List::new(items).block(Block::default().title("历史会话").borders(Borders::ALL))
     }
 
     fn history_right_widget(&self) -> Paragraph<'_> {
         let lines = if let Some(session) = &self.selected_session {
             session_snapshot_lines(session)
         } else {
-            vec![Line::from("按 Enter 打开选中的 session 详情。")]
+            vec![Line::from("按 Enter 打开选中的会话详情。")]
         };
         Paragraph::new(lines)
-            .block(Block::default().title("Session 详情").borders(Borders::ALL))
+            .block(Block::default().title("历史结果详情").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
     }
 
-    fn result_left_widget(&self) -> Paragraph<'_> {
-        let lines = if let Some(session) = &self.selected_session {
-            session_snapshot_lines(session)
-        } else {
-            vec![Line::from("尚未载入结果。")]
+    fn render_edit_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let Some(edit) = &self.edit_state else {
+            return;
         };
-        Paragraph::new(lines)
-            .block(Block::default().title("结果摘要").borders(Borders::ALL))
-            .wrap(Wrap { trim: true })
-    }
+        let header_height = if edit.field == FormField::Task { 4 } else { 3 };
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(header_height), Constraint::Min(6)])
+            .split(area);
 
-    fn result_right_widget(&self) -> Paragraph<'_> {
-        let mut lines = Vec::new();
-        if let Some(session) = &self.selected_session {
-            if let Some(summary) = &session.final_summary {
-                lines.push(Line::from(format!("总览：{}", summary.overview)));
-                lines.push(Line::from(format!(
-                    "结果：{}",
-                    summary.result_status.label()
-                )));
-                lines.push(Line::from(format!(
-                    "Apply：{}",
-                    summary.apply_status.label()
-                )));
-                lines.push(Line::from(format!(
-                    "可信度：{}",
-                    summary.trust_level.label()
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(format!(
-                    "接收文件：{}",
-                    if summary.accepted_files.is_empty() {
-                        "无".to_string()
-                    } else {
-                        truncate(&summary.accepted_files.join("；"), 100)
-                    }
-                )));
-                lines.push(Line::from(format!(
-                    "待人工复核：{}",
-                    if summary.manual_review_files.is_empty() {
-                        "无".to_string()
-                    } else {
-                        truncate(&summary.manual_review_files.join("；"), 100)
-                    }
-                )));
-                lines.push(Line::from(format!(
-                    "开放风险：{}",
-                    if summary.open_risks.is_empty() {
-                        "无".to_string()
-                    } else {
-                        truncate(&summary.open_risks.join("；"), 100)
-                    }
-                )));
-            } else {
-                lines.push(Line::from("该 session 还没有 final summary。"));
-            }
+        let help = if edit.field == FormField::Task {
+            "任务描述支持多行输入；Enter 换行，Esc 保存退出，Ctrl+P 先看方案，Ctrl+R 直接执行。"
         } else {
-            lines.push(Line::from("请先从历史页选择一个 session。"));
-        }
-
-        Paragraph::new(lines)
-            .block(Block::default().title("交付维度").borders(Borders::ALL))
-            .wrap(Wrap { trim: true })
-    }
-
-    fn edit_popup(&self) -> Paragraph<'_> {
-        let field = FormField::all()[self.selected_field];
-        Paragraph::new(vec![
+            "方向键移动，Backspace/Delete 删除，Enter 保存，Esc 取消。"
+        };
+        let header_lines = vec![
             Line::from(Span::styled(
-                format!("编辑字段：{}", field.label()),
+                format!("编辑字段：{}", edit.field.label()),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(""),
-            Line::from(self.field_value(field)),
-            Line::from(""),
-            Line::from("Enter / Esc 结束编辑，Backspace 删除，直接输入字符。"),
-        ])
-        .block(Block::default().title("编辑模式").borders(Borders::ALL))
-        .wrap(Wrap { trim: true })
+            Line::from(format!(
+                "字符数：{}   光标：{}",
+                edit.buffer.chars().count(),
+                edit.cursor
+            )),
+            Line::from(help),
+        ];
+        frame.render_widget(
+            Paragraph::new(header_lines)
+                .block(Block::default().title("编辑模式").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            sections[0],
+        );
+
+        let input_text = if edit.buffer.is_empty() {
+            " ".to_string()
+        } else {
+            edit.buffer.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(input_text)
+                .block(Block::default().title("内容").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            sections[1],
+        );
+
+        let inner_width = sections[1].width.saturating_sub(2) as usize;
+        let (cursor_row, cursor_col) =
+            wrapped_cursor_row_col(&edit.buffer, edit.cursor, inner_width);
+        let x = sections[1]
+            .x
+            .saturating_add(1)
+            .saturating_add(cursor_col as u16)
+            .min(sections[1].right().saturating_sub(2));
+        let y = sections[1]
+            .y
+            .saturating_add(1)
+            .saturating_add(cursor_row as u16)
+            .min(sections[1].bottom().saturating_sub(2));
+        frame.set_cursor_position(Position::new(x, y));
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -998,72 +1080,176 @@ impl AppShell {
             return Ok(());
         }
 
-        if self.editing {
-            return self.handle_edit_key(key);
+        if self.edit_state.is_some() {
+            return self.handle_edit_key(key).await;
         }
 
         match key.code {
-            KeyCode::Char('q') => {
+            KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
-            KeyCode::Char('1') => self.route = Route::Home,
-            KeyCode::Char('2') => self.route = Route::Compose,
-            KeyCode::Char('3') => self.route = Route::Run,
-            KeyCode::Char('4') => self.route = Route::History,
-            KeyCode::Char('5') => self.route = Route::Result,
-            KeyCode::Char('g') => self.refresh_project(true)?,
-            KeyCode::Char('d') => self.start_action(ShellAction::Doctor).await?,
-            KeyCode::Char('p') => self.start_action(ShellAction::Plan).await?,
-            KeyCode::Char('r') => self.start_action(ShellAction::Run).await?,
-            KeyCode::Char('l') => self.start_action(ShellAction::ReplaySelected).await?,
-            KeyCode::Char('s') => self.stop_active_command(),
-            KeyCode::Char('[') => self.cycle_run_subview(false),
-            KeyCode::Char(']') | KeyCode::Tab => self.cycle_run_subview(true),
+            KeyCode::Char('1') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.navigate_via_tab(Route::Start)
+            }
+            KeyCode::Char('2') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.navigate_to(Route::Run)
+            }
+            KeyCode::Char('3') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.navigate_via_tab(Route::History)
+            }
+            KeyCode::Esc => self.handle_global_back(),
+            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggle_advanced_settings()
+            }
+            KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.refresh_project(true)?
+            }
+            KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.form.thinking_mode = cycle_thinking_mode(self.form.thinking_mode, true)
+            }
+            KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_action(ShellAction::Doctor).await?
+            }
+            KeyCode::Char('p') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_action(ShellAction::Plan).await?
+            }
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_action(ShellAction::Run).await?
+            }
+            KeyCode::Char('l') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_action(ShellAction::ReplaySelected).await?
+            }
+            KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.stop_active_command()
+            }
+            KeyCode::Char('[') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_run_subview(false)
+            }
+            KeyCode::Char(']') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_run_subview(true)
+            }
+            KeyCode::Tab => self.cycle_run_subview(true),
             KeyCode::BackTab => self.cycle_run_subview(false),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Left => self.cycle_current_field(false),
             KeyCode::Right => self.cycle_current_field(true),
-            KeyCode::Enter | KeyCode::Char('e') => match self.route {
-                Route::Compose => {
-                    if field_is_editable(FormField::all()[self.selected_field]) {
-                        self.editing = true;
+            KeyCode::Enter => match self.route {
+                Route::Start => {
+                    if self.advanced_settings_open {
+                        let field = advanced_fields()[self.selected_field];
+                        if field_is_editable(field) {
+                            self.start_editing(field);
+                        } else {
+                            self.cycle_current_field(true);
+                        }
                     } else {
-                        self.cycle_current_field(true);
+                        self.start_editing(FormField::Task);
                     }
                 }
                 Route::History => self.open_history_selection()?,
                 _ => {}
             },
+            KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match self.route {
+                    Route::Start => {
+                        if self.advanced_settings_open {
+                            let field = advanced_fields()[self.selected_field];
+                            if field_is_editable(field) {
+                                self.start_editing(field);
+                            } else {
+                                self.cycle_current_field(true);
+                            }
+                        } else {
+                            self.start_editing(FormField::Task);
+                        }
+                    }
+                    Route::History => self.open_history_selection()?,
+                    _ => {}
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
-    fn handle_edit_key(&mut self, key: KeyEvent) -> Result<()> {
-        let field = FormField::all()[self.selected_field];
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
-                self.editing = false;
-                if matches!(field, FormField::TargetDir | FormField::ConfigPath) {
-                    self.refresh_project(true)?;
+    async fn handle_edit_key(&mut self, key: KeyEvent) -> Result<()> {
+        let mut commit = false;
+        let mut notice = None;
+        let mut action_after_commit = None;
+
+        {
+            let Some(edit) = &mut self.edit_state else {
+                return Ok(());
+            };
+            let multiline = edit.field == FormField::Task;
+            match key.code {
+                KeyCode::Esc if multiline => {
+                    commit = true;
+                    notice = Some("任务已保存，可按 `p` 先看方案，或按 `r` 直接开始。");
                 }
+                KeyCode::Esc => {
+                    self.edit_state = None;
+                    return Ok(());
+                }
+                KeyCode::Enter if multiline && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    insert_char_at_cursor(edit, '\n');
+                }
+                KeyCode::Enter => {
+                    commit = true;
+                }
+                KeyCode::Backspace => backspace_at_cursor(edit),
+                KeyCode::Delete => delete_at_cursor(edit),
+                KeyCode::Left => move_cursor_horizontal(edit, false),
+                KeyCode::Right => move_cursor_horizontal(edit, true),
+                KeyCode::Up => move_cursor_vertical(edit, false),
+                KeyCode::Down => move_cursor_vertical(edit, true),
+                KeyCode::Home => move_cursor_line_edge(edit, false),
+                KeyCode::End => move_cursor_line_edge(edit, true),
+                KeyCode::Tab if multiline => {
+                    insert_char_at_cursor(edit, ' ');
+                    insert_char_at_cursor(edit, ' ');
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    commit = true;
+                    notice = Some("内容已保存。");
+                }
+                KeyCode::Char('p')
+                    if multiline && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    commit = true;
+                    action_after_commit = Some(ShellAction::Plan);
+                }
+                KeyCode::Char('r')
+                    if multiline && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    commit = true;
+                    action_after_commit = Some(ShellAction::Run);
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    insert_char_at_cursor(edit, ch);
+                }
+                _ => {}
             }
-            KeyCode::Backspace => {
-                self.field_buffer_mut(field).pop();
-            }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.field_buffer_mut(field).push(ch);
-            }
-            _ => {}
         }
+
+        if commit {
+            self.commit_edit()?;
+            if let Some(message) = notice {
+                self.push_notice(message);
+            }
+            if let Some(action) = action_after_commit {
+                self.start_action(action).await?;
+            }
+        }
+
         Ok(())
     }
 
     fn move_selection(&mut self, delta: isize) {
         match self.route {
-            Route::Compose => {
-                let len = FormField::all().len() as isize;
+            Route::Start if self.advanced_settings_open => {
+                let len = advanced_fields().len() as isize;
                 self.selected_field =
                     ((self.selected_field as isize + delta).rem_euclid(len)) as usize;
             }
@@ -1071,17 +1257,24 @@ impl AppShell {
                 let len = self.project.sessions.len().max(1) as isize;
                 self.history_index =
                     ((self.history_index as isize + delta).rem_euclid(len)) as usize;
+                if let Some(item) = self.project.sessions.get(self.history_index) {
+                    self.selected_session =
+                        load_session(&self.project.target_dir, Some(&item.id)).ok();
+                }
             }
             _ => {}
         }
     }
 
     fn cycle_current_field(&mut self, forward: bool) {
-        if self.route != Route::Compose {
+        if self.route != Route::Start || !self.advanced_settings_open {
             return;
         }
 
-        match FormField::all()[self.selected_field] {
+        match advanced_fields()[self.selected_field] {
+            FormField::ThinkingMode => {
+                self.form.thinking_mode = cycle_thinking_mode(self.form.thinking_mode, forward);
+            }
             FormField::RoleSet => {
                 if !self.project.role_sets.is_empty() {
                     let current = self
@@ -1120,6 +1313,31 @@ impl AppShell {
         }
     }
 
+    fn toggle_advanced_settings(&mut self) {
+        if self.is_command_running() {
+            self.push_notice("当前动作仍在执行；请先等待结束，或按 `s` 停止后再调整高级设置。");
+            self.navigate_to(Route::Run);
+            return;
+        }
+
+        if self.route != Route::Start {
+            self.advanced_settings_open = true;
+            self.selected_field = 0;
+            self.navigate_to(Route::Start);
+            self.push_notice("已返回开始页，并展开高级设置。");
+            return;
+        }
+
+        let opening = !self.advanced_settings_open;
+        self.advanced_settings_open = opening;
+        self.selected_field = 0;
+        self.push_notice(if opening {
+            "已展开高级设置：现在可以调整模板、并发和结果落地策略。"
+        } else {
+            "已收起高级设置：返回默认低负担模式。"
+        });
+    }
+
     async fn start_action(&mut self, action: ShellAction) -> Result<()> {
         if self
             .active_command
@@ -1127,7 +1345,7 @@ impl AppShell {
             .is_some_and(|command| command.state.is_running())
         {
             self.push_notice("已有动作在执行，请等待当前命令结束。");
-            self.route = Route::Run;
+            self.navigate_to(Route::Run);
             return Ok(());
         }
 
@@ -1168,7 +1386,7 @@ impl AppShell {
             cancel_tx,
             rx,
         });
-        self.route = Route::Run;
+        self.navigate_to(Route::Run);
         Ok(())
     }
 
@@ -1222,14 +1440,13 @@ impl AppShell {
                 self.history_index = 0;
                 self.open_history_selection()?;
                 if matches!(state, CommandState::Succeeded)
-                    && matches!(
-                        action,
-                        ShellAction::Run | ShellAction::Plan | ShellAction::ReplaySelected
-                    )
+                    && matches!(action, ShellAction::Run | ShellAction::Plan)
                 {
-                    self.route = Route::Result;
+                    self.navigate_to(Route::History);
+                } else if matches!(action, ShellAction::ReplaySelected) {
+                    self.navigate_to(Route::Run);
                 } else {
-                    self.route = Route::Run;
+                    self.navigate_to(Route::Run);
                 }
             }
         }
@@ -1246,8 +1463,8 @@ impl AppShell {
             return;
         }
         let Some(cancel_tx) = &command.cancel_tx else {
-            self.push_notice("当前动作暂不支持安全停止；目前支持 Run / Replay。");
-            self.route = Route::Run;
+            self.push_notice("当前动作暂不支持安全停止；目前支持“开始执行”和“回放过程”。");
+            self.navigate_to(Route::Run);
             return;
         };
         // UI 层只负责发送停止信号，不直接粗暴 abort 后台任务；
@@ -1259,10 +1476,72 @@ impl AppShell {
                     "已发送停止信号，等待在跑 worker / replay 安全退出…".to_string(),
                 );
                 self.push_notice("已发送停止信号。");
-                self.route = Route::Run;
+                self.navigate_to(Route::Run);
             }
             Err(_) => self.push_notice("停止信号发送失败，当前动作可能已经结束。"),
         }
+    }
+
+    fn navigate_to(&mut self, route: Route) {
+        self.history_return_route =
+            next_history_return_route(self.route, self.history_return_route, route);
+        self.run_return_route = next_run_return_route(self.route, self.run_return_route, route);
+        self.route = route;
+    }
+
+    fn navigate_via_tab(&mut self, route: Route) {
+        if self.is_command_running() && route != Route::Run {
+            self.push_notice("当前动作仍在执行；请留在执行页查看进度，或按 `s` 停止。");
+            self.navigate_to(Route::Run);
+            return;
+        }
+        self.navigate_to(route);
+    }
+
+    fn leave_history(&mut self) {
+        let target = history_back_route(self.history_return_route);
+        self.route = target;
+        self.push_notice(match target {
+            Route::Start => "已返回开始页。",
+            Route::Run => "已返回执行页。",
+            Route::History => "已返回历史页。",
+        });
+    }
+
+    fn handle_global_back(&mut self) {
+        match self.route {
+            Route::Start => {
+                if self.advanced_settings_open {
+                    self.advanced_settings_open = false;
+                    self.selected_field = 0;
+                    self.push_notice("已收起高级设置。");
+                }
+            }
+            Route::Run => {
+                if self
+                    .active_command
+                    .as_ref()
+                    .is_some_and(|command| command.state.is_running())
+                {
+                    self.push_notice("当前动作仍在执行；如需中止请按 `s`。");
+                } else {
+                    let target = run_back_route(self.run_return_route);
+                    self.route = target;
+                    self.push_notice(match target {
+                        Route::Start => "已返回开始页。",
+                        Route::Run => "已返回执行页。",
+                        Route::History => "已返回历史页。",
+                    });
+                }
+            }
+            Route::History => self.leave_history(),
+        }
+    }
+
+    fn is_command_running(&self) -> bool {
+        self.active_command
+            .as_ref()
+            .is_some_and(|command| command.state.is_running())
     }
 
     fn cycle_run_subview(&mut self, forward: bool) {
@@ -1299,7 +1578,7 @@ impl AppShell {
     fn open_history_selection(&mut self) -> Result<()> {
         if let Some(item) = self.project.sessions.get(self.history_index) {
             self.selected_session = Some(load_session(&self.project.target_dir, Some(&item.id))?);
-            self.route = Route::Result;
+            self.navigate_to(Route::History);
         }
         Ok(())
     }
@@ -1316,12 +1595,23 @@ impl AppShell {
         match field {
             FormField::TargetDir => self.form.target_dir.clone(),
             FormField::ConfigPath => empty_to_dash(&self.form.config_path),
-            FormField::Task => empty_to_dash(&self.form.task),
+            FormField::Task => {
+                if self.form.task.trim().is_empty() {
+                    "—".to_string()
+                } else {
+                    truncate(&self.form.task.replace('\n', " ⏎ "), 72)
+                }
+            }
+            FormField::ThinkingMode => format!(
+                "{} / {}",
+                thinking_mode_user_title(self.form.thinking_mode),
+                thinking_mode_user_hint(self.form.thinking_mode)
+            ),
             FormField::RoleSet => self.form.role_set.clone(),
             FormField::Workers => self.form.workers.clone(),
             FormField::MaxRetries => self.form.max_retries.clone(),
             FormField::Model => empty_to_dash(&self.form.model),
-            FormField::ApplyMode => self.form.apply_mode.label().to_string(),
+            FormField::ApplyMode => apply_mode_user_label(self.form.apply_mode).to_string(),
             FormField::Preset => self
                 .form
                 .preset
@@ -1333,21 +1623,45 @@ impl AppShell {
         }
     }
 
-    fn field_buffer_mut(&mut self, field: FormField) -> &mut String {
-        match field {
-            FormField::TargetDir => &mut self.form.target_dir,
-            FormField::ConfigPath => &mut self.form.config_path,
-            FormField::Task => &mut self.form.task,
-            FormField::RoleSet => &mut self.form.role_set,
-            FormField::Workers => &mut self.form.workers,
-            FormField::MaxRetries => &mut self.form.max_retries,
-            FormField::Model => &mut self.form.model,
-            FormField::ResumeSession => &mut self.form.resume_session_id,
-            FormField::ApplyMode
-            | FormField::Preset
-            | FormField::FailFast
-            | FormField::CleanupSuccess => unreachable!("非文本字段不应进入编辑"),
+    fn start_editing(&mut self, field: FormField) {
+        let current = match field {
+            FormField::TargetDir => self.form.target_dir.clone(),
+            FormField::ConfigPath => self.form.config_path.clone(),
+            FormField::Task => self.form.task.clone(),
+            FormField::Workers => self.form.workers.clone(),
+            FormField::MaxRetries => self.form.max_retries.clone(),
+            FormField::Model => self.form.model.clone(),
+            FormField::ResumeSession => self.form.resume_session_id.clone(),
+            _ => return,
+        };
+        self.edit_state = Some(EditState {
+            field,
+            cursor: current.chars().count(),
+            buffer: current,
+            preferred_column: None,
+        });
+    }
+
+    fn commit_edit(&mut self) -> Result<()> {
+        let Some(edit) = self.edit_state.take() else {
+            return Ok(());
+        };
+        match edit.field {
+            FormField::TargetDir => self.form.target_dir = edit.buffer.trim().to_string(),
+            FormField::ConfigPath => self.form.config_path = edit.buffer.trim().to_string(),
+            FormField::Task => self.form.task = edit.buffer.trim().to_string(),
+            FormField::Workers => self.form.workers = edit.buffer.trim().to_string(),
+            FormField::MaxRetries => self.form.max_retries = edit.buffer.trim().to_string(),
+            FormField::Model => self.form.model = edit.buffer.trim().to_string(),
+            FormField::ResumeSession => {
+                self.form.resume_session_id = edit.buffer.trim().to_string()
+            }
+            _ => {}
         }
+        if matches!(edit.field, FormField::TargetDir | FormField::ConfigPath) {
+            self.refresh_project(true)?;
+        }
+        Ok(())
     }
 
     fn command_preview_lines(&self, action: ShellAction) -> CommandPreview {
@@ -1365,6 +1679,7 @@ struct CommandPreview {
     #[cfg_attr(not(test), allow(dead_code))]
     args: Vec<String>,
     commandline: String,
+    summary: String,
 }
 
 fn build_command_preview(
@@ -1441,8 +1756,13 @@ fn build_command_preview(
             .collect::<Vec<_>>()
             .join(" ")
     );
+    let summary = build_action_summary(target_dir, form, action, selected_session);
 
-    CommandPreview { args, commandline }
+    CommandPreview {
+        args,
+        commandline,
+        summary,
+    }
 }
 
 fn prepare_runtime_state(
@@ -1584,6 +1904,11 @@ fn build_plan_args(target_dir: &Path, form: &FormState) -> PlanArgs {
             workers: parse_usize(&form.workers),
             role_set: Some(form.role_set.clone()),
             model: empty_as_none(&form.model),
+            thinking_mode: Some(match form.thinking_mode {
+                ThinkingMode::Quick => ThinkingModeArg::Quick,
+                ThinkingMode::Balanced => ThinkingModeArg::Balanced,
+                ThinkingMode::HardThink => ThinkingModeArg::HardThink,
+            }),
             ui: UiModeArg::Minimal,
             target_dir: Some(target_dir.to_path_buf()),
         },
@@ -1599,6 +1924,11 @@ fn build_run_args(target_dir: &Path, form: &FormState) -> RunArgs {
             workers: parse_usize(&form.workers),
             role_set: Some(form.role_set.clone()),
             model: empty_as_none(&form.model),
+            thinking_mode: Some(match form.thinking_mode {
+                ThinkingMode::Quick => ThinkingModeArg::Quick,
+                ThinkingMode::Balanced => ThinkingModeArg::Balanced,
+                ThinkingMode::HardThink => ThinkingModeArg::HardThink,
+            }),
             ui: UiModeArg::Minimal,
             target_dir: Some(target_dir.to_path_buf()),
         },
@@ -1655,13 +1985,6 @@ fn load_project_context(
             .unwrap_or_else(|| "使用内置默认值".to_string()),
         verification_commands: loaded.settings.verification_commands.clone(),
         role_sets: sorted_role_sets(&resources),
-        rule_source: resources.rules.global_origin.describe(),
-        reviewer_rule_source: resources
-            .rules
-            .reviewer_origin
-            .as_ref()
-            .map(|origin| origin.describe())
-            .unwrap_or_else(|| "未配置".to_string()),
         sessions,
         last_error: None,
     })
@@ -1675,6 +1998,9 @@ fn hydrate_form_from_loaded(
 ) {
     if override_defaults || form.role_set.trim().is_empty() {
         form.role_set = loaded.settings.role_set.clone();
+    }
+    if override_defaults {
+        form.thinking_mode = loaded.settings.thinking_mode;
     }
     if override_defaults || form.workers.trim().is_empty() {
         form.workers = loaded.settings.workers.to_string();
@@ -1719,7 +2045,7 @@ fn load_session_summaries(target_dir: &Path) -> Result<Vec<SessionSummary>> {
             let manifest = serde_json::from_str::<SessionManifest>(&raw).ok()?;
             Some(SessionSummary {
                 id: manifest.id.clone(),
-                created_at: manifest.created_at.format("%m-%d %H:%M").to_string(),
+                created_at: format_beijing(manifest.created_at, "%m-%d %H:%M"),
                 task: manifest.task.clone(),
                 status: manifest.status.label().to_string(),
                 result: manifest
@@ -1777,6 +2103,34 @@ fn append_shared_args(args: &mut Vec<String>, target_dir: &Path, form: &FormStat
         args.push("--model".to_string());
         args.push(form.model.trim().to_string());
     }
+    args.push("--thinking-mode".to_string());
+    args.push(form.thinking_mode.label().to_string());
+}
+
+fn build_action_summary(
+    _target_dir: &Path,
+    form: &FormState,
+    action: ShellAction,
+    selected_session: Option<&SessionManifest>,
+) -> String {
+    match action {
+        ShellAction::Doctor => "检查当前仓库的环境、配置和验证条件".to_string(),
+        ShellAction::Plan => format!(
+            "先把“{}”拆成方案和待办清单，再决定怎么执行",
+            summarize_task(&form.task)
+        ),
+        ShellAction::Run => format!(
+            "直接开始处理“{}”，默认使用 {}",
+            summarize_task(&form.task),
+            advanced_settings_summary(form)
+        ),
+        ShellAction::ReplaySelected => format!(
+            "回看 {} 的关键过程和结果",
+            selected_session
+                .map(|session| truncate(&session.id, 18))
+                .unwrap_or_else(|| "最近一次会话".to_string())
+        ),
+    }
 }
 
 fn optional_path(value: &str) -> Option<&Path> {
@@ -1813,13 +2167,84 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
+fn summarize_task(task: &str) -> String {
+    if task.trim().is_empty() {
+        "当前任务".to_string()
+    } else {
+        truncate(task, 24)
+    }
+}
+
+fn thinking_mode_user_title(mode: ThinkingMode) -> &'static str {
+    match mode {
+        ThinkingMode::Quick => "快速推进",
+        ThinkingMode::Balanced => "平衡模式",
+        ThinkingMode::HardThink => "复杂任务",
+    }
+}
+
+fn thinking_mode_user_hint(mode: ThinkingMode) -> &'static str {
+    match mode {
+        ThinkingMode::Quick => "更快出结果",
+        ThinkingMode::Balanced => "默认推荐",
+        ThinkingMode::HardThink => "更重视边界和风险",
+    }
+}
+
+fn apply_mode_user_label(mode: ApplyMode) -> &'static str {
+    match mode {
+        ApplyMode::AutoSafe => "自动安全落地",
+        ApplyMode::Bundle => "只输出变更包",
+        ApplyMode::None => "只做方案和审阅",
+    }
+}
+
+fn advanced_fields() -> &'static [FormField] {
+    &[
+        FormField::TargetDir,
+        FormField::ConfigPath,
+        FormField::ThinkingMode,
+        FormField::RoleSet,
+        FormField::Workers,
+        FormField::MaxRetries,
+        FormField::Model,
+        FormField::ApplyMode,
+        FormField::Preset,
+        FormField::FailFast,
+        FormField::CleanupSuccess,
+        FormField::ResumeSession,
+    ]
+}
+
+fn advanced_settings_summary(form: &FormState) -> String {
+    let mut items = vec![
+        format!("{} 个 worker", form.workers),
+        form.role_set.clone(),
+        apply_mode_user_label(form.apply_mode).to_string(),
+    ];
+    if !form.max_retries.trim().is_empty() {
+        items.push(format!("重试 {}", form.max_retries));
+    }
+    if let Some(preset) = form.preset {
+        items.push(format!("预设 {}", preset.label()));
+    }
+    truncate(&items.join(" / "), 72)
+}
+
+fn verification_summary(project: &ProjectContext) -> String {
+    if project.verification_commands.is_empty() {
+        "未配置".to_string()
+    } else {
+        truncate(&project.verification_commands.join("  |  "), 100)
+    }
+}
+
 fn field_is_editable(field: FormField) -> bool {
     matches!(
         field,
         FormField::TargetDir
             | FormField::ConfigPath
             | FormField::Task
-            | FormField::RoleSet
             | FormField::Workers
             | FormField::MaxRetries
             | FormField::Model
@@ -1827,11 +2252,204 @@ fn field_is_editable(field: FormField) -> bool {
     )
 }
 
+fn cycle_thinking_mode(current: ThinkingMode, forward: bool) -> ThinkingMode {
+    let modes = [
+        ThinkingMode::Quick,
+        ThinkingMode::Balanced,
+        ThinkingMode::HardThink,
+    ];
+    let index = modes.iter().position(|item| *item == current).unwrap_or(1);
+    modes[cycle_index(index, modes.len(), forward)]
+}
+
+fn thinking_mode_color(mode: ThinkingMode) -> Color {
+    match mode {
+        ThinkingMode::Quick => Color::LightBlue,
+        ThinkingMode::Balanced => Color::LightGreen,
+        ThinkingMode::HardThink => Color::LightMagenta,
+    }
+}
+
+fn contextual_help_lines(
+    route: Route,
+    edit_state: Option<&EditState>,
+    run_subview: RunSubview,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if let Some(edit) = edit_state {
+        let hint = if edit.field == FormField::Task {
+            if width < 72 {
+                "编辑中：Esc 保存，Ctrl+P 规划，Ctrl+R 执行。"
+            } else {
+                "编辑中：Enter 换行，Esc 保存退出，Ctrl+P 先看方案，Ctrl+R 直接执行。"
+            }
+        } else {
+            if width < 72 {
+                "编辑中：Enter 保存，Esc 取消。"
+            } else {
+                "编辑中：Enter 保存，Esc 取消，Backspace/Delete 删除。"
+            }
+        };
+        return vec![Line::from(hint)];
+    }
+
+    let compact = width < 72;
+    match route {
+        Route::Start => vec![Line::from(if compact {
+            "开始页：e 写任务，a 高级，Esc 收起高级。"
+        } else {
+            "开始页：`e` 写任务，`m` 切任务强度，`a` 展开高级设置，`Esc` 收起高级，`d` / `p` / `r` 直接执行。"
+        })],
+        Route::Run => vec![Line::from(format!(
+            "{}：{}",
+            if compact {
+                "执行页：Esc 返回上一级"
+            } else {
+                "执行页，`Esc` 返回上一级，Tab/[ ] 切换，s 停止"
+            },
+            run_subview.label()
+        ))],
+        Route::History => vec![Line::from(if compact {
+            "历史页：↑↓ 预览，Enter 打开，Esc 返回上一级。"
+        } else {
+            "历史页：↑↓ 预览会话，Enter 打开结果详情，`l` 回放当前项，`Esc` 返回上一级。"
+        })],
+    }
+}
+
+fn shell_layout_constraints(area: Rect) -> Vec<Constraint> {
+    if area.height < 22 {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(4),
+        ]
+    } else {
+        vec![
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(6),
+        ]
+    }
+}
+
+fn route_titles(width: u16) -> Vec<&'static str> {
+    if width < 60 {
+        vec!["始", "执", "历"]
+    } else if width < 90 {
+        vec!["开始", "执行中", "历史结果"]
+    } else {
+        Route::all().iter().map(|route| route.label()).collect()
+    }
+}
+
+fn run_subview_titles(width: u16) -> Vec<&'static str> {
+    if width < 68 {
+        vec!["态势", "事件", "摘要"]
+    } else {
+        RunSubview::all().iter().map(|item| item.label()).collect()
+    }
+}
+
+fn split_main_sections(area: Rect) -> Vec<Rect> {
+    let direction = if area.width < 110 {
+        Direction::Vertical
+    } else {
+        Direction::Horizontal
+    };
+    let constraints = if matches!(direction, Direction::Horizontal) {
+        vec![Constraint::Percentage(48), Constraint::Percentage(52)]
+    } else if area.height < 18 {
+        vec![Constraint::Percentage(52), Constraint::Percentage(48)]
+    } else {
+        vec![Constraint::Percentage(46), Constraint::Percentage(54)]
+    };
+    Layout::default()
+        .direction(direction)
+        .constraints(constraints)
+        .split(area)
+        .to_vec()
+}
+
+fn run_route_constraints(area: Rect) -> Vec<Constraint> {
+    if area.height < 18 {
+        vec![
+            Constraint::Length(3),
+            Constraint::Percentage(62),
+            Constraint::Percentage(38),
+        ]
+    } else if area.height < 26 {
+        vec![
+            Constraint::Length(3),
+            Constraint::Percentage(68),
+            Constraint::Percentage(32),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(16),
+            Constraint::Length(9),
+        ]
+    }
+}
+
+fn popup_percent(size: u16, desired: u16, max: u16) -> u16 {
+    if size < 60 {
+        max
+    } else if size < 90 {
+        desired.max(80)
+    } else {
+        desired
+    }
+}
+
 fn shell_escape(value: &str) -> String {
     if value.contains(' ') {
         format!("{value:?}")
     } else {
         value.to_string()
+    }
+}
+
+fn next_history_return_route(current: Route, stored: Route, next: Route) -> Route {
+    if next == Route::History {
+        if current == Route::History {
+            stored
+        } else {
+            current
+        }
+    } else {
+        next
+    }
+}
+
+fn next_run_return_route(current: Route, stored: Route, next: Route) -> Route {
+    if next == Route::Run {
+        if current == Route::Run {
+            stored
+        } else {
+            current
+        }
+    } else {
+        stored
+    }
+}
+
+fn history_back_route(history_return_route: Route) -> Route {
+    if history_return_route == Route::History {
+        Route::Start
+    } else {
+        history_return_route
+    }
+}
+
+fn run_back_route(run_return_route: Route) -> Route {
+    if run_return_route == Route::Run {
+        Route::Start
+    } else {
+        run_return_route
     }
 }
 
@@ -1865,17 +2483,156 @@ fn centered_rect(horizontal: u16, vertical: u16, area: Rect) -> Rect {
         .split(vertical_layout[1])[1]
 }
 
+fn cursor_row_col(text: &str, cursor: usize) -> (usize, usize) {
+    let lines = line_spans(text);
+    for (line_index, (start, len)) in lines.iter().enumerate() {
+        if cursor <= start + len {
+            return (line_index, cursor.saturating_sub(*start));
+        }
+    }
+    let last_line = lines.len().saturating_sub(1);
+    let (start, len) = lines[last_line];
+    (last_line, cursor.saturating_sub(start).min(len))
+}
+
+fn wrapped_cursor_row_col(text: &str, cursor: usize, max_width: usize) -> (usize, usize) {
+    if max_width == 0 {
+        return (0, 0);
+    }
+
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for ch in text.chars().take(cursor) {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+
+        let ch_width = UnicodeWidthChar::width(ch)
+            .unwrap_or(1)
+            .max(1)
+            .min(max_width);
+
+        if col + ch_width > max_width {
+            row += 1;
+            col = 0;
+        }
+
+        col += ch_width;
+        if col >= max_width {
+            row += col / max_width;
+            col %= max_width;
+        }
+    }
+
+    (row, col)
+}
+
+fn line_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for line in text.split('\n') {
+        let len = line.chars().count();
+        spans.push((start, len));
+        start += len + 1;
+    }
+    if spans.is_empty() {
+        spans.push((0, 0));
+    }
+    spans
+}
+
+fn char_to_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| text.len())
+}
+
+fn insert_char_at_cursor(edit: &mut EditState, ch: char) {
+    let byte_index = char_to_byte_index(&edit.buffer, edit.cursor);
+    edit.buffer.insert(byte_index, ch);
+    edit.cursor += 1;
+    edit.preferred_column = None;
+}
+
+fn backspace_at_cursor(edit: &mut EditState) {
+    if edit.cursor == 0 {
+        return;
+    }
+    let start = char_to_byte_index(&edit.buffer, edit.cursor - 1);
+    let end = char_to_byte_index(&edit.buffer, edit.cursor);
+    edit.buffer.replace_range(start..end, "");
+    edit.cursor -= 1;
+    edit.preferred_column = None;
+}
+
+fn delete_at_cursor(edit: &mut EditState) {
+    let total = edit.buffer.chars().count();
+    if edit.cursor >= total {
+        return;
+    }
+    let start = char_to_byte_index(&edit.buffer, edit.cursor);
+    let end = char_to_byte_index(&edit.buffer, edit.cursor + 1);
+    edit.buffer.replace_range(start..end, "");
+    edit.preferred_column = None;
+}
+
+fn move_cursor_horizontal(edit: &mut EditState, forward: bool) {
+    let total = edit.buffer.chars().count();
+    if forward {
+        edit.cursor = (edit.cursor + 1).min(total);
+    } else {
+        edit.cursor = edit.cursor.saturating_sub(1);
+    }
+    edit.preferred_column = None;
+}
+
+fn move_cursor_line_edge(edit: &mut EditState, end: bool) {
+    let lines = line_spans(&edit.buffer);
+    for (start, len) in lines {
+        if edit.cursor <= start + len {
+            edit.cursor = if end { start + len } else { start };
+            edit.preferred_column = None;
+            return;
+        }
+    }
+}
+
+fn move_cursor_vertical(edit: &mut EditState, forward: bool) {
+    let lines = line_spans(&edit.buffer);
+    let (current_row, current_col) = cursor_row_col(&edit.buffer, edit.cursor);
+    let target_row = if forward {
+        (current_row + 1).min(lines.len().saturating_sub(1))
+    } else {
+        current_row.saturating_sub(1)
+    };
+    let desired_col = edit.preferred_column.unwrap_or(current_col);
+    let (target_start, target_len) = lines[target_row];
+    edit.cursor = target_start + desired_col.min(target_len);
+    edit.preferred_column = Some(desired_col);
+}
+
 fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(format!("Session：{}", session.id)),
+        Line::from(format!("会话：{}", session.id)),
         Line::from(format!("任务：{}", truncate(&session.task, 100))),
         Line::from(format!("状态：{}", session.status.label())),
         Line::from(format!(
             "创建时间：{}",
-            session.created_at.format("%Y-%m-%d %H:%M:%S")
+            format_beijing(session.created_at, "%Y-%m-%d %H:%M:%S")
         )),
-        Line::from(format!("role_set：{}", session.role_set)),
-        Line::from(format!("apply_mode：{}", session.apply_mode.label())),
+        Line::from(format!("协作模板：{}", session.role_set)),
+        Line::from(format!(
+            "任务强度：{}",
+            thinking_mode_user_title(session.thinking_mode)
+        )),
+        Line::from(format!(
+            "结果落地：{}",
+            apply_mode_user_label(session.apply_mode)
+        )),
     ];
 
     if let Some(summary) = &session.final_summary {
@@ -1911,7 +2668,7 @@ fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
     } else if let Some(report) = &session.doctor_report {
         lines.push(Line::from(""));
         lines.push(Line::from(format!(
-            "Doctor：{} / {}",
+            "环境检查：{} / {}",
             report.readiness.label(),
             report.summary
         )));
@@ -1922,9 +2679,82 @@ fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FormState, ShellAction, build_command_preview};
-    use crate::model::{ApplyMode, SessionPreset};
-    use std::path::Path;
+    use super::{
+        ActiveCommand, AppShell, CommandState, FormField, FormState, ProjectContext, Route,
+        RunSubview, ShellAction, build_command_preview, contextual_help_lines, history_back_route,
+        next_history_return_route, next_run_return_route, prepare_runtime_state, route_titles,
+        run_back_route, run_subview_titles, split_main_sections, wrapped_cursor_row_col,
+    };
+    use crate::model::{ApplyMode, SessionPreset, ThinkingMode};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+    use tokio::sync::{mpsc, watch};
+
+    fn test_shell() -> AppShell {
+        AppShell {
+            route: Route::Start,
+            history_return_route: Route::Start,
+            run_return_route: Route::Start,
+            selected_field: 0,
+            advanced_settings_open: false,
+            edit_state: None,
+            history_index: 0,
+            notices: Vec::new(),
+            form: FormState::default(),
+            project: ProjectContext {
+                target_dir: PathBuf::from("/tmp/demo"),
+                display_target: "/tmp/demo".to_string(),
+                config_source: "test".to_string(),
+                verification_commands: Vec::new(),
+                role_sets: vec!["default".to_string()],
+                sessions: Vec::new(),
+                last_error: None,
+            },
+            selected_session: None,
+            runtime_state: None,
+            run_subview: RunSubview::Dashboard,
+            last_doctor_report: None,
+            active_command: None,
+            should_quit: false,
+        }
+    }
+
+    fn finished_command(action: ShellAction) -> ActiveCommand {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        ActiveCommand {
+            action,
+            commandline: "codex-forge test".to_string(),
+            state: CommandState::Succeeded,
+            started_at: Instant::now(),
+            output: Vec::new(),
+            cancel_tx: None,
+            rx,
+        }
+    }
+
+    fn running_command(action: ShellAction) -> ActiveCommand {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        ActiveCommand {
+            action,
+            commandline: "codex-forge test".to_string(),
+            state: CommandState::Running,
+            started_at: Instant::now(),
+            output: Vec::new(),
+            cancel_tx: Some(cancel_tx),
+            rx,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
 
     #[test]
     fn builds_run_command_from_form() {
@@ -1932,6 +2762,7 @@ mod tests {
             target_dir: "/tmp/demo".to_string(),
             config_path: String::new(),
             task: "实现 v5".to_string(),
+            thinking_mode: ThinkingMode::HardThink,
             role_set: "default".to_string(),
             workers: "4".to_string(),
             max_retries: "2".to_string(),
@@ -1948,8 +2779,11 @@ mod tests {
         assert!(preview.args.contains(&"实现 v5".to_string()));
         assert!(preview.args.contains(&"--apply-mode".to_string()));
         assert!(preview.args.contains(&"bundle".to_string()));
+        assert!(preview.args.contains(&"--thinking-mode".to_string()));
+        assert!(preview.args.contains(&"hard-think".to_string()));
         assert!(preview.args.contains(&"--resume".to_string()));
         assert!(preview.args.contains(&"abc".to_string()));
+        assert!(preview.summary.contains("实现 v5"));
     }
 
     #[test]
@@ -1966,5 +2800,453 @@ mod tests {
         );
         assert!(preview.args.contains(&"replay".to_string()));
         assert!(preview.args.contains(&"--timeline".to_string()));
+    }
+
+    #[test]
+    fn wrapped_cursor_moves_to_next_visual_line() {
+        assert_eq!(wrapped_cursor_row_col("abcdef", 6, 6), (1, 0));
+        assert_eq!(wrapped_cursor_row_col("abcdefg", 7, 6), (1, 1));
+    }
+
+    #[test]
+    fn wrapped_cursor_counts_wide_chars() {
+        assert_eq!(wrapped_cursor_row_col("你好ab", 4, 6), (1, 0));
+        assert_eq!(wrapped_cursor_row_col("你好abc", 5, 6), (1, 1));
+    }
+
+    #[test]
+    fn uses_compact_titles_on_narrow_terminal() {
+        assert_eq!(route_titles(50), vec!["始", "执", "历"]);
+        assert_eq!(run_subview_titles(60), vec!["态势", "事件", "摘要"]);
+    }
+
+    #[test]
+    fn stacks_main_sections_on_narrow_terminal() {
+        let sections = split_main_sections(Rect::new(0, 0, 80, 30));
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].width, 80);
+        assert_eq!(sections[1].width, 80);
+    }
+
+    #[test]
+    fn entering_history_remembers_previous_route() {
+        assert_eq!(
+            next_history_return_route(Route::Run, Route::Start, Route::History),
+            Route::Run
+        );
+        assert_eq!(
+            next_history_return_route(Route::Start, Route::Run, Route::History),
+            Route::Start
+        );
+    }
+
+    #[test]
+    fn staying_in_history_keeps_stored_return_route() {
+        assert_eq!(
+            next_history_return_route(Route::History, Route::Run, Route::History),
+            Route::Run
+        );
+        assert_eq!(
+            next_history_return_route(Route::History, Route::Start, Route::History),
+            Route::Start
+        );
+    }
+
+    #[test]
+    fn history_back_route_uses_last_non_history_route() {
+        assert_eq!(history_back_route(Route::Run), Route::Run);
+        assert_eq!(history_back_route(Route::Start), Route::Start);
+    }
+
+    #[test]
+    fn history_back_route_falls_back_to_start_for_invalid_state() {
+        assert_eq!(history_back_route(Route::History), Route::Start);
+    }
+
+    #[test]
+    fn entering_run_remembers_previous_route() {
+        assert_eq!(
+            next_run_return_route(Route::History, Route::Start, Route::Run),
+            Route::History
+        );
+        assert_eq!(
+            next_run_return_route(Route::Start, Route::History, Route::Run),
+            Route::Start
+        );
+    }
+
+    #[test]
+    fn staying_in_run_keeps_stored_return_route() {
+        assert_eq!(
+            next_run_return_route(Route::Run, Route::History, Route::Run),
+            Route::History
+        );
+        assert_eq!(
+            next_run_return_route(Route::Run, Route::Start, Route::Run),
+            Route::Start
+        );
+    }
+
+    #[test]
+    fn run_back_route_falls_back_to_start_for_invalid_state() {
+        assert_eq!(run_back_route(Route::Run), Route::Start);
+    }
+
+    #[test]
+    fn toggle_advanced_from_run_navigates_back_to_start() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+
+        shell.toggle_advanced_settings();
+
+        assert_eq!(shell.route, Route::Start);
+        assert!(shell.advanced_settings_open);
+    }
+
+    #[test]
+    fn toggle_advanced_from_history_navigates_back_to_start() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.history_return_route = Route::Run;
+
+        shell.toggle_advanced_settings();
+
+        assert_eq!(shell.route, Route::Start);
+        assert!(shell.advanced_settings_open);
+    }
+
+    #[test]
+    fn toggle_advanced_from_history_keeps_panel_open() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.advanced_settings_open = true;
+
+        shell.toggle_advanced_settings();
+
+        assert_eq!(shell.route, Route::Start);
+        assert!(shell.advanced_settings_open);
+    }
+
+    #[test]
+    fn toggle_advanced_is_blocked_while_command_is_running() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+        shell.active_command = Some(running_command(ShellAction::Run));
+
+        shell.toggle_advanced_settings();
+
+        assert_eq!(shell.route, Route::Run);
+        assert!(!shell.advanced_settings_open);
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("当前动作仍在执行"))
+        );
+    }
+
+    #[test]
+    fn global_back_closes_advanced_on_start() {
+        let mut shell = test_shell();
+        shell.advanced_settings_open = true;
+
+        shell.handle_global_back();
+
+        assert_eq!(shell.route, Route::Start);
+        assert!(!shell.advanced_settings_open);
+    }
+
+    #[test]
+    fn global_back_from_run_returns_to_start_when_idle() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+        shell.active_command = Some(finished_command(ShellAction::Doctor));
+
+        shell.handle_global_back();
+
+        assert_eq!(shell.route, Route::Start);
+    }
+
+    #[test]
+    fn global_back_from_run_returns_to_history_after_doctor_from_history() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.navigate_to(Route::Run);
+        shell.active_command = Some(finished_command(ShellAction::Doctor));
+
+        shell.handle_global_back();
+
+        assert_eq!(shell.route, Route::History);
+    }
+
+    #[test]
+    fn global_back_from_run_returns_to_history_after_replay() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.navigate_to(Route::Run);
+        shell.active_command = Some(finished_command(ShellAction::ReplaySelected));
+
+        shell.handle_global_back();
+
+        assert_eq!(shell.route, Route::History);
+    }
+
+    #[test]
+    fn tab_navigation_is_blocked_while_command_is_running() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+        shell.active_command = Some(running_command(ShellAction::Run));
+
+        shell.navigate_via_tab(Route::History);
+
+        assert_eq!(shell.route, Route::Run);
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("当前动作仍在执行"))
+        );
+    }
+
+    #[test]
+    fn global_back_from_run_does_not_hide_running_command() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+        shell.active_command = Some(running_command(ShellAction::Run));
+
+        shell.handle_global_back();
+
+        assert_eq!(shell.route, Route::Run);
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("当前动作仍在执行"))
+        );
+    }
+
+    #[test]
+    fn global_back_from_history_uses_return_route() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.history_return_route = Route::Run;
+
+        shell.handle_global_back();
+
+        assert_eq!(shell.route, Route::Run);
+    }
+
+    #[test]
+    fn help_texts_expose_global_back_rules() {
+        let start = contextual_help_lines(Route::Start, None, RunSubview::Dashboard, 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let run = contextual_help_lines(Route::Run, None, RunSubview::Timeline, 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let history = contextual_help_lines(Route::History, None, RunSubview::Summary, 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(start.contains("Esc"));
+        assert!(run.contains("Esc"));
+        assert!(history.contains("Esc"));
+    }
+
+    #[test]
+    fn compact_history_help_mentions_previous_level() {
+        let history = contextual_help_lines(Route::History, None, RunSubview::Summary, 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(history.contains("返回上一级"));
+    }
+
+    #[test]
+    fn idle_run_log_mentions_replay_and_back_navigation() {
+        let shell = test_shell();
+        let text = shell
+            .run_log_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Esc 返回上一级"));
+        assert!(text.contains("历史页可按 `l` 回放已完成会话"));
+    }
+
+    #[test]
+    fn finished_run_log_switches_to_back_hint() {
+        let mut shell = test_shell();
+        shell.active_command = Some(finished_command(ShellAction::ReplaySelected));
+
+        let text = shell
+            .run_log_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Esc 返回上一级"));
+        assert!(!text.contains("s 停止"));
+    }
+
+    #[test]
+    fn shell_action_stop_support_matches_expected_paths() {
+        assert!(!ShellAction::Doctor.supports_stop());
+        assert!(!ShellAction::Plan.supports_stop());
+        assert!(ShellAction::Run.supports_stop());
+        assert!(ShellAction::ReplaySelected.supports_stop());
+    }
+
+    #[test]
+    fn prepare_runtime_state_matches_action_kind() {
+        let form = FormState {
+            task: "实现审计".to_string(),
+            ..FormState::default()
+        };
+
+        assert!(prepare_runtime_state(ShellAction::Doctor, &form, None).is_none());
+        assert!(prepare_runtime_state(ShellAction::Plan, &form, None).is_some());
+        assert!(prepare_runtime_state(ShellAction::Run, &form, None).is_some());
+    }
+
+    #[test]
+    fn replay_runtime_state_requires_selected_session() {
+        let form = FormState {
+            task: "回放".to_string(),
+            ..FormState::default()
+        };
+
+        assert!(prepare_runtime_state(ShellAction::ReplaySelected, &form, None).is_none());
+    }
+
+    #[test]
+    fn replay_finish_stays_on_run_route() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.navigate_to(Route::Run);
+        let (tx, rx) = mpsc::unbounded_channel();
+        shell.active_command = Some(ActiveCommand {
+            action: ShellAction::ReplaySelected,
+            commandline: "codex-forge replay".to_string(),
+            state: CommandState::Running,
+            started_at: Instant::now(),
+            output: Vec::new(),
+            cancel_tx: None,
+            rx,
+        });
+
+        let _ = tx.send(super::RunnerEvent::Finished {
+            state: CommandState::Succeeded,
+            manifest: None,
+        });
+
+        shell.poll_command_output().unwrap();
+
+        assert_eq!(shell.route, Route::Run);
+    }
+
+    #[tokio::test]
+    async fn key_sequence_edits_task_and_saves_with_escape() {
+        let mut shell = test_shell();
+
+        shell.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+        shell.handle_key(key(KeyCode::Char('修'))).await.unwrap();
+        shell.handle_key(key(KeyCode::Char('复'))).await.unwrap();
+        shell.handle_key(key(KeyCode::Esc)).await.unwrap();
+
+        assert_eq!(shell.form.task, "修复");
+        assert!(shell.edit_state.is_none());
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("任务已保存"))
+        );
+    }
+
+    #[tokio::test]
+    async fn key_sequence_history_to_advanced_then_escape_returns_cleanly() {
+        let mut shell = test_shell();
+
+        shell.handle_key(key(KeyCode::Char('3'))).await.unwrap();
+        assert_eq!(shell.route, Route::History);
+
+        shell.handle_key(key(KeyCode::Char('a'))).await.unwrap();
+        assert_eq!(shell.route, Route::Start);
+        assert!(shell.advanced_settings_open);
+
+        shell.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert_eq!(shell.route, Route::Start);
+        assert!(!shell.advanced_settings_open);
+    }
+
+    #[tokio::test]
+    async fn key_sequence_tab_and_brackets_cycle_run_subviews() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+
+        shell.handle_key(key(KeyCode::Tab)).await.unwrap();
+        assert_eq!(shell.run_subview, RunSubview::Timeline);
+
+        shell.handle_key(key(KeyCode::Char(']'))).await.unwrap();
+        assert_eq!(shell.run_subview, RunSubview::Summary);
+
+        shell.handle_key(key(KeyCode::Char('['))).await.unwrap();
+        assert_eq!(shell.run_subview, RunSubview::Timeline);
+    }
+
+    #[tokio::test]
+    async fn key_sequence_running_command_blocks_history_and_advanced_hotkeys() {
+        let mut shell = test_shell();
+        shell.route = Route::Run;
+        shell.active_command = Some(running_command(ShellAction::Run));
+
+        shell.handle_key(key(KeyCode::Char('3'))).await.unwrap();
+        assert_eq!(shell.route, Route::Run);
+
+        shell.handle_key(key(KeyCode::Char('a'))).await.unwrap();
+        assert_eq!(shell.route, Route::Run);
+        assert!(!shell.advanced_settings_open);
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("当前动作仍在执行"))
+        );
+    }
+
+    #[tokio::test]
+    async fn key_sequence_non_task_escape_cancels_without_committing() {
+        let mut shell = test_shell();
+        shell.advanced_settings_open = true;
+        shell.start_editing(FormField::Workers);
+
+        shell.handle_key(key(KeyCode::Char('9'))).await.unwrap();
+        shell.handle_key(key(KeyCode::Esc)).await.unwrap();
+
+        assert_eq!(shell.form.workers, "4");
+        assert!(shell.edit_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn key_sequence_ctrl_shortcuts_are_ignored_outside_edit_mode() {
+        let mut shell = test_shell();
+
+        shell.handle_key(ctrl_key('p')).await.unwrap();
+        shell.handle_key(ctrl_key('r')).await.unwrap();
+
+        assert_eq!(shell.route, Route::Start);
+        assert!(shell.active_command.is_none());
     }
 }

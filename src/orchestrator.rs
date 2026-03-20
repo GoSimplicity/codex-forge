@@ -89,11 +89,41 @@ async fn plan_session_inner(
         &mut session,
         &mut ui,
         event_tx.as_ref(),
+        RuntimeEvent::PhaseChanged {
+            phase: "规划清单已生成".to_string(),
+        },
+    )?;
+    record_event(
+        &mut session,
+        &mut ui,
+        event_tx.as_ref(),
         RuntimeEvent::CommanderNote {
             message: format!("计划清单已生成，共 {} 项 todo。", plan_todo.todos.len()),
         },
     )?;
+    for todo in &plan_todo.todos {
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::TodoStateChanged {
+                todo_id: todo.id.clone(),
+                title: todo.title.clone(),
+                status: TodoStatus::Pending,
+                message: "规划完成，等待调度".to_string(),
+                commit_hash: None,
+            },
+        )?;
+    }
 
+    record_event(
+        &mut session,
+        &mut ui,
+        event_tx.as_ref(),
+        RuntimeEvent::PhaseChanged {
+            phase: "生成执行图".to_string(),
+        },
+    )?;
     let graph = build_plan(
         &config,
         &session.manifest.repo_snapshot,
@@ -111,10 +141,30 @@ async fn plan_session_inner(
             dependencies: graph.dependency_count(),
         },
     )?;
+    record_event(
+        &mut session,
+        &mut ui,
+        event_tx.as_ref(),
+        RuntimeEvent::CommanderNote {
+            message: format!(
+                "执行图已生成：{} 个节点，{} 条依赖，已可进入执行阶段。",
+                graph.nodes.len(),
+                graph.dependency_count()
+            ),
+        },
+    )?;
     let contract = derive_execution_contract(&config, &graph);
     session.set_execution_contract(contract)?;
     session.set_graph(graph)?;
     session.set_status(SessionStatus::Completed)?;
+    record_event(
+        &mut session,
+        &mut ui,
+        event_tx.as_ref(),
+        RuntimeEvent::PhaseChanged {
+            phase: "规划完成".to_string(),
+        },
+    )?;
     ui.finish()?;
     let _ = cleanup_empty_dirs(
         &session

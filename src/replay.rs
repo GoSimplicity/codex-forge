@@ -8,6 +8,7 @@ use tokio::time::sleep;
 
 use crate::model::{RuntimeEvent, RuntimeEventRecord, SessionManifest, UiMode};
 use crate::session::load_session;
+use crate::time::format_beijing;
 use crate::ui::{UiController, describe_runtime_event};
 
 pub async fn replay_session(
@@ -28,7 +29,7 @@ pub async fn replay_session(
                 serde_json::from_str(line).context("解析 timeline 事件失败")?;
             println!(
                 "- {} | {}",
-                record.ts.format("%H:%M:%S"),
+                format_beijing(record.ts, "%H:%M:%S"),
                 describe_timeline_event(&record.payload)
             );
         }
