@@ -214,7 +214,7 @@ def create_fixture_workspace(base_dir: Path) -> tuple[Path, Path]:
     repo_dir.mkdir(parents=True, exist_ok=True)
     bin_dir.mkdir(parents=True, exist_ok=True)
 
-    run(["git", "init"], cwd=repo_dir)
+    run(["git", "init", "-b", "main"], cwd=repo_dir)
     run(["git", "config", "user.email", "codex@example.com"], cwd=repo_dir)
     run(["git", "config", "user.name", "Codex"], cwd=repo_dir)
 

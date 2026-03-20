@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 fn make_repo(case_name: &str) -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    run(dir.path(), &["git", "init"]);
+    run(dir.path(), &["git", "init", "-b", "main"]);
     run(
         dir.path(),
         &["git", "config", "user.email", "codex@example.com"],
@@ -35,7 +35,7 @@ verification_commands = ["git status --short >/dev/null"]
 fn make_unborn_repo(case_name: &str) -> (TempDir, TempDir) {
     let repo = TempDir::new().expect("temp repo");
     let bin = TempDir::new().expect("temp bin");
-    run(repo.path(), &["git", "init"]);
+    run(repo.path(), &["git", "init", "-b", "main"]);
     install_fake_codex_to(bin.path(), case_name);
     (repo, bin)
 }
