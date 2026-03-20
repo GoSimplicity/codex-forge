@@ -747,6 +747,85 @@ fn run_can_resume_previous_session() {
 }
 
 #[test]
+fn continue_from_plan_creates_iteration_artifacts() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let first = command(bin, repo.path())
+        .args([
+            "plan",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("first plan");
+    assert!(first.status.success(), "{:?}", first);
+    let parent_session_id = latest_session_id(repo.path());
+
+    let continued = command(bin, repo.path())
+        .args([
+            "continue",
+            "--session",
+            &parent_session_id,
+            "--feedback",
+            "把第一版计划再收敛一下，突出下一步优化项",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("continue plan");
+    assert!(continued.status.success(), "{:?}", continued);
+
+    let manifest = load_manifest(repo.path());
+    assert_eq!(
+        manifest["parent_session_id"].as_str(),
+        Some(parent_session_id.as_str())
+    );
+    assert_eq!(
+        manifest["root_session_id"].as_str(),
+        Some(parent_session_id.as_str())
+    );
+    assert_eq!(manifest["continuation_kind"], "plan_refine");
+    assert_eq!(manifest["iteration_index"], 2);
+    assert_eq!(manifest["plan_todo"]["iteration_index"], 2);
+    assert_eq!(
+        manifest["feedback_history"]
+            .as_array()
+            .expect("feedback")
+            .len(),
+        1
+    );
+
+    let session_id = latest_session_id(repo.path());
+    let session_dir = repo
+        .path()
+        .join(".codex-forge")
+        .join("sessions")
+        .join(&session_id);
+    assert!(session_dir.join("commander").join("feedback.json").exists());
+    assert!(session_dir.join("commander").join("feedback.md").exists());
+    assert!(
+        session_dir
+            .join("commander")
+            .join("session-lineage.json")
+            .exists()
+    );
+    assert!(
+        repo.path()
+            .join(".codex-forge")
+            .join("sessions")
+            .join(parent_session_id)
+            .join("latest.md")
+            .exists()
+    );
+}
+
+#[test]
 fn auto_safe_supports_unborn_repo() {
     let (repo, fake_bin) = make_unborn_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");

@@ -332,6 +332,112 @@ impl Display for SessionPreset {
     }
 }
 
+fn default_iteration_index() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationKind {
+    PlanRefine,
+    RunRefine,
+}
+
+impl ContinuationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlanRefine => "plan-refine",
+            Self::RunRefine => "run-refine",
+        }
+    }
+}
+
+impl Display for ContinuationKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackRecord {
+    pub author: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub raw_feedback: String,
+    pub intent_summary: String,
+    #[serde(default)]
+    pub scope_delta: Vec<String>,
+    #[serde(default)]
+    pub accepted_assumptions: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BaselineArtifacts {
+    #[serde(default)]
+    pub parent_plan_todo_path: Option<PathBuf>,
+    #[serde(default)]
+    pub parent_summary_markdown_path: Option<PathBuf>,
+    #[serde(default)]
+    pub parent_summary_json_path: Option<PathBuf>,
+    #[serde(default)]
+    pub parent_apply_result_path: Option<PathBuf>,
+    #[serde(default)]
+    pub parent_verification_report_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLineageEntry {
+    pub session_id: String,
+    #[serde(default = "default_iteration_index")]
+    pub iteration_index: u32,
+    #[serde(default)]
+    pub continuation_kind: Option<ContinuationKind>,
+    pub status: SessionStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuationConfig {
+    pub parent_session_id: String,
+    pub root_session_id: String,
+    #[serde(default = "default_iteration_index")]
+    pub iteration_index: u32,
+    pub kind: ContinuationKind,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub feedback: String,
+    #[serde(default)]
+    pub feedback_history: Vec<FeedbackRecord>,
+    #[serde(default)]
+    pub baseline_artifacts: BaselineArtifacts,
+    #[serde(default)]
+    pub parent_lineage: Vec<SessionLineageEntry>,
+    #[serde(default)]
+    pub parent_task: String,
+    #[serde(default)]
+    pub parent_plan_summary: Option<String>,
+    #[serde(default)]
+    pub parent_summary_overview: Option<String>,
+    #[serde(default)]
+    pub parent_recommended_next_action: Vec<String>,
+}
+
+impl ContinuationConfig {
+    pub fn latest_feedback_summary(&self) -> String {
+        let trimmed = self.feedback.trim();
+        if trimmed.is_empty() {
+            "未提供新增反馈，沿用上一轮目标与建议。".to_string()
+        } else {
+            self.feedback_history
+                .last()
+                .map(|item| item.intent_summary.clone())
+                .filter(|item| !item.trim().is_empty())
+                .unwrap_or_else(|| trimmed.to_string())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub task: String,
@@ -352,6 +458,8 @@ pub struct SessionConfig {
     pub plan_only: bool,
     pub preset: Option<SessionPreset>,
     pub resume_session_id: Option<String>,
+    #[serde(default)]
+    pub continuation: Option<ContinuationConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -533,6 +641,14 @@ pub struct PlanTodo {
     pub risks: Vec<String>,
     pub used_fallback: bool,
     pub planning_notes: Vec<String>,
+    #[serde(default = "default_iteration_index")]
+    pub iteration_index: u32,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
+    #[serde(default)]
+    pub feedback_summary: Vec<String>,
+    #[serde(default)]
+    pub delta_summary: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -769,6 +885,16 @@ pub struct ArtifactManifest {
     pub apply_result_path: Option<PathBuf>,
     pub verification_report_path: Option<PathBuf>,
     pub change_trust_report_path: Option<PathBuf>,
+    #[serde(default)]
+    pub feedback_json_path: Option<PathBuf>,
+    #[serde(default)]
+    pub feedback_markdown_path: Option<PathBuf>,
+    #[serde(default)]
+    pub iteration_summary_path: Option<PathBuf>,
+    #[serde(default)]
+    pub lineage_path: Option<PathBuf>,
+    #[serde(default)]
+    pub latest_pointer_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -822,6 +948,18 @@ pub struct FinalSummary {
     pub review_report: Option<ReviewGateReport>,
     #[serde(default)]
     pub evidence_summary: Vec<String>,
+    #[serde(default = "default_iteration_index")]
+    pub iteration_index: u32,
+    #[serde(default)]
+    pub based_on_session_id: Option<String>,
+    #[serde(default)]
+    pub feedback_summary: Vec<String>,
+    #[serde(default)]
+    pub delta_summary: Vec<String>,
+    #[serde(default)]
+    pub completed_this_iteration: Vec<String>,
+    #[serde(default)]
+    pub unaccepted_feedback: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,6 +1072,20 @@ pub struct SessionManifest {
     pub config_path: Option<PathBuf>,
     #[serde(default)]
     pub preset: Option<SessionPreset>,
+    #[serde(default = "default_iteration_index")]
+    pub iteration_index: u32,
+    #[serde(default)]
+    pub root_session_id: String,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub continuation_kind: Option<ContinuationKind>,
+    #[serde(default)]
+    pub feedback_history: Vec<FeedbackRecord>,
+    #[serde(default)]
+    pub supersedes_session_id: Option<String>,
+    #[serde(default)]
+    pub baseline_artifacts: BaselineArtifacts,
     pub plan_todo: Option<PlanTodo>,
     #[serde(default)]
     pub todo_states: Vec<TodoStateRecord>,
@@ -955,6 +1107,8 @@ pub struct SessionManifest {
     pub timeline_events: Vec<TimelineEventSummary>,
     #[serde(default)]
     pub demo_summary: Vec<String>,
+    #[serde(default)]
+    pub lineage: Vec<SessionLineageEntry>,
     pub session_dir: PathBuf,
     pub timeline_path: PathBuf,
     pub graph_path: PathBuf,
@@ -966,6 +1120,28 @@ pub struct SessionManifest {
     pub apply_result_path: PathBuf,
     pub verification_report_path: PathBuf,
     pub change_trust_report_path: PathBuf,
+}
+
+impl SessionManifest {
+    pub fn root_session_id_ref(&self) -> &str {
+        if self.root_session_id.is_empty() {
+            self.id.as_str()
+        } else {
+            self.root_session_id.as_str()
+        }
+    }
+
+    pub fn iteration_index_value(&self) -> u32 {
+        if self.iteration_index == 0 {
+            1
+        } else {
+            self.iteration_index
+        }
+    }
+
+    pub fn continuable(&self) -> bool {
+        self.status == SessionStatus::Completed
+    }
 }
 
 #[derive(Debug, Clone)]

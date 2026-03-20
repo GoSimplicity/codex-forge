@@ -1,17 +1,23 @@
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::Parser;
 
 use crate::app_shell::run_app_shell;
 use crate::cli::{
     AgentCommands, AgentListArgs, ApplyModeArg, Cli, Commands, ConfigCommands, ConfigValidateArgs,
-    DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs, ThinkingModeArg, TuiArgs, UiModeArg,
+    ContinueArgs, ContinueModeArg, DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs,
+    ThinkingModeArg, TuiArgs, UiModeArg,
 };
 use crate::config::{load_project_config, validate_project_config};
 use crate::doctor::run_doctor;
-use crate::model::{ApplyMode, SessionConfig, SessionPreset, ThinkingMode, UiMode};
+use crate::model::{
+    ApplyMode, BaselineArtifacts, ContinuationConfig, ContinuationKind, FeedbackRecord,
+    SessionConfig, SessionLineageEntry, SessionManifest, SessionPreset, ThinkingMode, UiMode,
+};
 use crate::orchestrator::{plan_session, run_session};
 use crate::replay::replay_session;
 use crate::resources::{load_resource_catalog, resolve_role_set};
+use crate::session::load_session;
 use crate::workspace::{describe_git_readiness, resolve_target_dir};
 
 pub async fn run() -> Result<()> {
@@ -32,6 +38,17 @@ pub async fn run() -> Result<()> {
             } else {
                 let (config, roles) = resolve_plan_config(args)?;
                 let _manifest = plan_session(config, roles).await?;
+            }
+        }
+        Some(Commands::Continue(args)) => {
+            let (config, roles) = resolve_continue_config(args)?;
+            if matches!(
+                config.continuation.as_ref().map(|item| item.kind),
+                Some(ContinuationKind::PlanRefine)
+            ) {
+                let _manifest = plan_session(config, roles).await?;
+            } else {
+                let _manifest = run_session(config, roles).await?;
             }
         }
         Some(Commands::Replay(args)) => run_replay(args).await?,
@@ -57,6 +74,7 @@ async fn run_tui(args: TuiArgs) -> Result<()> {
 pub(crate) fn resolve_run_config(
     args: RunArgs,
 ) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+    let task = validated_task_input(&args.shared.task)?;
     let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
     let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
     let resources = load_resource_catalog(&target_dir)?;
@@ -71,7 +89,7 @@ pub(crate) fn resolve_run_config(
     }
 
     let config = SessionConfig {
-        task: args.shared.task,
+        task,
         workers: args
             .shared
             .workers
@@ -100,6 +118,7 @@ pub(crate) fn resolve_run_config(
         plan_only: false,
         preset: args.preset.map(into_preset),
         resume_session_id: args.resume,
+        continuation: None,
     };
     Ok((apply_run_preset(config), roles))
 }
@@ -107,6 +126,7 @@ pub(crate) fn resolve_run_config(
 pub(crate) fn resolve_plan_config(
     args: PlanArgs,
 ) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+    let task = validated_task_input(&args.shared.task)?;
     let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
     let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
     let resources = load_resource_catalog(&target_dir)?;
@@ -118,7 +138,7 @@ pub(crate) fn resolve_plan_config(
     let roles = resolve_role_set(&resources, &role_set)?;
 
     let config = SessionConfig {
-        task: args.shared.task,
+        task,
         workers: args
             .shared
             .workers
@@ -144,6 +164,107 @@ pub(crate) fn resolve_plan_config(
         plan_only: true,
         preset: None,
         resume_session_id: None,
+        continuation: None,
+    };
+    Ok((config, roles))
+}
+
+pub(crate) fn resolve_continue_config(
+    args: ContinueArgs,
+) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let parent_manifest = load_session(&target_dir, Some(&args.session))?;
+    if !parent_manifest.continuable() {
+        bail!("continue 只支持已完成 session；未完成任务请改用 run --resume");
+    }
+
+    let loaded = load_project_config(&target_dir, parent_manifest.config_path.as_deref())?;
+    let resources = load_resource_catalog(&target_dir)?;
+    let role_set = parent_manifest.role_set.clone();
+    let roles = resolve_role_set(&resources, &role_set)?;
+    if roles.is_empty() {
+        bail!("角色集合为空，无法继续迭代");
+    }
+
+    let continuation_kind = resolve_continuation_kind(args.mode, &parent_manifest);
+    let feedback = args.feedback.unwrap_or_default();
+    let mut feedback_history = parent_manifest.feedback_history.clone();
+    if !feedback.trim().is_empty() {
+        feedback_history.push(build_feedback_record(&feedback, args.title.clone()));
+    }
+
+    let continuation = ContinuationConfig {
+        parent_session_id: parent_manifest.id.clone(),
+        root_session_id: parent_manifest.root_session_id_ref().to_string(),
+        iteration_index: parent_manifest.iteration_index_value() + 1,
+        kind: continuation_kind,
+        title: args.title,
+        feedback,
+        feedback_history,
+        baseline_artifacts: baseline_artifacts_from_manifest(&parent_manifest),
+        parent_lineage: if parent_manifest.lineage.is_empty() {
+            vec![SessionLineageEntry {
+                session_id: parent_manifest.id.clone(),
+                iteration_index: parent_manifest.iteration_index_value(),
+                continuation_kind: parent_manifest.continuation_kind,
+                status: parent_manifest.status,
+                created_at: parent_manifest.created_at,
+            }]
+        } else {
+            parent_manifest.lineage.clone()
+        },
+        parent_task: parent_manifest.task.clone(),
+        parent_plan_summary: parent_manifest
+            .plan_todo
+            .as_ref()
+            .map(|item| item.summary.clone()),
+        parent_summary_overview: parent_manifest
+            .final_summary
+            .as_ref()
+            .map(|item| item.overview.clone()),
+        parent_recommended_next_action: parent_manifest
+            .final_summary
+            .as_ref()
+            .map(|item| item.recommended_next_action.clone())
+            .unwrap_or_default(),
+    };
+
+    let config = SessionConfig {
+        task: parent_manifest.task.clone(),
+        workers: parent_manifest.workers_requested.max(1),
+        role_set,
+        model: parent_manifest
+            .model
+            .clone()
+            .or(loaded.settings.model.clone()),
+        thinking_mode: parent_manifest.thinking_mode,
+        ui_mode: into_ui_mode(args.ui),
+        target_dir,
+        cleanup_success: parent_manifest.cleanup_success,
+        apply_mode: match continuation_kind {
+            ContinuationKind::PlanRefine => ApplyMode::None,
+            ContinuationKind::RunRefine => {
+                if matches!(parent_manifest.apply_mode, ApplyMode::None) {
+                    loaded.settings.apply_mode
+                } else {
+                    parent_manifest.apply_mode
+                }
+            }
+        },
+        max_retries: parent_manifest.max_retries.max(1),
+        fail_fast: parent_manifest.fail_fast,
+        verification_commands: if parent_manifest.verification_commands.is_empty() {
+            loaded.settings.verification_commands.clone()
+        } else {
+            parent_manifest.verification_commands.clone()
+        },
+        config_path: loaded.path.or(parent_manifest.config_path.clone()),
+        global_rule_prompt: resources.rules.global.clone(),
+        reviewer_rule_prompt: resources.rules.reviewer.clone(),
+        plan_only: matches!(continuation_kind, ContinuationKind::PlanRefine),
+        preset: parent_manifest.preset,
+        resume_session_id: None,
+        continuation: Some(continuation),
     };
     Ok((config, roles))
 }
@@ -233,7 +354,7 @@ fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {
 fn print_agents(args: AgentListArgs) -> Result<()> {
     let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
     let resources = load_resource_catalog(&target_dir)?;
-    println!("codex-forge v5 可用角色：");
+    println!("codex-forge v6 可用角色：");
     let mut role_items = resources.roles.values().collect::<Vec<_>>();
     role_items.sort_by(|left, right| left.role.key.cmp(&right.role.key));
     for role in role_items {
@@ -261,6 +382,31 @@ fn print_agents(args: AgentListArgs) -> Result<()> {
     Ok(())
 }
 
+fn validated_task_input(task: &str) -> Result<String> {
+    let trimmed = task.trim();
+    if trimmed.is_empty() {
+        bail!("任务描述不能为空；请先输入提示词，再执行 plan 或 run")
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_task_input;
+
+    #[test]
+    fn rejects_empty_task_input() {
+        let error = validated_task_input("   \n\t").expect_err("should reject empty task");
+        assert!(error.to_string().contains("任务描述不能为空"));
+    }
+
+    #[test]
+    fn trims_valid_task_input() {
+        let task = validated_task_input("  修复 TUI 交互  ").expect("valid task");
+        assert_eq!(task, "修复 TUI 交互");
+    }
+}
+
 fn into_ui_mode(mode: UiModeArg) -> UiMode {
     match mode {
         UiModeArg::Rich => UiMode::Rich,
@@ -273,6 +419,57 @@ fn into_apply_mode(mode: ApplyModeArg) -> ApplyMode {
         ApplyModeArg::AutoSafe => ApplyMode::AutoSafe,
         ApplyModeArg::Bundle => ApplyMode::Bundle,
         ApplyModeArg::None => ApplyMode::None,
+    }
+}
+
+fn resolve_continuation_kind(
+    mode: ContinueModeArg,
+    parent_manifest: &SessionManifest,
+) -> ContinuationKind {
+    match mode {
+        ContinueModeArg::Plan => ContinuationKind::PlanRefine,
+        ContinueModeArg::Run => ContinuationKind::RunRefine,
+        ContinueModeArg::Auto => {
+            if parent_manifest.worker_results.is_empty()
+                && parent_manifest.apply_result.is_none()
+                && parent_manifest.final_summary.is_none()
+            {
+                ContinuationKind::PlanRefine
+            } else {
+                ContinuationKind::RunRefine
+            }
+        }
+    }
+}
+
+fn build_feedback_record(feedback: &str, title: Option<String>) -> FeedbackRecord {
+    let trimmed = feedback.trim();
+    let intent_summary = trimmed.chars().take(80).collect::<String>();
+    FeedbackRecord {
+        author: "human".to_string(),
+        title,
+        raw_feedback: trimmed.to_string(),
+        intent_summary: if intent_summary.is_empty() {
+            "补充一轮反馈".to_string()
+        } else {
+            intent_summary
+        },
+        scope_delta: vec![trimmed.to_string()],
+        accepted_assumptions: vec![
+            "默认继承上一轮的角色集合、worker 数和仓库规则。".to_string(),
+            "默认把本轮结果视为可继续反馈的阶段性交付。".to_string(),
+        ],
+        created_at: Utc::now(),
+    }
+}
+
+fn baseline_artifacts_from_manifest(manifest: &SessionManifest) -> BaselineArtifacts {
+    BaselineArtifacts {
+        parent_plan_todo_path: manifest.artifact_manifest.plan_todo_path.clone(),
+        parent_summary_markdown_path: Some(manifest.summary_markdown_path.clone()),
+        parent_summary_json_path: Some(manifest.summary_json_path.clone()),
+        parent_apply_result_path: Some(manifest.apply_result_path.clone()),
+        parent_verification_report_path: Some(manifest.verification_report_path.clone()),
     }
 }
 

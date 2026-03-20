@@ -73,6 +73,28 @@ pub fn render_worker_prompt(
         ""
     };
     let thinking_mode = config.thinking_mode;
+    let continuation_block = config
+        .continuation
+        .as_ref()
+        .map(|item| {
+            let latest_feedback = item
+                .feedback_history
+                .last()
+                .map(|record| record.intent_summary.clone())
+                .unwrap_or_else(|| item.feedback.clone());
+            format!(
+                "延续迭代上下文：\n\
+- 当前轮次：V{}\n\
+- 来源会话：{}\n\
+- 延续类型：{}\n\
+- 本轮反馈：{}\n\n",
+                item.iteration_index,
+                item.parent_session_id,
+                item.kind.label(),
+                latest_feedback
+            )
+        })
+        .unwrap_or_default();
     format!(
         "{prompt_preamble}\n\
 角色：{}（{}）\n\
@@ -85,6 +107,7 @@ pub fn render_worker_prompt(
 角色专项规则：\n{}\n\n\
 思考模式要求：\n{}\n\n\
 全局任务：{}\n\
+{}\
 当前节点：{}\n\
 节点目标：{}\n\
 聚焦点：{}\n\n\
@@ -136,6 +159,7 @@ pub fn render_worker_prompt(
         },
         thinking_mode_instructions(thinking_mode),
         config.task,
+        continuation_block,
         node.title,
         node.objective,
         node.prompt_focus,

@@ -550,16 +550,30 @@ fn append_event_line(stream_name: &str, path: &Path, line: &str) -> Result<()> {
 }
 
 fn extract_message(value: &Value) -> Option<String> {
-    let candidates = [
+    let primary_candidates = [
         value.get("message").and_then(Value::as_str),
         value.get("delta").and_then(Value::as_str),
         value.get("content").and_then(Value::as_str),
-        value.pointer("/item/text").and_then(Value::as_str),
-        value.pointer("/item/content").and_then(Value::as_str),
         value.pointer("/content/0/text").and_then(Value::as_str),
     ];
 
-    for text in candidates.into_iter().flatten() {
+    for text in primary_candidates.into_iter().flatten() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(summary) = summarize_event_message(value) {
+        return Some(summary);
+    }
+
+    let secondary_candidates = [
+        value.pointer("/item/text").and_then(Value::as_str),
+        value.pointer("/item/content").and_then(Value::as_str),
+    ];
+
+    for text in secondary_candidates.into_iter().flatten() {
         let trimmed = text.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
@@ -567,6 +581,133 @@ fn extract_message(value: &Value) -> Option<String> {
     }
 
     None
+}
+
+fn summarize_event_message(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("thread.started") => Some("线程已启动".to_string()),
+        Some("turn.started") => Some("开始新一轮响应".to_string()),
+        Some("turn.completed") => Some("本轮响应结束".to_string()),
+        Some("item.started") | Some("item.completed") | Some("item.updated") => {
+            summarize_item_event(
+                value.get("type").and_then(Value::as_str).unwrap_or("item"),
+                value.get("item")?,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn summarize_item_event(event_type: &str, item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("unknown");
+    match item_type {
+        "agent_message" => item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
+        "command_execution" => summarize_command_execution_event(event_type, item),
+        "todo_list" => summarize_todo_list_event(event_type, item),
+        "file_change" => summarize_file_change_event(item),
+        _ => item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
+    }
+}
+
+fn summarize_command_execution_event(event_type: &str, item: &Value) -> Option<String> {
+    let command = item
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|text| truncate_inline(text, 72))
+        .unwrap_or_else(|| "未命名命令".to_string());
+    match event_type {
+        "item.started" => Some(format!("命令执行中：{command}")),
+        "item.completed" => {
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let exit_code = item
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|code| format!(" / 退出码 {code}"))
+                .unwrap_or_default();
+            let output_hint = item
+                .get("aggregated_output")
+                .and_then(Value::as_str)
+                .and_then(first_non_empty_line)
+                .map(|line| format!(" / {}", truncate_inline(&line, 60)))
+                .unwrap_or_default();
+            Some(format!(
+                "命令{}：{}{}{}",
+                if status == "completed" { "完成" } else { status },
+                command,
+                exit_code,
+                output_hint
+            ))
+        }
+        _ => Some(format!("命令更新：{command}")),
+    }
+}
+
+fn summarize_todo_list_event(event_type: &str, item: &Value) -> Option<String> {
+    let items = item.get("items")?.as_array()?;
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    Some(format!(
+        "Todo {}：已完成 {completed}/{total}",
+        if event_type == "item.started" {
+            "已发布"
+        } else {
+            "已更新"
+        }
+    ))
+}
+
+fn summarize_file_change_event(item: &Value) -> Option<String> {
+    let changes = item.get("changes")?.as_array()?;
+    if changes.is_empty() {
+        return Some("文件变更已记录".to_string());
+    }
+    let mut paths = Vec::new();
+    for change in changes.iter().take(3) {
+        if let Some(path) = change.get("path").and_then(Value::as_str) {
+            paths.push(path.rsplit('/').next().unwrap_or(path).to_string());
+        }
+    }
+    let suffix = if changes.len() > 3 {
+        format!(" 等 {} 个文件", changes.len())
+    } else {
+        format!(" 共 {} 个文件", changes.len())
+    };
+    Some(format!("文件变更：{}{}", paths.join("、"), suffix))
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
+}
+
+fn truncate_inline(text: &str, max: usize) -> String {
+    let trimmed = text.replace('\n', " ");
+    if trimmed.chars().count() <= max {
+        trimmed
+    } else {
+        format!("{}...", trimmed.chars().take(max).collect::<String>())
+    }
 }
 
 fn compact_json(value: &Value) -> String {
@@ -886,6 +1027,27 @@ mod tests {
         assert_eq!(kind, "raw");
         assert_eq!(message, "plain stderr");
         assert!(raw.is_none());
+    }
+
+    #[test]
+    fn summarizes_command_execution_event() {
+        let (kind, message, raw) = parse_event_line(
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test -q","aggregated_output":"ok\n","exit_code":0,"status":"completed"}}"#,
+        );
+        assert_eq!(kind, "item.completed");
+        assert!(message.contains("命令完成"));
+        assert!(message.contains("cargo test -q"));
+        assert!(message.contains("ok"));
+        assert!(raw.is_some());
+    }
+
+    #[test]
+    fn summarizes_todo_list_event() {
+        let (kind, message, _) = parse_event_line(
+            r#"{"type":"item.updated","item":{"type":"todo_list","items":[{"text":"a","completed":true},{"text":"b","completed":false}]}}"#,
+        );
+        assert_eq!(kind, "item.updated");
+        assert_eq!(message, "Todo 已更新：已完成 1/2");
     }
 
     #[test]

@@ -77,6 +77,21 @@ async fn plan_session_inner(
             ),
         },
     )?;
+    if let Some(continuation) = &config.continuation {
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::CommanderNote {
+                message: format!(
+                    "基于 session `{}` 进入 V{} 迭代，反馈摘要：{}",
+                    continuation.parent_session_id,
+                    continuation.iteration_index,
+                    continuation.latest_feedback_summary()
+                ),
+            },
+        )?;
+    }
 
     let plan_todo = build_plan_todo(
         &config,
@@ -181,6 +196,10 @@ async fn plan_session_inner(
             session.plan_todo_json_path().display()
         );
         println!("执行图文件：`{}`", session.manifest.graph_path.display());
+        println!(
+            "继续反馈：`codex-forge continue --session {} --feedback \"...\"`",
+            session.manifest.id
+        );
     }
     Ok(session.manifest)
 }
@@ -243,6 +262,21 @@ async fn run_session_inner(
             ),
         },
     )?;
+    if let Some(continuation) = &config.continuation {
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::CommanderNote {
+                message: format!(
+                    "基于 session `{}` 进入 V{} 迭代，反馈摘要：{}",
+                    continuation.parent_session_id,
+                    continuation.iteration_index,
+                    continuation.latest_feedback_summary()
+                ),
+            },
+        )?;
+    }
     session.set_status(SessionStatus::Planning)?;
     record_event(
         &mut session,
@@ -668,6 +702,17 @@ async fn run_session_inner(
     );
 
     finished.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+    if event_tx.is_none() {
+        println!("运行完成：`{}`", session.manifest.id);
+        println!(
+            "摘要文件：`{}`",
+            session.manifest.summary_markdown_path.display()
+        );
+        println!(
+            "继续反馈：`codex-forge continue --session {} --feedback \"...\"`",
+            session.manifest.id
+        );
+    }
     Ok(EmbeddedRunOutcome {
         manifest: session.manifest,
         stopped: false,

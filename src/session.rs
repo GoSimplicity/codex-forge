@@ -9,8 +9,8 @@ use chrono::Utc;
 use crate::model::{
     ApplyMode, ApplyResult, ArtifactEntry, ArtifactIndexEntry, ArtifactManifest, ChangeTrustReport,
     ExecutionContract, ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot, RuntimeEvent,
-    RuntimeEventRecord, SessionConfig, SessionManifest, SessionStatus, TimelineEventSummary,
-    TodoStateRecord, TodoStatus, VerificationReport, WorkerResult,
+    RuntimeEventRecord, SessionConfig, SessionLineageEntry, SessionManifest, SessionStatus,
+    TimelineEventSummary, TodoStateRecord, TodoStatus, VerificationReport, WorkerResult,
 };
 
 #[derive(Debug, Clone)]
@@ -34,11 +34,52 @@ impl SessionContext {
         fs::create_dir_all(&session_dir)
             .with_context(|| format!("创建 session 目录失败：{}", session_dir.display()))?;
 
+        let created_at = Utc::now();
+        let iteration_index = config
+            .continuation
+            .as_ref()
+            .map(|item| item.iteration_index.max(1))
+            .unwrap_or(1);
+        let root_session_id = config
+            .continuation
+            .as_ref()
+            .map(|item| item.root_session_id.clone())
+            .unwrap_or_else(|| session_id.clone());
+        let lineage = if let Some(continuation) = &config.continuation {
+            let mut items = if continuation.parent_lineage.is_empty() {
+                vec![SessionLineageEntry {
+                    session_id: continuation.parent_session_id.clone(),
+                    iteration_index: iteration_index.saturating_sub(1).max(1),
+                    continuation_kind: None,
+                    status: SessionStatus::Completed,
+                    created_at,
+                }]
+            } else {
+                continuation.parent_lineage.clone()
+            };
+            items.push(SessionLineageEntry {
+                session_id: session_id.clone(),
+                iteration_index,
+                continuation_kind: Some(continuation.kind),
+                status: SessionStatus::Planning,
+                created_at,
+            });
+            items
+        } else {
+            vec![SessionLineageEntry {
+                session_id: session_id.clone(),
+                iteration_index,
+                continuation_kind: None,
+                status: SessionStatus::Planning,
+                created_at,
+            }]
+        };
+
         let manifest = SessionManifest {
             id: session_id,
             task: config.task.clone(),
             repo_snapshot,
-            created_at: Utc::now(),
+            created_at,
             status: SessionStatus::Planning,
             ui_mode: config.ui_mode,
             workers_requested: config.workers,
@@ -52,6 +93,27 @@ impl SessionContext {
             verification_commands: config.verification_commands.clone(),
             config_path: config.config_path.clone(),
             preset: config.preset,
+            iteration_index,
+            root_session_id,
+            parent_session_id: config
+                .continuation
+                .as_ref()
+                .map(|item| item.parent_session_id.clone()),
+            continuation_kind: config.continuation.as_ref().map(|item| item.kind),
+            feedback_history: config
+                .continuation
+                .as_ref()
+                .map(|item| item.feedback_history.clone())
+                .unwrap_or_default(),
+            supersedes_session_id: config
+                .continuation
+                .as_ref()
+                .map(|item| item.parent_session_id.clone()),
+            baseline_artifacts: config
+                .continuation
+                .as_ref()
+                .map(|item| item.baseline_artifacts.clone())
+                .unwrap_or_default(),
             plan_todo: None,
             todo_states: Vec::new(),
             execution_graph: None,
@@ -68,6 +130,7 @@ impl SessionContext {
             artifact_index: Vec::new(),
             timeline_events: Vec::new(),
             demo_summary: Vec::new(),
+            lineage,
             timeline_path: session_dir.join("timeline.jsonl"),
             graph_path: session_dir.join("commander").join("execution-graph.json"),
             execution_contract_path: session_dir
@@ -99,6 +162,9 @@ impl SessionContext {
 
     pub fn set_status(&mut self, status: SessionStatus) -> Result<()> {
         self.manifest.status = status;
+        if let Some(last) = self.manifest.lineage.last_mut() {
+            last.status = status;
+        }
         self.persist()
     }
 
@@ -294,6 +360,28 @@ impl SessionContext {
         self.commander_dir().join("plan-todo.md")
     }
 
+    pub fn feedback_json_path(&self) -> PathBuf {
+        self.commander_dir().join("feedback.json")
+    }
+
+    pub fn feedback_markdown_path(&self) -> PathBuf {
+        self.commander_dir().join("feedback.md")
+    }
+
+    pub fn iteration_summary_path(&self) -> PathBuf {
+        self.commander_dir().join("iteration-summary.md")
+    }
+
+    pub fn lineage_path(&self) -> PathBuf {
+        self.commander_dir().join("session-lineage.json")
+    }
+
+    pub fn latest_pointer_path(&self) -> PathBuf {
+        self.sessions_root()
+            .join(self.manifest.root_session_id_ref())
+            .join("latest.md")
+    }
+
     pub fn set_reused_plan_session_id(&mut self, session_id: impl Into<String>) -> Result<()> {
         self.manifest.reused_plan_session_id = Some(session_id.into());
         self.persist()
@@ -362,6 +450,7 @@ impl SessionContext {
     }
 
     pub fn persist(&mut self) -> Result<()> {
+        self.sync_auxiliary_artifacts()?;
         self.refresh_indexes();
         fs::write(
             &self.manifest_path,
@@ -371,6 +460,7 @@ impl SessionContext {
     }
 
     pub fn persist_artifact_manifest(&mut self) -> Result<()> {
+        self.sync_auxiliary_artifacts()?;
         self.refresh_indexes();
         fs::write(
             &self.manifest.artifact_manifest_path,
@@ -418,6 +508,70 @@ impl SessionContext {
     fn refresh_indexes(&mut self) {
         self.manifest.artifact_index = build_artifact_index(&self.manifest);
     }
+
+    fn sessions_root(&self) -> PathBuf {
+        self.manifest
+            .session_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.manifest.session_dir.clone())
+    }
+
+    fn sync_auxiliary_artifacts(&mut self) -> Result<()> {
+        fs::create_dir_all(self.commander_dir()).with_context(|| {
+            format!(
+                "创建 commander 目录失败：{}",
+                self.commander_dir().display()
+            )
+        })?;
+
+        let lineage_path = self.lineage_path();
+        fs::write(
+            &lineage_path,
+            serde_json::to_vec_pretty(&self.manifest.lineage).context("序列化 lineage 失败")?,
+        )
+        .with_context(|| format!("写入 lineage 失败：{}", lineage_path.display()))?;
+        self.manifest.artifact_manifest.lineage_path = Some(lineage_path);
+
+        let iteration_summary_path = self.iteration_summary_path();
+        fs::write(
+            &iteration_summary_path,
+            render_iteration_summary_markdown(&self.manifest),
+        )
+        .with_context(|| format!("写入迭代摘要失败：{}", iteration_summary_path.display()))?;
+        self.manifest.artifact_manifest.iteration_summary_path = Some(iteration_summary_path);
+
+        let latest_pointer_path = self.latest_pointer_path();
+        fs::write(&latest_pointer_path, render_latest_pointer(&self.manifest))
+            .with_context(|| format!("写入 latest 指针失败：{}", latest_pointer_path.display()))?;
+        self.manifest.artifact_manifest.latest_pointer_path = Some(latest_pointer_path);
+
+        if !self.manifest.feedback_history.is_empty() {
+            let feedback_json_path = self.feedback_json_path();
+            fs::write(
+                &feedback_json_path,
+                serde_json::to_vec_pretty(&self.manifest.feedback_history)
+                    .context("序列化反馈记录失败")?,
+            )
+            .with_context(|| format!("写入反馈 JSON 失败：{}", feedback_json_path.display()))?;
+            self.manifest.artifact_manifest.feedback_json_path = Some(feedback_json_path);
+
+            let feedback_markdown_path = self.feedback_markdown_path();
+            fs::write(
+                &feedback_markdown_path,
+                render_feedback_markdown(&self.manifest.feedback_history),
+            )
+            .with_context(|| {
+                format!(
+                    "写入反馈 Markdown 失败：{}",
+                    feedback_markdown_path.display()
+                )
+            })?;
+            self.manifest.artifact_manifest.feedback_markdown_path = Some(feedback_markdown_path);
+        }
+
+        Ok(())
+    }
 }
 
 pub fn load_session(target_dir: &Path, session_id: Option<&str>) -> Result<SessionManifest> {
@@ -435,7 +589,8 @@ pub fn load_session(target_dir: &Path, session_id: Option<&str>) -> Result<Sessi
     let manifest_path = session_path.join("manifest.json");
     let content = fs::read_to_string(&manifest_path)
         .with_context(|| format!("读取 manifest 失败：{}", manifest_path.display()))?;
-    serde_json::from_str(&content).context("解析 manifest 失败")
+    let manifest = serde_json::from_str(&content).context("解析 manifest 失败")?;
+    Ok(normalize_loaded_manifest(manifest))
 }
 
 pub fn find_reusable_plan_session(
@@ -465,6 +620,7 @@ pub fn find_reusable_plan_session(
         let Ok(manifest) = serde_json::from_str::<SessionManifest>(&content) else {
             continue;
         };
+        let manifest = normalize_loaded_manifest(manifest);
         if is_reusable_plan_manifest(&manifest, task, workers, role_set) {
             return Ok(Some(manifest));
         }
@@ -503,6 +659,25 @@ fn latest_session_dir(sessions_root: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("没有可回放的 session"))
 }
 
+fn normalize_loaded_manifest(mut manifest: SessionManifest) -> SessionManifest {
+    if manifest.iteration_index == 0 {
+        manifest.iteration_index = 1;
+    }
+    if manifest.root_session_id.is_empty() {
+        manifest.root_session_id = manifest.id.clone();
+    }
+    if manifest.lineage.is_empty() {
+        manifest.lineage.push(SessionLineageEntry {
+            session_id: manifest.id.clone(),
+            iteration_index: manifest.iteration_index,
+            continuation_kind: manifest.continuation_kind,
+            status: manifest.status,
+            created_at: manifest.created_at,
+        });
+    }
+    manifest
+}
+
 fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -> String {
     let worker_lines = manifest
         .worker_results
@@ -533,6 +708,10 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
     let todo_states = render_todo_states(&summary.todo_states);
     let evidence_summary = render_bullets(&summary.evidence_summary);
     let demo_summary = render_bullets(&manifest.demo_summary);
+    let feedback_summary = render_bullets(&summary.feedback_summary);
+    let delta_summary = render_bullets(&summary.delta_summary);
+    let completed_this_iteration = render_bullets(&summary.completed_this_iteration);
+    let unaccepted_feedback = render_bullets(&summary.unaccepted_feedback);
     let review_findings = summary
         .review_report
         .as_ref()
@@ -554,6 +733,10 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
     format!(
         "# Session {}\n\n\
 ## 任务\n\n{}\n\n\
+## 迭代信息\n\n\
+- 当前轮次：V{}\n\
+- 根会话：`{}`\n\
+- 来源会话：{}\n\n\
 ## 总览\n\n{}\n\n\
 ## 决策状态\n\n\
 - 结果：{}\n\
@@ -571,13 +754,24 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
 ## 已验证能力\n\n{}\n\n\
 ## 因环境受阻\n\n{}\n\n\
 ## Todo 状态\n\n{}\n\n\
+## 本轮反馈\n\n{}\n\n\
+## 相对上一轮变化\n\n{}\n\n\
+## 本轮完成内容\n\n{}\n\n\
 ## 审阅关卡\n\n{}\n\n{}\n\n\
 ## 证据摘要\n\n{}\n\n\
 ## Demo 摘要\n\n{}\n\n\
 ## 未关闭风险\n\n{}\n\n\
+## 未采纳反馈\n\n{}\n\n\
 ## 下一步\n\n{}\n",
         manifest.id,
         manifest.task,
+        summary.iteration_index,
+        manifest.root_session_id_ref(),
+        summary
+            .based_on_session_id
+            .as_deref()
+            .map(|item| format!("`{item}`"))
+            .unwrap_or_else(|| "无".to_string()),
         summary.overview,
         summary.result_status.label(),
         summary
@@ -597,11 +791,15 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
         verified_capabilities,
         blocked_verifications,
         todo_states,
+        feedback_summary,
+        delta_summary,
+        completed_this_iteration,
         review_findings,
         review_scopes,
         evidence_summary,
         demo_summary,
         open_risks,
+        unaccepted_feedback,
         recommended_next_action,
     )
 }
@@ -627,15 +825,34 @@ fn render_plan_todo_markdown(plan_todo: &PlanTodo) -> String {
         .join("\n");
     let risks = render_bullets(&plan_todo.risks);
     let notes = render_bullets(&plan_todo.planning_notes);
+    let feedback_summary = render_bullets(&plan_todo.feedback_summary);
+    let delta_summary = render_bullets(&plan_todo.delta_summary);
 
     format!(
         "# 计划清单\n\n\
+## 迭代信息\n\n\
+- 当前轮次：V{}\n\
+- 来源会话：{}\n\n\
 ## 摘要\n\n{}\n\n\
 ## 推进策略\n\n{}\n\n\
+## 本轮反馈\n\n{}\n\n\
+## 相对上一轮变化\n\n{}\n\n\
 ## Todo\n\n{}\n\
 ## 风险\n\n{}\n\n\
 ## 规划备注\n\n{}\n",
-        plan_todo.summary, plan_todo.approach, todo_lines, risks, notes
+        plan_todo.iteration_index,
+        plan_todo
+            .source_session_id
+            .as_deref()
+            .map(|item| format!("`{item}`"))
+            .unwrap_or_else(|| "无".to_string()),
+        plan_todo.summary,
+        plan_todo.approach,
+        feedback_summary,
+        delta_summary,
+        todo_lines,
+        risks,
+        notes
     )
 }
 
@@ -696,6 +913,90 @@ fn render_todo_states(items: &[TodoStateRecord]) -> String {
         .join("\n")
 }
 
+fn render_feedback_markdown(items: &[crate::model::FeedbackRecord]) -> String {
+    let body = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            format!(
+                "## 反馈 {}\n\n- 作者：{}\n- 标题：{}\n- 意图摘要：{}\n- 原始反馈：{}\n- 默认假设：{}\n",
+                index + 1,
+                item.author,
+                item.title.clone().unwrap_or_else(|| "无".to_string()),
+                item.intent_summary,
+                item.raw_feedback,
+                if item.accepted_assumptions.is_empty() {
+                    "无".to_string()
+                } else {
+                    item.accepted_assumptions.join("；")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("# 反馈记录\n\n{body}\n")
+}
+
+fn render_iteration_summary_markdown(manifest: &SessionManifest) -> String {
+    let latest_feedback = manifest
+        .feedback_history
+        .last()
+        .map(|item| item.intent_summary.clone())
+        .unwrap_or_else(|| "无新增反馈".to_string());
+    let plan_delta = manifest
+        .plan_todo
+        .as_ref()
+        .map(|item| render_bullets(&item.delta_summary))
+        .unwrap_or_else(|| "- 无".to_string());
+    let summary_delta = manifest
+        .final_summary
+        .as_ref()
+        .map(|item| render_bullets(&item.delta_summary))
+        .unwrap_or_else(|| "- 无".to_string());
+    format!(
+        "# 迭代摘要\n\n\
+- 当前 session：`{}`\n\
+- 当前轮次：V{}\n\
+- 根会话：`{}`\n\
+- 来源会话：{}\n\
+- 延续类型：{}\n\
+- 最新反馈：{}\n\n\
+## 规划变化\n\n{}\n\n\
+## 执行变化\n\n{}\n",
+        manifest.id,
+        manifest.iteration_index_value(),
+        manifest.root_session_id_ref(),
+        manifest
+            .parent_session_id
+            .as_deref()
+            .map(|item| format!("`{item}`"))
+            .unwrap_or_else(|| "无".to_string()),
+        manifest
+            .continuation_kind
+            .map(|item| item.label().to_string())
+            .unwrap_or_else(|| "root".to_string()),
+        latest_feedback,
+        plan_delta,
+        summary_delta,
+    )
+}
+
+fn render_latest_pointer(manifest: &SessionManifest) -> String {
+    format!(
+        "# Latest Iteration\n\n\
+- root_session: `{}`\n\
+- latest_session: `{}`\n\
+- version: `V{}`\n\
+- status: {}\n\
+- continue: `codex-forge continue --session {} --feedback \"...\"`\n",
+        manifest.root_session_id_ref(),
+        manifest.id,
+        manifest.iteration_index_value(),
+        manifest.status.label(),
+        manifest.id
+    )
+}
+
 fn build_artifact_index(manifest: &SessionManifest) -> Vec<ArtifactIndexEntry> {
     let mut items = Vec::new();
     if let Some(path) = &manifest.artifact_manifest.plan_todo_path {
@@ -747,6 +1048,36 @@ fn build_artifact_index(manifest: &SessionManifest) -> Vec<ArtifactIndexEntry> {
     if let Some(path) = &manifest.artifact_manifest.change_trust_report_path {
         items.push(ArtifactIndexEntry {
             key: "change_trust_report".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.feedback_json_path {
+        items.push(ArtifactIndexEntry {
+            key: "feedback_json".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.feedback_markdown_path {
+        items.push(ArtifactIndexEntry {
+            key: "feedback_markdown".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.iteration_summary_path {
+        items.push(ArtifactIndexEntry {
+            key: "iteration_summary".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.lineage_path {
+        items.push(ArtifactIndexEntry {
+            key: "lineage".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.latest_pointer_path {
+        items.push(ArtifactIndexEntry {
+            key: "latest".to_string(),
             path: path.clone(),
         });
     }

@@ -18,6 +18,7 @@ pub enum Commands {
     Tui(TuiArgs),
     Run(RunArgs),
     Plan(PlanArgs),
+    Continue(ContinueArgs),
     Replay(ReplayArgs),
     Agents(AgentsArgs),
     Doctor(DoctorArgs),
@@ -91,6 +92,27 @@ pub struct PlanArgs {
     pub shared: SharedTaskArgs,
     #[arg(long, help = "使用指定配置文件做纯规划校验")]
     pub config_only: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ContinueArgs {
+    #[arg(long, help = "要继续迭代的 session id")]
+    pub session: String,
+    #[arg(long, help = "本轮新增的人类反馈；不传则沿用上一轮目标继续")]
+    pub feedback: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ContinueModeArg::Auto,
+        help = "继续模式：auto 会根据父 session 自动判断走 plan 还是 run"
+    )]
+    pub mode: ContinueModeArg,
+    #[arg(long, help = "给本轮反馈补一个短标题，方便回看")]
+    pub title: Option<String>,
+    #[arg(long, value_enum, default_value_t = UiModeArg::Rich, help = "终端展示模式")]
+    pub ui: UiModeArg,
+    #[arg(long, help = "目标仓库目录；不传则优先复用上次指定目录")]
+    pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -176,6 +198,13 @@ pub enum ApplyModeArg {
     AutoSafe,
     Bundle,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ContinueModeArg {
+    Auto,
+    Plan,
+    Run,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -18,8 +18,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, W
 use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{resolve_plan_config, resolve_run_config};
-use crate::cli::{ApplyModeArg, PlanArgs, RunArgs, SharedTaskArgs, ThinkingModeArg, UiModeArg};
+use crate::app::{resolve_continue_config, resolve_plan_config, resolve_run_config};
+use crate::cli::{
+    ApplyModeArg, ContinueArgs, ContinueModeArg, PlanArgs, RunArgs, SharedTaskArgs,
+    ThinkingModeArg, UiModeArg,
+};
 use crate::config::{LoadedProjectConfig, load_project_config};
 use crate::doctor::run_doctor;
 use crate::model::{
@@ -36,7 +39,7 @@ use crate::workspace::{remember_target_dir, resolve_target_dir};
 const MAX_LOG_LINES: usize = 240;
 const MAX_NOTICE_LINES: usize = 8;
 
-/// v5 终端产品主导航。保留固定 5 个页面，确保演示路径稳定可记忆。
+/// v6 终端产品主导航。保留固定 3 个页面，确保演示路径稳定可记忆。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Start,
@@ -65,6 +68,8 @@ enum FormField {
     TargetDir,
     ConfigPath,
     Task,
+    ContinueFeedback,
+    ContinueMode,
     ThinkingMode,
     RoleSet,
     Workers,
@@ -83,6 +88,8 @@ impl FormField {
             Self::TargetDir => "目标仓库",
             Self::ConfigPath => "配置文件",
             Self::Task => "任务描述",
+            Self::ContinueFeedback => "继续反馈",
+            Self::ContinueMode => "继续模式",
             Self::ThinkingMode => "任务强度",
             Self::RoleSet => "协作模板",
             Self::Workers => "并发 Worker",
@@ -104,6 +111,7 @@ enum ShellAction {
     Doctor,
     Plan,
     Run,
+    ContinueSelected,
     ReplaySelected,
 }
 
@@ -113,12 +121,17 @@ impl ShellAction {
             Self::Doctor => "检查环境",
             Self::Plan => "先看方案",
             Self::Run => "开始执行",
+            Self::ContinueSelected => "继续优化",
             Self::ReplaySelected => "回放过程",
         }
     }
 
     fn supports_stop(self) -> bool {
         matches!(self, Self::Run | Self::ReplaySelected)
+    }
+
+    fn requires_task(self) -> bool {
+        matches!(self, Self::Plan | Self::Run)
     }
 }
 
@@ -222,6 +235,8 @@ struct FormState {
     target_dir: String,
     config_path: String,
     task: String,
+    continue_feedback: String,
+    continue_mode: ContinueModeArg,
     thinking_mode: ThinkingMode,
     role_set: String,
     workers: String,
@@ -240,6 +255,8 @@ impl Default for FormState {
             target_dir: String::new(),
             config_path: String::new(),
             task: String::new(),
+            continue_feedback: String::new(),
+            continue_mode: ContinueModeArg::Auto,
             thinking_mode: ThinkingMode::Balanced,
             role_set: "default".to_string(),
             workers: "4".to_string(),
@@ -295,7 +312,7 @@ impl Drop for TerminalGuard {
 
 pub async fn run_app_shell(initial_target_dir: Option<PathBuf>) -> Result<()> {
     if !io::stdout().is_terminal() {
-        bail!("v5 主界面需要在交互式终端中运行");
+        bail!("v6 主界面需要在交互式终端中运行");
     }
 
     let initial_dir = if let Some(path) = initial_target_dir {
@@ -351,7 +368,7 @@ impl AppShell {
             history_index: 0,
             notices: vec![
                 "默认只需要两步：先写任务，再选择“先看方案”或“开始执行”。".to_string(),
-                "按 `a` 展开高级设置；旧的 CLI 参数和运行能力仍然保留兼容。".to_string(),
+                "历史页新增 `c`：可基于已完成 session 继续反馈和迭代。".to_string(),
             ],
             form,
             project,
@@ -415,7 +432,7 @@ impl AppShell {
             vec![
                 Line::from(vec![
                     Span::styled(
-                        "◢ CF V5 ◣",
+                        "◢ CF V6 ◣",
                         Style::default()
                             .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
@@ -439,7 +456,7 @@ impl AppShell {
             vec![
                 Line::from(vec![
                     Span::styled(
-                        "◢ CODEX-FORGE V5 ◣",
+                        "◢ CODEX-FORGE V6 ◣",
                         Style::default()
                             .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
@@ -643,8 +660,8 @@ impl AppShell {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("1) 按 `e` 写下你要完成的任务"),
-            Line::from("   编辑中：`Esc` 保存退出，`Ctrl+P` 直接先看方案，`Ctrl+R` 直接开始"),
+            Line::from("1) 先按 `e` 输入提示词，这是 plan / run 的前置条件"),
+            Line::from("   编辑中：`Esc` 保存退出，`Ctrl+P` 看方案，`Ctrl+R` 开始执行"),
             Line::from(format!("2) 按 `p` 先看方案：{}", plan_preview.summary)),
             Line::from(format!("3) 按 `r` 直接开始：{}", primary_preview.summary)),
             Line::from("4) 需要更细控制时，再按 `a` 展开高级设置"),
@@ -682,9 +699,9 @@ impl AppShell {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("默认只暴露最少决策：任务、任务强度、先方案/直接执行。"),
-            Line::from("其它并发、模板、落地策略默认自动处理。"),
-            Line::from("按 `a` 才展开高级设置；不展开也能直接运行。"),
+            Line::from("默认只保留三步：输入提示词、看方案、开始执行。"),
+            Line::from("没有提示词时，系统不会进入 plan / run。"),
+            Line::from("并发、模板、落地策略默认自动处理；按 `a` 才展开。"),
             Line::from("任务编辑时也能直接操作：`Esc` 保存，`Ctrl+P` 规划，`Ctrl+R` 执行。"),
             Line::from(""),
             Line::from(Span::styled(
@@ -840,7 +857,9 @@ impl AppShell {
             )));
             lines.push(Line::from("当前没有运行中的动作。"));
             lines.push(Line::from("可在任意页面直接按 `d` / `p` / `r` 启动。"));
-            lines.push(Line::from("历史页可按 `l` 回放已完成会话。"));
+            lines.push(Line::from(
+                "历史页可按 ←/→ 选择 continue mode，再按 `c` 继续优化当前会话。",
+            ));
             lines.push(Line::from(
                 "运行中可按 `s` 发送停止信号（开始执行 / 回放过程支持）。",
             ));
@@ -882,7 +901,7 @@ impl AppShell {
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("事件流").borders(Borders::ALL))
+            .block(Block::default().title("实时过程流").borders(Borders::ALL))
             .wrap(Wrap { trim: false })
     }
 
@@ -1002,9 +1021,34 @@ impl AppShell {
 
     fn history_right_widget(&self) -> Paragraph<'_> {
         let lines = if let Some(session) = &self.selected_session {
-            session_snapshot_lines(session)
+            let mut lines = session_snapshot_lines(session);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "继续迭代",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let continue_preview = self.command_preview_lines(ShellAction::ContinueSelected);
+            lines.push(Line::from(continue_preview.summary));
+            lines.push(Line::from(format!(
+                "模式：{}（←/→ 切换）",
+                continue_mode_user_label(self.form.continue_mode)
+            )));
+            lines.push(Line::from(format!(
+                "反馈：{}",
+                if self.form.continue_feedback.trim().is_empty() {
+                    "未填写；可直接按 `Enter` 继续，或按 `e` 补充反馈".to_string()
+                } else {
+                    truncate(&self.form.continue_feedback, 100)
+                }
+            )));
+            lines.push(Line::from(
+                "操作：←/→ 切换继续模式，`Enter`/`c` 继续，`e` 编辑反馈，`l` 回放过程。",
+            ));
+            lines
         } else {
-            vec![Line::from("按 Enter 打开选中的会话详情。")]
+            vec![Line::from("先选中一个会话，再按 `Enter` 继续或按 `l` 回放。")]
         };
         Paragraph::new(lines)
             .block(Block::default().title("历史结果详情").borders(Borders::ALL))
@@ -1015,14 +1059,22 @@ impl AppShell {
         let Some(edit) = &self.edit_state else {
             return;
         };
-        let header_height = if edit.field == FormField::Task { 4 } else { 3 };
+        let header_height = if matches!(edit.field, FormField::Task | FormField::ContinueFeedback) {
+            4
+        } else {
+            3
+        };
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(header_height), Constraint::Min(6)])
             .split(area);
 
-        let help = if edit.field == FormField::Task {
-            "任务描述支持多行输入；Enter 换行，Esc 保存退出，Ctrl+P 先看方案，Ctrl+R 直接执行。"
+        let help = if matches!(edit.field, FormField::Task | FormField::ContinueFeedback) {
+            if edit.field == FormField::Task {
+                "任务描述支持多行输入；Enter 换行，Esc 保存退出，Ctrl+P 先看方案，Ctrl+R 直接执行。"
+            } else {
+                "继续反馈支持多行输入；Enter 换行，Esc 保存退出，Ctrl+R 直接继续优化。"
+            }
         } else {
             "方向键移动，Backspace/Delete 删除，Enter 保存，Esc 取消。"
         };
@@ -1116,6 +1168,9 @@ impl AppShell {
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::Run).await?
             }
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_action(ShellAction::ContinueSelected).await?
+            }
             KeyCode::Char('l') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::ReplaySelected).await?
             }
@@ -1132,8 +1187,20 @@ impl AppShell {
             KeyCode::BackTab => self.cycle_run_subview(false),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
-            KeyCode::Left => self.cycle_current_field(false),
-            KeyCode::Right => self.cycle_current_field(true),
+            KeyCode::Left => {
+                if self.route == Route::History {
+                    self.form.continue_mode = cycle_continue_mode(self.form.continue_mode, false);
+                } else {
+                    self.cycle_current_field(false);
+                }
+            }
+            KeyCode::Right => {
+                if self.route == Route::History {
+                    self.form.continue_mode = cycle_continue_mode(self.form.continue_mode, true);
+                } else {
+                    self.cycle_current_field(true);
+                }
+            }
             KeyCode::Enter => match self.route {
                 Route::Start => {
                     if self.advanced_settings_open {
@@ -1147,7 +1214,7 @@ impl AppShell {
                         self.start_editing(FormField::Task);
                     }
                 }
-                Route::History => self.open_history_selection()?,
+                Route::History => self.start_action(ShellAction::ContinueSelected).await?,
                 _ => {}
             },
             KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1164,7 +1231,13 @@ impl AppShell {
                             self.start_editing(FormField::Task);
                         }
                     }
-                    Route::History => self.open_history_selection()?,
+                    Route::History => {
+                        if self.selected_session.is_some() {
+                            self.start_editing(FormField::ContinueFeedback);
+                        } else {
+                            self.open_history_selection()?;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1182,11 +1255,17 @@ impl AppShell {
             let Some(edit) = &mut self.edit_state else {
                 return Ok(());
             };
-            let multiline = edit.field == FormField::Task;
+            let multiline = matches!(edit.field, FormField::Task | FormField::ContinueFeedback);
             match key.code {
                 KeyCode::Esc if multiline => {
                     commit = true;
-                    notice = Some("任务已保存，可按 `p` 先看方案，或按 `r` 直接开始。");
+                    notice = Some(match edit.field {
+                        FormField::Task => "任务已保存，可按 `p` 先看方案，或按 `r` 直接开始。",
+                        FormField::ContinueFeedback => {
+                            "反馈已保存，可按 `Enter` 或 `c` 基于当前会话继续优化。"
+                        }
+                        _ => "内容已保存。",
+                    });
                 }
                 KeyCode::Esc => {
                     self.edit_state = None;
@@ -1224,7 +1303,10 @@ impl AppShell {
                     if multiline && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     commit = true;
-                    action_after_commit = Some(ShellAction::Run);
+                    action_after_commit = Some(match edit.field {
+                        FormField::ContinueFeedback => ShellAction::ContinueSelected,
+                        _ => ShellAction::Run,
+                    });
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     insert_char_at_cursor(edit, ch);
@@ -1272,6 +1354,9 @@ impl AppShell {
         }
 
         match advanced_fields()[self.selected_field] {
+            FormField::ContinueMode => {
+                self.form.continue_mode = cycle_continue_mode(self.form.continue_mode, forward);
+            }
             FormField::ThinkingMode => {
                 self.form.thinking_mode = cycle_thinking_mode(self.form.thinking_mode, forward);
             }
@@ -1349,6 +1434,13 @@ impl AppShell {
             return Ok(());
         }
 
+        if !self.ensure_task_ready(action) {
+            return Ok(());
+        }
+        if !self.ensure_continue_ready(action) {
+            return Ok(());
+        }
+
         let command_preview = self.command_preview_lines(action);
         let (tx, rx) = mpsc::unbounded_channel();
         // 只有 Run / Replay 接了真正的协作式停止链路；
@@ -1365,10 +1457,7 @@ impl AppShell {
         {
             self.runtime_state = Some(runtime_state);
         }
-        self.run_subview = match action {
-            ShellAction::ReplaySelected => RunSubview::Timeline,
-            _ => RunSubview::Dashboard,
-        };
+        self.run_subview = preferred_run_subview(action);
         spawn_embedded_action(
             action,
             self.project.target_dir.clone(),
@@ -1388,6 +1477,46 @@ impl AppShell {
         });
         self.navigate_to(Route::Run);
         Ok(())
+    }
+
+    fn ensure_task_ready(&mut self, action: ShellAction) -> bool {
+        if !action.requires_task() || !self.form.task.trim().is_empty() {
+            return true;
+        }
+
+        self.navigate_to(Route::Start);
+        self.advanced_settings_open = false;
+        self.start_editing(FormField::Task);
+        self.push_notice("请先输入提示词，再生成方案或开始执行。");
+        false
+    }
+
+    fn ensure_continue_ready(&mut self, action: ShellAction) -> bool {
+        if action != ShellAction::ContinueSelected {
+            return true;
+        }
+
+        if self.selected_session.is_none() {
+            self.navigate_to(Route::History);
+            self.push_notice("请先在历史页选中一个已完成 session，再继续优化。");
+            return false;
+        }
+        if !self
+            .selected_session
+            .as_ref()
+            .is_some_and(SessionManifest::continuable)
+        {
+            self.navigate_to(Route::History);
+            self.push_notice("当前 session 还不能继续迭代；请先选一个已完成会话。");
+            return false;
+        }
+        if self.form.continue_feedback.trim().is_empty() {
+            self.navigate_to(Route::History);
+            self.start_editing(FormField::ContinueFeedback);
+            self.push_notice("请先输入这轮反馈，再继续优化当前 session。");
+            return false;
+        }
+        true
     }
 
     fn poll_command_output(&mut self) -> Result<()> {
@@ -1440,7 +1569,10 @@ impl AppShell {
                 self.history_index = 0;
                 self.open_history_selection()?;
                 if matches!(state, CommandState::Succeeded)
-                    && matches!(action, ShellAction::Run | ShellAction::Plan)
+                    && matches!(
+                        action,
+                        ShellAction::Run | ShellAction::Plan | ShellAction::ContinueSelected
+                    )
                 {
                     self.navigate_to(Route::History);
                 } else {
@@ -1600,6 +1732,16 @@ impl AppShell {
                     truncate(&self.form.task.replace('\n', " ⏎ "), 72)
                 }
             }
+            FormField::ContinueFeedback => {
+                if self.form.continue_feedback.trim().is_empty() {
+                    "—".to_string()
+                } else {
+                    truncate(&self.form.continue_feedback.replace('\n', " ⏎ "), 72)
+                }
+            }
+            FormField::ContinueMode => {
+                continue_mode_user_label(self.form.continue_mode).to_string()
+            }
             FormField::ThinkingMode => format!(
                 "{} / {}",
                 thinking_mode_user_title(self.form.thinking_mode),
@@ -1626,6 +1768,7 @@ impl AppShell {
             FormField::TargetDir => self.form.target_dir.clone(),
             FormField::ConfigPath => self.form.config_path.clone(),
             FormField::Task => self.form.task.clone(),
+            FormField::ContinueFeedback => self.form.continue_feedback.clone(),
             FormField::Workers => self.form.workers.clone(),
             FormField::MaxRetries => self.form.max_retries.clone(),
             FormField::Model => self.form.model.clone(),
@@ -1648,6 +1791,9 @@ impl AppShell {
             FormField::TargetDir => self.form.target_dir = edit.buffer.trim().to_string(),
             FormField::ConfigPath => self.form.config_path = edit.buffer.trim().to_string(),
             FormField::Task => self.form.task = edit.buffer.trim().to_string(),
+            FormField::ContinueFeedback => {
+                self.form.continue_feedback = edit.buffer.trim().to_string()
+            }
             FormField::Workers => self.form.workers = edit.buffer.trim().to_string(),
             FormField::MaxRetries => self.form.max_retries = edit.buffer.trim().to_string(),
             FormField::Model => self.form.model = edit.buffer.trim().to_string(),
@@ -1733,6 +1879,21 @@ fn build_command_preview(
                 args.push(form.resume_session_id.trim().to_string());
             }
         }
+        ShellAction::ContinueSelected => {
+            args.push("continue".to_string());
+            if let Some(session) = selected_session {
+                args.push("--session".to_string());
+                args.push(session.id.clone());
+            }
+            args.push("--feedback".to_string());
+            args.push(form.continue_feedback.clone());
+            args.push("--mode".to_string());
+            args.push(continue_mode_arg_value(form.continue_mode).to_string());
+            args.push("--target-dir".to_string());
+            args.push(target_dir.display().to_string());
+            args.push("--ui".to_string());
+            args.push("minimal".to_string());
+        }
         ShellAction::ReplaySelected => {
             args.push("replay".to_string());
             if let Some(session) = selected_session {
@@ -1771,6 +1932,9 @@ fn prepare_runtime_state(
     match action {
         ShellAction::Doctor => None,
         ShellAction::Plan | ShellAction::Run => Some(RuntimeViewState::new("准备中", &form.task)),
+        ShellAction::ContinueSelected => {
+            selected_session.map(|session| RuntimeViewState::new(&session.id, &session.task))
+        }
         ShellAction::ReplaySelected => {
             selected_session.map(|session| RuntimeViewState::new(&session.id, &session.task))
         }
@@ -1801,6 +1965,10 @@ fn spawn_embedded_action(
             ShellAction::Doctor => run_doctor_embedded(&target_dir, &form, tx.clone()).await,
             ShellAction::Plan => run_plan_embedded(&target_dir, &form, tx.clone()).await,
             ShellAction::Run => run_run_embedded(&target_dir, &form, tx.clone(), stop_rx).await,
+            ShellAction::ContinueSelected => {
+                run_continue_embedded(&target_dir, &form, selected_session, tx.clone(), stop_rx)
+                    .await
+            }
             ShellAction::ReplaySelected => {
                 let session_id = selected_session.as_ref().map(|session| session.id.as_str());
                 replay_session_embedded(&target_dir, session_id, runtime_tx(&tx), stop_rx)
@@ -1897,6 +2065,35 @@ async fn run_run_embedded(
     ))
 }
 
+async fn run_continue_embedded(
+    target_dir: &Path,
+    form: &FormState,
+    selected_session: Option<SessionManifest>,
+    tx: mpsc::UnboundedSender<RunnerEvent>,
+    stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<(CommandState, Option<SessionManifest>)> {
+    let args = build_continue_args(target_dir, form, selected_session.as_ref())?;
+    let (config, roles) = resolve_continue_config(args)?;
+    if matches!(
+        config.continuation.as_ref().map(|item| item.kind),
+        Some(crate::model::ContinuationKind::PlanRefine)
+    ) {
+        let manifest = plan_session_embedded(config, roles, runtime_tx(&tx)).await?;
+        Ok((CommandState::Succeeded, Some(manifest)))
+    } else {
+        let EmbeddedRunOutcome { manifest, stopped } =
+            run_session_embedded(config, roles, runtime_tx(&tx), stop_rx).await?;
+        Ok((
+            if stopped {
+                CommandState::Stopped
+            } else {
+                CommandState::Succeeded
+            },
+            Some(manifest),
+        ))
+    }
+}
+
 fn build_plan_args(target_dir: &Path, form: &FormState) -> PlanArgs {
     PlanArgs {
         shared: SharedTaskArgs {
@@ -1946,6 +2143,22 @@ fn build_run_args(target_dir: &Path, form: &FormState) -> RunArgs {
         fail_fast: form.fail_fast,
         cleanup_success: form.cleanup_success,
     }
+}
+
+fn build_continue_args(
+    target_dir: &Path,
+    form: &FormState,
+    selected_session: Option<&SessionManifest>,
+) -> Result<ContinueArgs> {
+    let session = selected_session.context("history continue 需要先选中一个 session")?;
+    Ok(ContinueArgs {
+        session: session.id.clone(),
+        feedback: empty_as_none(&form.continue_feedback),
+        mode: form.continue_mode,
+        title: None,
+        ui: UiModeArg::Minimal,
+        target_dir: Some(target_dir.to_path_buf()),
+    })
 }
 
 fn parse_usize(value: &str) -> Option<usize> {
@@ -2116,21 +2329,59 @@ fn build_action_summary(
 ) -> String {
     match action {
         ShellAction::Doctor => "检查当前仓库的环境、配置和验证条件".to_string(),
-        ShellAction::Plan => format!(
-            "先把“{}”拆成方案和待办清单，再决定怎么执行",
-            summarize_task(&form.task)
-        ),
-        ShellAction::Run => format!(
-            "直接开始处理“{}”，默认使用 {}",
-            summarize_task(&form.task),
-            advanced_settings_summary(form)
-        ),
+        ShellAction::Plan => {
+            if form.task.trim().is_empty() {
+                "请先输入提示词，然后再生成方案和待办清单".to_string()
+            } else {
+                format!(
+                    "先把“{}”拆成方案和待办清单，再决定怎么执行",
+                    summarize_task(&form.task)
+                )
+            }
+        }
+        ShellAction::Run => {
+            if form.task.trim().is_empty() {
+                "请先输入提示词，然后再开始执行".to_string()
+            } else {
+                format!(
+                    "直接开始处理“{}”，默认使用 {}",
+                    summarize_task(&form.task),
+                    advanced_settings_summary(form)
+                )
+            }
+        }
+        ShellAction::ContinueSelected => {
+            if selected_session.is_none() {
+                "请先在历史页选中一个已完成 session，再继续优化".to_string()
+            } else if form.continue_feedback.trim().is_empty() {
+                "请先填写这轮反馈，然后基于当前 session 继续优化".to_string()
+            } else {
+                format!(
+                    "基于 {} 继续优化（{}）：{}",
+                    selected_session
+                        .map(|session| truncate(&session.id, 18))
+                        .unwrap_or_else(|| "当前会话".to_string()),
+                    continue_mode_user_title(form.continue_mode),
+                    truncate(&form.continue_feedback, 40)
+                )
+            }
+        }
         ShellAction::ReplaySelected => format!(
             "回看 {} 的关键过程和结果",
             selected_session
                 .map(|session| truncate(&session.id, 18))
                 .unwrap_or_else(|| "最近一次会话".to_string())
         ),
+    }
+}
+
+fn preferred_run_subview(action: ShellAction) -> RunSubview {
+    match action {
+        ShellAction::Plan
+        | ShellAction::Run
+        | ShellAction::ContinueSelected
+        | ShellAction::ReplaySelected => RunSubview::Timeline,
+        ShellAction::Doctor => RunSubview::Dashboard,
     }
 }
 
@@ -2200,10 +2451,35 @@ fn apply_mode_user_label(mode: ApplyMode) -> &'static str {
     }
 }
 
+fn continue_mode_user_title(mode: ContinueModeArg) -> &'static str {
+    match mode {
+        ContinueModeArg::Auto => "自动判断",
+        ContinueModeArg::Plan => "只重做方案",
+        ContinueModeArg::Run => "直接执行",
+    }
+}
+
+fn continue_mode_user_label(mode: ContinueModeArg) -> &'static str {
+    match mode {
+        ContinueModeArg::Auto => "自动判断（auto）",
+        ContinueModeArg::Plan => "只重做方案（plan）",
+        ContinueModeArg::Run => "直接执行（run）",
+    }
+}
+
+fn continue_mode_arg_value(mode: ContinueModeArg) -> &'static str {
+    match mode {
+        ContinueModeArg::Auto => "auto",
+        ContinueModeArg::Plan => "plan",
+        ContinueModeArg::Run => "run",
+    }
+}
+
 fn advanced_fields() -> &'static [FormField] {
     &[
         FormField::TargetDir,
         FormField::ConfigPath,
+        FormField::ContinueMode,
         FormField::ThinkingMode,
         FormField::RoleSet,
         FormField::Workers,
@@ -2246,6 +2522,7 @@ fn field_is_editable(field: FormField) -> bool {
         FormField::TargetDir
             | FormField::ConfigPath
             | FormField::Task
+            | FormField::ContinueFeedback
             | FormField::Workers
             | FormField::MaxRetries
             | FormField::Model
@@ -2260,6 +2537,16 @@ fn cycle_thinking_mode(current: ThinkingMode, forward: bool) -> ThinkingMode {
         ThinkingMode::HardThink,
     ];
     let index = modes.iter().position(|item| *item == current).unwrap_or(1);
+    modes[cycle_index(index, modes.len(), forward)]
+}
+
+fn cycle_continue_mode(current: ContinueModeArg, forward: bool) -> ContinueModeArg {
+    let modes = [
+        ContinueModeArg::Auto,
+        ContinueModeArg::Plan,
+        ContinueModeArg::Run,
+    ];
+    let index = modes.iter().position(|item| *item == current).unwrap_or(0);
     modes[cycle_index(index, modes.len(), forward)]
 }
 
@@ -2309,9 +2596,9 @@ fn contextual_help_lines(
             run_subview.label()
         ))],
         Route::History => vec![Line::from(if compact {
-            "历史页：↑↓ 预览，Enter 打开，Esc 返回上一级。"
+            "历史页：↑↓ 预览，←→ 切模式，c 继续，Esc 返回上一级。"
         } else {
-            "历史页：↑↓ 预览会话，Enter 打开结果详情，`l` 回放当前项，`Esc` 返回上一级。"
+            "历史页：↑↓ 预览会话，←→ 切继续模式，`c` 继续优化当前项，`l` 回放当前项，`Esc` 返回上一级。"
         })],
     }
 }
@@ -2618,6 +2905,7 @@ fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(format!("会话：{}", session.id)),
         Line::from(format!("任务：{}", truncate(&session.task, 100))),
+        Line::from(format!("版本：V{}", session.iteration_index_value())),
         Line::from(format!("状态：{}", session.status.label())),
         Line::from(format!(
             "创建时间：{}",
@@ -2632,7 +2920,15 @@ fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
             "结果落地：{}",
             apply_mode_user_label(session.apply_mode)
         )),
+        Line::from(format!(
+            "可继续反馈：{}",
+            if session.continuable() { "是" } else { "否" }
+        )),
     ];
+
+    if let Some(parent) = &session.parent_session_id {
+        lines.push(Line::from(format!("来源会话：{}", truncate(parent, 32))));
+    }
 
     if let Some(summary) = &session.final_summary {
         lines.push(Line::from(""));
@@ -2664,6 +2960,12 @@ fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
                 truncate(&summary.open_risks.join("；"), 100)
             }
         )));
+        if !summary.feedback_summary.is_empty() {
+            lines.push(Line::from(format!(
+                "本轮反馈：{}",
+                truncate(&summary.feedback_summary.join("；"), 100)
+            )));
+        }
     } else if let Some(report) = &session.doctor_report {
         lines.push(Line::from(""));
         lines.push(Line::from(format!(
@@ -2680,11 +2982,17 @@ fn session_snapshot_lines(session: &SessionManifest) -> Vec<Line<'static>> {
 mod tests {
     use super::{
         ActiveCommand, AppShell, CommandState, FormField, FormState, ProjectContext, Route,
-        RunSubview, ShellAction, build_command_preview, contextual_help_lines, history_back_route,
-        next_history_return_route, next_run_return_route, prepare_runtime_state, route_titles,
-        run_back_route, run_subview_titles, split_main_sections, wrapped_cursor_row_col,
+        RunSubview, ShellAction, build_command_preview, build_continue_args, contextual_help_lines,
+        history_back_route, next_history_return_route, next_run_return_route,
+        preferred_run_subview, prepare_runtime_state, route_titles, run_back_route,
+        run_subview_titles, split_main_sections, wrapped_cursor_row_col,
     };
-    use crate::model::{ApplyMode, SessionPreset, ThinkingMode};
+    use crate::cli::ContinueModeArg;
+    use crate::model::{
+        ApplyMode, ArtifactManifest, BaselineArtifacts, RepoSnapshot, SessionManifest,
+        SessionPreset, SessionStatus, ThinkingMode, UiMode,
+    };
+    use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
     use std::path::{Path, PathBuf};
@@ -2755,12 +3063,84 @@ mod tests {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
 
+    fn sample_session(id: &str) -> SessionManifest {
+        let session_dir = PathBuf::from(format!("/tmp/{id}"));
+        SessionManifest {
+            id: id.to_string(),
+            task: "继续优化博客".to_string(),
+            repo_snapshot: RepoSnapshot {
+                repo_root: PathBuf::from("/tmp/demo"),
+                display_name: "demo".to_string(),
+                top_level_entries: vec!["src".to_string()],
+                detected_stacks: vec!["Rust".to_string()],
+                readme_excerpt: None,
+            },
+            created_at: Utc::now(),
+            status: SessionStatus::Completed,
+            ui_mode: UiMode::Minimal,
+            workers_requested: 3,
+            role_set: "default".to_string(),
+            model: None,
+            thinking_mode: ThinkingMode::Balanced,
+            cleanup_success: false,
+            apply_mode: ApplyMode::AutoSafe,
+            max_retries: 2,
+            fail_fast: false,
+            verification_commands: Vec::new(),
+            config_path: None,
+            preset: None,
+            iteration_index: 1,
+            root_session_id: id.to_string(),
+            parent_session_id: None,
+            continuation_kind: None,
+            feedback_history: Vec::new(),
+            supersedes_session_id: None,
+            baseline_artifacts: BaselineArtifacts::default(),
+            plan_todo: None,
+            todo_states: Vec::new(),
+            execution_graph: None,
+            execution_contract: None,
+            worker_results: Vec::new(),
+            artifact_manifest: ArtifactManifest::default(),
+            apply_result: None,
+            verification_report: None,
+            change_trust_report: None,
+            doctor_report: None,
+            final_summary: None,
+            reused_plan_session_id: None,
+            resumed_from_session_id: None,
+            artifact_index: Vec::new(),
+            timeline_events: Vec::new(),
+            demo_summary: Vec::new(),
+            lineage: Vec::new(),
+            session_dir: session_dir.clone(),
+            timeline_path: session_dir.join("timeline.jsonl"),
+            graph_path: session_dir.join("commander").join("execution-graph.json"),
+            execution_contract_path: session_dir
+                .join("commander")
+                .join("execution-contract.json"),
+            summary_json_path: session_dir.join("summary.json"),
+            summary_markdown_path: session_dir.join("summary.md"),
+            artifact_manifest_path: session_dir.join("artifact-manifest.json"),
+            apply_plan_path: session_dir.join("integration").join("apply-plan.json"),
+            apply_result_path: session_dir.join("integration").join("apply-result.json"),
+            verification_report_path: session_dir
+                .join("integration")
+                .join("verification-report.json"),
+            change_trust_report_path: session_dir
+                .join("integration")
+                .join("change-trust-report.json"),
+        }
+    }
+
     #[test]
     fn builds_run_command_from_form() {
         let form = FormState {
             target_dir: "/tmp/demo".to_string(),
             config_path: String::new(),
             task: "实现 v5".to_string(),
+            continue_feedback: String::new(),
+            continue_mode: ContinueModeArg::Auto,
             thinking_mode: ThinkingMode::HardThink,
             role_set: "default".to_string(),
             workers: "4".to_string(),
@@ -2786,6 +3166,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_task_preview_requires_prompt_first() {
+        let form = FormState::default();
+
+        let plan_preview =
+            build_command_preview(Path::new("/tmp/demo"), &form, ShellAction::Plan, None);
+        let run_preview =
+            build_command_preview(Path::new("/tmp/demo"), &form, ShellAction::Run, None);
+
+        assert!(plan_preview.summary.contains("先输入提示词"));
+        assert!(run_preview.summary.contains("先输入提示词"));
+    }
+
+    #[test]
     fn builds_replay_command_with_timeline() {
         let form = FormState {
             task: "x".to_string(),
@@ -2799,6 +3192,46 @@ mod tests {
         );
         assert!(preview.args.contains(&"replay".to_string()));
         assert!(preview.args.contains(&"--timeline".to_string()));
+    }
+
+    #[test]
+    fn builds_continue_command_from_selected_session() {
+        let form = FormState {
+            continue_feedback: "把验证说明写得更清楚".to_string(),
+            continue_mode: ContinueModeArg::Plan,
+            ..FormState::default()
+        };
+        let session = sample_session("session-1");
+        let preview = build_command_preview(
+            Path::new("/tmp/demo"),
+            &form,
+            ShellAction::ContinueSelected,
+            Some(&session),
+        );
+        assert!(preview.args.contains(&"continue".to_string()));
+        assert!(preview.args.contains(&"--session".to_string()));
+        assert!(preview.args.contains(&"session-1".to_string()));
+        assert!(preview.args.contains(&"--feedback".to_string()));
+        assert!(preview.args.contains(&"把验证说明写得更清楚".to_string()));
+        assert!(preview.args.contains(&"--mode".to_string()));
+        assert!(preview.args.contains(&"plan".to_string()));
+        assert!(preview.summary.contains("继续优化"));
+    }
+
+    #[test]
+    fn build_continue_args_uses_selected_continue_mode() {
+        let form = FormState {
+            continue_feedback: "补上执行验证".to_string(),
+            continue_mode: ContinueModeArg::Run,
+            ..FormState::default()
+        };
+        let session = sample_session("session-2");
+
+        let args = build_continue_args(Path::new("/tmp/demo"), &form, Some(&session)).unwrap();
+
+        assert_eq!(args.mode, ContinueModeArg::Run);
+        assert_eq!(args.session, "session-2");
+        assert_eq!(args.feedback, Some("补上执行验证".to_string()));
     }
 
     #[test]
@@ -3080,7 +3513,7 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("Esc 返回上一级"));
-        assert!(text.contains("历史页可按 `l` 回放已完成会话"));
+        assert!(text.contains("历史页可按 ←/→ 选择 continue mode"));
     }
 
     #[test]
@@ -3108,6 +3541,30 @@ mod tests {
     }
 
     #[test]
+    fn preferred_run_subview_defaults_to_timeline_for_process_actions() {
+        assert_eq!(
+            preferred_run_subview(ShellAction::Doctor),
+            RunSubview::Dashboard
+        );
+        assert_eq!(
+            preferred_run_subview(ShellAction::Plan),
+            RunSubview::Timeline
+        );
+        assert_eq!(
+            preferred_run_subview(ShellAction::Run),
+            RunSubview::Timeline
+        );
+        assert_eq!(
+            preferred_run_subview(ShellAction::ContinueSelected),
+            RunSubview::Timeline
+        );
+        assert_eq!(
+            preferred_run_subview(ShellAction::ReplaySelected),
+            RunSubview::Timeline
+        );
+    }
+
+    #[test]
     fn prepare_runtime_state_matches_action_kind() {
         let form = FormState {
             task: "实现审计".to_string(),
@@ -3117,6 +3574,14 @@ mod tests {
         assert!(prepare_runtime_state(ShellAction::Doctor, &form, None).is_none());
         assert!(prepare_runtime_state(ShellAction::Plan, &form, None).is_some());
         assert!(prepare_runtime_state(ShellAction::Run, &form, None).is_some());
+        assert!(
+            prepare_runtime_state(
+                ShellAction::ContinueSelected,
+                &form,
+                Some(&sample_session("session-1"))
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -3247,5 +3712,60 @@ mod tests {
 
         assert_eq!(shell.route, Route::Start);
         assert!(shell.active_command.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_without_task_reopens_task_editor_instead_of_starting() {
+        let mut shell = test_shell();
+
+        shell.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+
+        assert_eq!(shell.route, Route::Start);
+        assert!(shell.active_command.is_none());
+        assert!(matches!(
+            shell.edit_state.as_ref().map(|edit| edit.field),
+            Some(FormField::Task)
+        ));
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("请先输入提示词"))
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_without_feedback_reopens_feedback_editor() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        shell.selected_session = Some(sample_session("session-1"));
+
+        shell.handle_key(key(KeyCode::Char('c'))).await.unwrap();
+
+        assert_eq!(shell.route, Route::History);
+        assert!(shell.active_command.is_none());
+        assert!(matches!(
+            shell.edit_state.as_ref().map(|edit| edit.field),
+            Some(FormField::ContinueFeedback)
+        ));
+        assert!(
+            shell
+                .notices
+                .last()
+                .is_some_and(|message| message.contains("请先输入这轮反馈"))
+        );
+    }
+
+    #[tokio::test]
+    async fn history_left_right_cycles_continue_mode() {
+        let mut shell = test_shell();
+        shell.route = Route::History;
+        assert_eq!(shell.form.continue_mode, ContinueModeArg::Auto);
+
+        shell.handle_key(key(KeyCode::Right)).await.unwrap();
+        assert_eq!(shell.form.continue_mode, ContinueModeArg::Plan);
+
+        shell.handle_key(key(KeyCode::Left)).await.unwrap();
+        assert_eq!(shell.form.continue_mode, ContinueModeArg::Auto);
     }
 }

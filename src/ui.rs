@@ -29,7 +29,7 @@ pub struct WorkerView {
 }
 
 /// 运行态共享视图模型。
-/// 旧 CLI Rich UI 和 v5 AppShell 都复用这份状态，避免出现两套运行态解释逻辑。
+/// 旧 CLI Rich UI 和 v6 AppShell 都复用这份状态，避免出现两套运行态解释逻辑。
 #[derive(Debug, Clone)]
 pub struct RuntimeViewState {
     pub session_id: String,
@@ -133,6 +133,9 @@ impl RuntimeViewState {
             } => {
                 if let Some(worker) = self.workers.get_mut(agent_id) {
                     worker.last_event = format!("{kind}: {}", truncate(message, 72));
+                }
+                if let Some(note) = summarize_worker_update(kind, message) {
+                    push_note(&mut self.commander_notes, &format!("{agent_id} / {note}"));
                 }
             }
             RuntimeEvent::HandoffReady {
@@ -267,7 +270,7 @@ pub fn render_runtime_dashboard(
         return;
     }
 
-    // 这个布局是 v5 执行页主视图，也是旧 Rich UI 的基础信息源：
+    // 这个布局是 v6 执行页主视图，也是旧 Rich UI 的基础信息源：
     // 顶部总览 / 中间 worker+todo / 下方 commander notes / 底部状态面板。
     let sections = Layout::default()
         .direction(Direction::Vertical)
@@ -298,7 +301,7 @@ pub fn render_runtime_dashboard(
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
-                "◢ CODEX-FORGE V5 ◣",
+                "◢ CODEX-FORGE V6 ◣",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -536,7 +539,7 @@ fn render_runtime_dashboard_compact(
         vec![
             Line::from(vec![
                 Span::styled(
-                    "◢ CF V5 ◣",
+                    "◢ CF V6 ◣",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -560,7 +563,7 @@ fn render_runtime_dashboard_compact(
         vec![
             Line::from(vec![
                 Span::styled(
-                    "◢ CODEX-FORGE V5 ◣",
+                    "◢ CODEX-FORGE V6 ◣",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -813,7 +816,7 @@ pub fn describe_runtime_event(event: &RuntimeEvent) -> String {
             agent_id,
             kind,
             message,
-        } => format!("{agent_id} [{kind}] {}", truncate(message, 96)),
+        } => format!("{agent_id} [{kind}] {message}"),
         RuntimeEvent::HandoffReady {
             agent_id,
             handoff_path,
@@ -997,6 +1000,33 @@ fn push_note(notes: &mut Vec<String>, note: &str) {
     }
 }
 
+fn summarize_worker_update(kind: &str, message: &str) -> Option<String> {
+    if message.trim().is_empty() {
+        return None;
+    }
+    if matches!(kind, "raw" | "stderr:raw" | "stdout:raw" | "empty") {
+        return None;
+    }
+    if kind.starts_with("stderr:") {
+        return Some(format!("stderr：{}", truncate(message, 56)));
+    }
+    if matches!(
+        kind,
+        "item.started"
+            | "item.completed"
+            | "item.updated"
+            | "turn.started"
+            | "turn.completed"
+            | "thread.started"
+    ) {
+        return Some(truncate(message, 56));
+    }
+    if kind.contains("error") || kind == "retry" {
+        return Some(format!("{kind} / {}", truncate(message, 56)));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RuntimeViewState, planning_activity_lines};
@@ -1029,5 +1059,30 @@ mod tests {
         assert!(rendered.contains("规划清单已生成"));
         assert!(rendered.contains("todo-1"));
         assert!(rendered.contains("计划清单已生成，共 2 项 todo。"));
+    }
+
+    #[test]
+    fn worker_updates_surface_into_planning_notes() {
+        let mut state = RuntimeViewState::new("session-2", "继续优化");
+        state.apply(&RuntimeEvent::WorkerDispatched {
+            agent_id: "implementer-1".to_string(),
+            role: "implementer".to_string(),
+            title: "实现交互".to_string(),
+            worktree_path: "/tmp/demo".into(),
+        });
+        state.apply(&RuntimeEvent::WorkerUpdate {
+            agent_id: "implementer-1".to_string(),
+            kind: "item.completed".to_string(),
+            message: "命令完成：cargo test -q / 退出码 0 / ok".to_string(),
+        });
+
+        let rendered = planning_activity_lines(&state, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("implementer-1"));
+        assert!(rendered.contains("命令完成"));
     }
 }

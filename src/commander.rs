@@ -219,7 +219,7 @@ pub async fn build_plan_todo(
     {
         Ok(raw) => match serde_json::from_str::<PlanTodoOutput>(&raw) {
             Ok(output) => match normalize_plan_todo(output) {
-                Ok(plan_todo) => Ok(plan_todo),
+                Ok(plan_todo) => Ok(enrich_plan_todo(config, plan_todo)),
                 Err(error) => {
                     notes.push(format!(
                         "Codex todo 计划结果不可用，改走内置回退：{}",
@@ -318,9 +318,10 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
         .readme_excerpt
         .clone()
         .unwrap_or_else(|| "无 README 摘要".to_string());
+    let continuation_block = render_continuation_prompt_block(config);
 
     format!(
-        "你现在是 codex-forge V4 的 planner，需要先输出一份**面向用户可读**的计划 TODO 清单。\n\
+        "你现在是 codex-forge V6 的 iterative planner，需要先输出一份**面向用户可读**的计划 TODO 清单。\n\
 请只输出符合 schema 的 JSON，不要输出 Markdown，也不要输出执行角色。\n\n\
 全局任务：{}\n\
 思考强度：{}（{}）\n\
@@ -329,11 +330,13 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
 仓库摘要：\n\
 - 顶层目录：{}\n\
 - README 摘要：\n{}\n\n\
+{}\
 规划要求：\n\
 - todo 必须直接对应用户要推进的工作，而不是角色名。\n\
 - 优先给出 3 到 6 个可执行步骤，顺序清晰，避免空话。\n\
 - 每个 todo 需要写清目标、细节、依赖和完成标准。\n\
 - 风险要简洁，优先列真正会阻塞执行的点。\n\
+- 如果这是延续迭代，要优先吸收上一轮反馈，输出更适合当前轮次的最小调整方案。\n\
 - 保持最小可执行规划，不要过度设计。\n",
         config.task,
         config.thinking_mode.title(),
@@ -346,6 +349,7 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
         },
         repo.top_level_entries.join("、"),
         readme,
+        continuation_block,
     )
 }
 
@@ -397,8 +401,9 @@ fn build_planner_prompt(
         })
         .unwrap_or_default();
 
+    let continuation_block = render_continuation_prompt_block(config);
     format!(
-        "你现在是 codex-forge V4 的 commander agent，需要为多个 Codex worker 规划显式执行图。\n\
+        "你现在是 codex-forge V6 的 commander agent，需要为多个 Codex worker 规划显式执行图。\n\
 请只输出符合 schema 的 JSON，不要输出 Markdown。\n\n\
 全局任务：{}\n\
 思考强度：{}（{}）\n\
@@ -412,6 +417,7 @@ fn build_planner_prompt(
 仓库摘要：\n\
 - 顶层目录：{}\n\
 - README 摘要：\n{}\n\n\
+{}\
 {}\
 规划要求：\n\
 - 输出 1 到 {} 个节点。\n\
@@ -438,8 +444,41 @@ fn build_planner_prompt(
         roles_text,
         repo.top_level_entries.join("、"),
         readme,
+        continuation_block,
         todo_context,
         config.workers,
+    )
+}
+
+fn render_continuation_prompt_block(config: &SessionConfig) -> String {
+    let Some(continuation) = &config.continuation else {
+        return String::new();
+    };
+    let latest_feedback = continuation.latest_feedback_summary();
+    let previous_summary = continuation
+        .parent_summary_overview
+        .clone()
+        .or_else(|| continuation.parent_plan_summary.clone())
+        .unwrap_or_else(|| "无".to_string());
+    let next_actions = if continuation.parent_recommended_next_action.is_empty() {
+        "无".to_string()
+    } else {
+        continuation.parent_recommended_next_action.join("；")
+    };
+    format!(
+        "延续迭代上下文：\n\
+- 当前轮次：V{}\n\
+- 来源会话：{}\n\
+- 延续类型：{}\n\
+- 上一轮摘要：{}\n\
+- 人类最新反馈：{}\n\
+- 上一轮建议下一步：{}\n\n",
+        continuation.iteration_index,
+        continuation.parent_session_id,
+        continuation.kind.label(),
+        previous_summary,
+        latest_feedback,
+        next_actions
     )
 }
 
@@ -798,7 +837,39 @@ fn normalize_plan_todo(output: PlanTodoOutput) -> Result<PlanTodo> {
         risks: output.risks,
         used_fallback: false,
         planning_notes: Vec::new(),
+        iteration_index: 1,
+        source_session_id: None,
+        feedback_summary: Vec::new(),
+        delta_summary: Vec::new(),
     })
+}
+
+fn enrich_plan_todo(config: &SessionConfig, mut plan_todo: PlanTodo) -> PlanTodo {
+    plan_todo.iteration_index = config
+        .continuation
+        .as_ref()
+        .map(|item| item.iteration_index.max(1))
+        .unwrap_or(1);
+    plan_todo.source_session_id = config
+        .continuation
+        .as_ref()
+        .map(|item| item.parent_session_id.clone());
+    if let Some(continuation) = &config.continuation {
+        let latest_feedback = continuation.latest_feedback_summary();
+        plan_todo.feedback_summary = vec![latest_feedback.clone()];
+        plan_todo.delta_summary = vec![
+            format!(
+                "基于 session `{}` 进入 V{} 迭代。",
+                continuation.parent_session_id, continuation.iteration_index
+            ),
+            format!("本轮优先吸收的人类反馈：{latest_feedback}"),
+        ];
+        plan_todo.planning_notes.push(
+            "这是一次 continuation 规划；需要优先保留已验证基线，只在反馈影响范围内调整。"
+                .to_string(),
+        );
+    }
+    plan_todo
 }
 
 fn fallback_plan(
@@ -989,17 +1060,24 @@ fn fallback_plan_todo(config: &SessionConfig, mut notes: Vec<String>) -> PlanTod
     };
 
     notes.push("planner 不可用，已生成保守的用户可读 todo 清单。".to_string());
-    PlanTodo {
-        summary: format!("围绕 `{}` 生成的最小可执行计划。", config.task),
-        approach: "先收敛范围，再完成主链路，最后补验证和交付说明。".to_string(),
-        todos,
-        risks: vec![
-            "如果技术栈、部署方式或内容来源未提前定清，后续实现容易返工。".to_string(),
-            "如果任务实际跨多个模块或服务，执行前仍需再确认边界。".to_string(),
-        ],
-        used_fallback: true,
-        planning_notes: notes,
-    }
+    enrich_plan_todo(
+        config,
+        PlanTodo {
+            summary: format!("围绕 `{}` 生成的最小可执行计划。", config.task),
+            approach: "先收敛范围，再完成主链路，最后补验证和交付说明。".to_string(),
+            todos,
+            risks: vec![
+                "如果技术栈、部署方式或内容来源未提前定清，后续实现容易返工。".to_string(),
+                "如果任务实际跨多个模块或服务，执行前仍需再确认边界。".to_string(),
+            ],
+            used_fallback: true,
+            planning_notes: notes,
+            iteration_index: 1,
+            source_session_id: None,
+            feedback_summary: Vec::new(),
+            delta_summary: Vec::new(),
+        },
+    )
 }
 
 fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
@@ -1085,10 +1163,17 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
         &verified_capabilities,
         &blocked_verifications,
     );
+    let latest_feedback = manifest
+        .feedback_history
+        .last()
+        .map(|item| item.intent_summary.clone());
+    let completed_this_iteration =
+        build_iteration_completion_summary(manifest, &accepted_files, &verified_capabilities);
 
     FinalSummary {
         overview: format!(
-            "本次运行共调度 {} 个节点，成功 {} 个、失败 {} 个；apply 状态为 `{}`，可信度为 `{}`，范围漂移为“{}”，适合{}继续推进。",
+            "当前可用版本为 V{}：本次运行共调度 {} 个节点，成功 {} 个、失败 {} 个；apply 状态为 `{}`，可信度为 `{}`，范围漂移为“{}”，适合{}继续推进。",
+            manifest.iteration_index_value(),
             manifest.worker_results.len(),
             success,
             failed_workers,
@@ -1116,6 +1201,12 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
         used_fallback: false,
         review_report,
         evidence_summary,
+        iteration_index: manifest.iteration_index_value(),
+        based_on_session_id: manifest.parent_session_id.clone(),
+        feedback_summary: latest_feedback.into_iter().collect(),
+        delta_summary: build_iteration_delta_summary(manifest),
+        completed_this_iteration,
+        unaccepted_feedback: Vec::new(),
     }
 }
 
@@ -1238,7 +1329,54 @@ fn recommended_next_actions(
         "查看验证报告：`{}`",
         manifest.verification_report_path.display()
     ));
+    actions.push(format!(
+        "如需继续优化，执行：`codex-forge continue --session {} --feedback \"...\"`",
+        manifest.id
+    ));
     actions
+}
+
+fn build_iteration_delta_summary(manifest: &SessionManifest) -> Vec<String> {
+    let mut items = Vec::new();
+    if let Some(parent) = &manifest.parent_session_id {
+        items.push(format!("相对上一轮 session `{parent}` 继续推进。"));
+    }
+    if let Some(kind) = manifest.continuation_kind {
+        items.push(format!("本轮延续类型：{}。", kind.label()));
+    }
+    if let Some(feedback) = manifest.feedback_history.last() {
+        items.push(format!(
+            "本轮优先吸收的人类反馈：{}",
+            feedback.intent_summary
+        ));
+    }
+    if items.is_empty() {
+        items.push("这是根会话的首轮交付。".to_string());
+    }
+    items
+}
+
+fn build_iteration_completion_summary(
+    manifest: &SessionManifest,
+    accepted_files: &[String],
+    verified_capabilities: &[String],
+) -> Vec<String> {
+    let mut items = Vec::new();
+    if !accepted_files.is_empty() {
+        items.push(format!("自动接收文件 {} 个。", accepted_files.len()));
+    }
+    if !verified_capabilities.is_empty() {
+        items.push(format!("完成验证能力 {} 项。", verified_capabilities.len()));
+    }
+    if manifest.worker_results.is_empty() {
+        items.push("本轮主要产出为规划与反馈闭环工件。".to_string());
+    } else {
+        items.push(format!(
+            "完成 worker 节点 {} 个。",
+            manifest.worker_results.len()
+        ));
+    }
+    items
 }
 
 fn latest_reviewer_gate(manifest: &SessionManifest) -> Option<ApplyDecision> {
@@ -1767,6 +1905,7 @@ mod tests {
             plan_only: false,
             preset: None,
             resume_session_id: None,
+            continuation: None,
         };
         let roles = sample_roles();
         let graph = fallback_plan(&config, &roles, Vec::new()).expect("fallback graph");
