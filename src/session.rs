@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,28 @@ use crate::model::{
 pub struct SessionContext {
     pub manifest: SessionManifest,
     manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupScope {
+    SessionCascade,
+    AllArtifacts,
+}
+
+#[derive(Debug, Clone)]
+pub struct CleanupReport {
+    pub scope: CleanupScope,
+    pub repo_root: PathBuf,
+    pub forge_dir: PathBuf,
+    pub removed_sessions: Vec<String>,
+    pub had_artifacts: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResetReport {
+    pub removed_sessions: Vec<String>,
+    pub reset_commits: Vec<String>,
+    pub reset_to: Option<String>,
 }
 
 impl SessionContext {
@@ -593,6 +616,138 @@ pub fn load_session(target_dir: &Path, session_id: Option<&str>) -> Result<Sessi
     Ok(normalize_loaded_manifest(manifest))
 }
 
+pub fn cleanup_session_lineage(target_dir: &Path, session_id: &str) -> Result<CleanupReport> {
+    let sessions_root = resolve_sessions_root(target_dir)?;
+    if !sessions_root.exists() {
+        bail!("未找到 .codex-forge/sessions：{}", sessions_root.display());
+    }
+
+    let entries = load_all_session_entries(&sessions_root)?;
+    let mut removed_ids = entries
+        .iter()
+        .filter(|entry| session_matches_cleanup_target(&entry.manifest, session_id))
+        .map(|entry| entry.manifest.id.clone())
+        .collect::<Vec<_>>();
+    removed_ids.sort();
+    removed_ids.dedup();
+
+    if removed_ids.is_empty() {
+        bail!("未找到 session `{session_id}`，无法清理");
+    }
+
+    let removed_id_set = removed_ids.iter().cloned().collect::<HashSet<_>>();
+    let affected_roots = entries
+        .iter()
+        .filter(|entry| removed_id_set.contains(&entry.manifest.id))
+        .map(|entry| entry.manifest.root_session_id_ref().to_string())
+        .collect::<HashSet<_>>();
+
+    for entry in entries
+        .iter()
+        .filter(|entry| removed_id_set.contains(&entry.manifest.id))
+    {
+        if entry.path.exists() {
+            fs::remove_dir_all(&entry.path)
+                .with_context(|| format!("删除 session 目录失败：{}", entry.path.display()))?;
+        }
+    }
+
+    let remaining = entries
+        .into_iter()
+        .filter(|entry| !removed_id_set.contains(&entry.manifest.id))
+        .map(|entry| entry.manifest)
+        .collect::<Vec<_>>();
+
+    for root_session_id in affected_roots {
+        rewrite_latest_pointer(&sessions_root, &remaining, &root_session_id)?;
+    }
+
+    let forge_dir = sessions_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sessions_root.clone());
+    crate::workspace::cleanup_empty_dirs(&forge_dir)?;
+
+    Ok(CleanupReport {
+        scope: CleanupScope::SessionCascade,
+        repo_root: forge_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| target_dir.to_path_buf()),
+        forge_dir,
+        removed_sessions: removed_ids,
+        had_artifacts: true,
+    })
+}
+
+pub fn cleanup_all_forge_artifacts(target_dir: &Path) -> Result<CleanupReport> {
+    let sessions_root = resolve_sessions_root(target_dir)?;
+    let forge_dir = sessions_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| sessions_root.clone());
+    let removed_sessions = if sessions_root.exists() {
+        load_all_session_entries(&sessions_root)?
+            .into_iter()
+            .map(|entry| entry.manifest.id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let had_artifacts = forge_dir.exists();
+    if had_artifacts {
+        fs::remove_dir_all(&forge_dir)
+            .with_context(|| format!("删除 .codex-forge 目录失败：{}", forge_dir.display()))?;
+    }
+
+    Ok(CleanupReport {
+        scope: CleanupScope::AllArtifacts,
+        repo_root: forge_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| target_dir.to_path_buf()),
+        forge_dir,
+        removed_sessions,
+        had_artifacts,
+    })
+}
+
+pub fn reset_session_lineage(target_dir: &Path, session_id: &str) -> Result<ResetReport> {
+    let sessions_root = resolve_sessions_root(target_dir)?;
+    if !sessions_root.exists() {
+        bail!("未找到 .codex-forge/sessions：{}", sessions_root.display());
+    }
+
+    let entries = load_all_session_entries(&sessions_root)?;
+    let matched_entries = entries
+        .iter()
+        .filter(|entry| session_matches_cleanup_target(&entry.manifest, session_id))
+        .collect::<Vec<_>>();
+    if matched_entries.is_empty() {
+        bail!("未找到 session `{session_id}`，无法重置");
+    }
+
+    let reset_commits = collect_reset_commit_hashes(&matched_entries);
+    let repo_root = sessions_root
+        .parent()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| target_dir.to_path_buf());
+    let reset_to = if reset_commits.is_empty() {
+        None
+    } else {
+        Some(reset_repo_before_commits(&repo_root, &reset_commits)?)
+    };
+
+    let cleanup = cleanup_session_lineage(target_dir, session_id)?;
+    Ok(ResetReport {
+        removed_sessions: cleanup.removed_sessions,
+        reset_commits,
+        reset_to,
+    })
+}
+
 pub fn find_reusable_plan_session(
     target_dir: &Path,
     task: &str,
@@ -644,6 +799,206 @@ fn resolve_sessions_root(target_dir: &Path) -> Result<PathBuf> {
     };
 
     Ok(repo_root.join(".codex-forge").join("sessions"))
+}
+
+#[derive(Debug)]
+struct SessionCleanupEntry {
+    manifest: SessionManifest,
+    path: PathBuf,
+}
+
+fn load_all_session_entries(sessions_root: &Path) -> Result<Vec<SessionCleanupEntry>> {
+    let mut entries = fs::read_dir(sessions_root)
+        .with_context(|| format!("读取 sessions 根目录失败：{}", sessions_root.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let manifest_path = path.join("manifest.json");
+            let raw = fs::read_to_string(&manifest_path).ok()?;
+            let manifest = serde_json::from_str::<SessionManifest>(&raw).ok()?;
+            Some(SessionCleanupEntry {
+                manifest: normalize_loaded_manifest(manifest),
+                path,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
+    Ok(entries)
+}
+
+fn collect_reset_commit_hashes(entries: &[&SessionCleanupEntry]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut hashes = Vec::new();
+
+    for entry in entries {
+        let Some(apply_result) = &entry.manifest.apply_result else {
+            continue;
+        };
+        for record in &apply_result.todo_commits {
+            let Some(hash) = &record.commit_hash else {
+                continue;
+            };
+            if seen.insert(hash.clone()) {
+                hashes.push(hash.clone());
+            }
+        }
+    }
+
+    hashes
+}
+
+fn session_matches_cleanup_target(manifest: &SessionManifest, session_id: &str) -> bool {
+    manifest.id == session_id
+        || manifest
+            .lineage
+            .iter()
+            .any(|entry| entry.session_id == session_id)
+        || manifest.parent_session_id.as_deref() == Some(session_id)
+}
+
+fn reset_repo_before_commits(repo_root: &Path, reset_commits: &[String]) -> Result<String> {
+    if reset_commits.is_empty() {
+        bail!("没有可回滚的 commit");
+    }
+    if !git_is_clean_sync(repo_root)? {
+        bail!("目标工作区不干净，拒绝一键重置；请先处理未提交改动");
+    }
+
+    let expected_tail = reset_commits.iter().rev().cloned().collect::<Vec<_>>();
+    let actual_tail = git_lines(
+        repo_root,
+        &[
+            "rev-list",
+            "--first-parent",
+            "--max-count",
+            &expected_tail.len().to_string(),
+            "HEAD",
+        ],
+        "读取当前 HEAD 提交链失败",
+    )?;
+    if actual_tail != expected_tail {
+        bail!("目标 session 的提交已不在当前 HEAD 尾部，拒绝自动重置，避免误删后续人工提交");
+    }
+
+    let oldest = reset_commits
+        .first()
+        .context("缺少最早 commit，无法计算重置基线")?;
+    let reset_to = git_stdout_trimmed(
+        repo_root,
+        &[&format!("{oldest}^")],
+        "定位重置基线失败",
+        "rev-parse",
+    )?;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["reset", "--hard"])
+        .arg(&reset_to)
+        .output()
+        .with_context(|| format!("执行 git reset --hard 失败：{}", repo_root.display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(reset_to)
+}
+
+fn git_is_clean_sync(repo_root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--short", "--untracked-files=all"])
+        .output()
+        .with_context(|| format!("执行 git status 失败：{}", repo_root.display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    let status_text = String::from_utf8_lossy(&output.stdout).to_string();
+    let dirty_lines = status_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.ends_with(".codex-forge") && !line.contains(".codex-forge/"))
+        .collect::<Vec<_>>();
+    Ok(dirty_lines.is_empty())
+}
+
+fn git_lines(repo_root: &Path, args: &[&str], context: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("{context}：{}", repo_root.display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn git_stdout_trimmed(
+    repo_root: &Path,
+    extra_args: &[&str],
+    context: &str,
+    command: &str,
+) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg(command)
+        .args(extra_args)
+        .output()
+        .with_context(|| format!("{context}：{}", repo_root.display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn rewrite_latest_pointer(
+    sessions_root: &Path,
+    remaining: &[SessionManifest],
+    root_session_id: &str,
+) -> Result<()> {
+    let latest_pointer_path = sessions_root.join(root_session_id).join("latest.md");
+    let latest = remaining
+        .iter()
+        .filter(|manifest| manifest.root_session_id_ref() == root_session_id)
+        .max_by(|left, right| {
+            left.iteration_index_value()
+                .cmp(&right.iteration_index_value())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+    if let Some(manifest) = latest {
+        if let Some(parent) = latest_pointer_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建 latest 指针目录失败：{}", parent.display()))?;
+        }
+        fs::write(&latest_pointer_path, render_latest_pointer(manifest))
+            .with_context(|| format!("回写 latest 指针失败：{}", latest_pointer_path.display()))?;
+    } else if latest_pointer_path.exists() {
+        fs::remove_file(&latest_pointer_path).with_context(|| {
+            format!(
+                "删除失效 latest 指针失败：{}",
+                latest_pointer_path.display()
+            )
+        })?;
+        if let Some(parent) = latest_pointer_path.parent() {
+            crate::workspace::cleanup_empty_dirs(parent)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn latest_session_dir(sessions_root: &Path) -> Result<PathBuf> {

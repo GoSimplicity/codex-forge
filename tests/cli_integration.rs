@@ -907,6 +907,146 @@ verification_commands = ["git status --short >/dev/null"]
     );
 }
 
+#[test]
+fn clean_session_removes_selected_history_and_rewrites_latest_pointer() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let first = command(bin, repo.path())
+        .args([
+            "plan",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("first plan");
+    assert!(first.status.success(), "{:?}", first);
+    let root_session_id = latest_session_id(repo.path());
+
+    let second = command(bin, repo.path())
+        .args([
+            "continue",
+            "--session",
+            &root_session_id,
+            "--feedback",
+            "继续细化这版方案",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("continue plan");
+    assert!(second.status.success(), "{:?}", second);
+    let child_session_id = latest_session_id(repo.path());
+
+    let clean = command(bin, repo.path())
+        .args([
+            "clean",
+            "--session",
+            &child_session_id,
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("clean session");
+    assert!(clean.status.success(), "{:?}", clean);
+
+    assert!(!session_dir(repo.path(), &child_session_id).exists());
+    assert!(session_dir(repo.path(), &root_session_id).exists());
+
+    let latest = fs::read_to_string(session_dir(repo.path(), &root_session_id).join("latest.md"))
+        .expect("read latest pointer");
+    assert!(latest.contains(&format!("latest_session: `{}`", root_session_id)));
+}
+
+#[test]
+fn clean_all_removes_entire_codex_forge_dir() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let output = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run forge");
+    assert!(output.status.success(), "{:?}", output);
+    assert!(repo.path().join(".codex-forge").exists());
+
+    let clean = command(bin, repo.path())
+        .args([
+            "clean",
+            "--all",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("clean all");
+    assert!(clean.status.success(), "{:?}", clean);
+    assert!(!repo.path().join(".codex-forge").exists());
+}
+
+#[test]
+fn reset_session_rolls_back_commits_and_removes_history() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let output = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run forge");
+    assert!(output.status.success(), "{:?}", output);
+
+    let session_id = latest_session_id(repo.path());
+    assert_ne!(
+        git_stdout(repo.path(), &["rev-list", "--count", "HEAD"]),
+        "1".to_string()
+    );
+
+    let reset = command(bin, repo.path())
+        .args([
+            "reset",
+            "--session",
+            &session_id,
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("reset session");
+    assert!(reset.status.success(), "{:?}", reset);
+
+    let file_a = fs::read_to_string(repo.path().join("file-a.txt")).expect("read file-a");
+    assert_eq!(file_a, "alpha\n");
+    assert_eq!(
+        git_stdout(repo.path(), &["rev-list", "--count", "HEAD"]),
+        "1"
+    );
+    assert_eq!(
+        git_stdout(repo.path(), &["rev-parse", "--short", "HEAD"]),
+        git_stdout(
+            repo.path(),
+            &["rev-list", "--max-count", "1", "--abbrev-commit", "HEAD"]
+        )
+    );
+    assert!(!session_dir(repo.path(), &session_id).exists());
+}
+
 fn command(bin: &str, repo: &Path) -> Command {
     command_with_bin(bin, repo, &repo.join(".fake-bin"))
 }
@@ -947,6 +1087,10 @@ fn latest_session_id(repo: &Path) -> String {
         .expect("latest session")
 }
 
+fn session_dir(repo: &Path, session_id: &str) -> PathBuf {
+    repo.join(".codex-forge").join("sessions").join(session_id)
+}
+
 fn load_manifest(repo: &Path) -> Value {
     let session_id = latest_session_id(repo);
     let manifest_path = repo
@@ -967,11 +1111,33 @@ fn run(dir: &Path, args: &[&str]) {
     assert!(status.success(), "command failed: {:?}", args);
 }
 
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git failed: {:?}", args);
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 #[test]
-fn remembered_target_dir_is_reused_without_repassing_flag() {
+fn current_dir_is_used_without_repassing_flag() {
     let repo = make_repo("success");
     let other = TempDir::new().expect("other cwd");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    fs::write(
+        other.path().join("codex-forge.toml"),
+        r#"
+[defaults]
+workers = 2
+apply_mode = "bundle"
+max_retries = 1
+verification_commands = ["pwd >/dev/null"]
+"#,
+    )
+    .expect("write other config");
 
     let first = command(bin, repo.path())
         .args([
@@ -993,7 +1159,31 @@ fn remembered_target_dir_is_reused_without_repassing_flag() {
         .output()
         .expect("config validate without target");
     assert!(second.status.success(), "{:?}", second);
-    assert!(String::from_utf8_lossy(&second.stdout).contains("配置有效"));
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("默认 workers：2"), "{stdout}");
+    assert!(stdout.contains("默认 apply_mode：bundle"), "{stdout}");
+}
+
+#[test]
+fn repo_root_is_used_when_invoked_from_subdir() {
+    let repo = make_repo("success");
+    let subdir = repo.path().join("nested").join("deeper");
+    fs::create_dir_all(&subdir).expect("create subdir");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let mut cmd = command(bin, repo.path());
+    cmd.current_dir(&subdir);
+    let output = cmd
+        .args(["config", "validate"])
+        .output()
+        .expect("config validate from subdir");
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("默认 workers：3"), "{stdout}");
+    assert!(
+        stdout.contains(&repo.path().join("codex-forge.toml").display().to_string()),
+        "{stdout}"
+    );
 }
 
 #[test]

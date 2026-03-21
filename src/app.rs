@@ -4,9 +4,9 @@ use clap::Parser;
 
 use crate::app_shell::run_app_shell;
 use crate::cli::{
-    AgentCommands, AgentListArgs, ApplyModeArg, Cli, Commands, ConfigCommands, ConfigValidateArgs,
-    ContinueArgs, ContinueModeArg, DoctorArgs, PlanArgs, PresetArg, ReplayArgs, RunArgs,
-    ThinkingModeArg, TuiArgs, UiModeArg,
+    AgentCommands, AgentListArgs, ApplyModeArg, CleanArgs, Cli, Commands, ConfigCommands,
+    ConfigValidateArgs, ContinueArgs, ContinueModeArg, DoctorArgs, PlanArgs, PresetArg, ReplayArgs,
+    ResetArgs, RunArgs, ThinkingModeArg, TuiArgs, UiModeArg,
 };
 use crate::config::{load_project_config, validate_project_config};
 use crate::doctor::run_doctor;
@@ -17,7 +17,10 @@ use crate::model::{
 use crate::orchestrator::{plan_session, run_session};
 use crate::replay::replay_session;
 use crate::resources::{load_resource_catalog, resolve_role_set};
-use crate::session::load_session;
+use crate::session::{
+    CleanupScope, cleanup_all_forge_artifacts, cleanup_session_lineage, load_session,
+    reset_session_lineage,
+};
 use crate::workspace::{describe_git_readiness, resolve_target_dir};
 
 pub async fn run() -> Result<()> {
@@ -52,6 +55,8 @@ pub async fn run() -> Result<()> {
             }
         }
         Some(Commands::Replay(args)) => run_replay(args).await?,
+        Some(Commands::Reset(args)) => run_reset_command(args)?,
+        Some(Commands::Clean(args)) => run_clean_command(args)?,
         Some(Commands::Agents(args)) => match args.command {
             AgentCommands::List(list_args) => print_agents(list_args)?,
         },
@@ -321,6 +326,66 @@ async fn run_doctor_command(args: DoctorArgs) -> Result<()> {
     } else {
         bail!("doctor 检查未通过")
     }
+}
+
+fn run_clean_command(args: CleanArgs) -> Result<()> {
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let report = if args.all {
+        cleanup_all_forge_artifacts(&target_dir)?
+    } else {
+        cleanup_session_lineage(
+            &target_dir,
+            args.session
+                .as_deref()
+                .context("clean 需要指定 --session 或 --all")?,
+        )?
+    };
+
+    match report.scope {
+        CleanupScope::AllArtifacts => {
+            if !report.had_artifacts {
+                println!(
+                    "当前仓库下没有可清理的 .codex-forge 产物：{}",
+                    report.repo_root.display()
+                );
+            } else {
+                println!("已清空：{}", report.forge_dir.display());
+                println!("删除 session 数：{}", report.removed_sessions.len());
+            }
+        }
+        CleanupScope::SessionCascade => {
+            println!("已清理指定历史及其后续迭代。");
+            println!("删除 session 数：{}", report.removed_sessions.len());
+            println!("目标仓库：{}", report.repo_root.display());
+        }
+    }
+
+    if !report.removed_sessions.is_empty() {
+        println!("删除的 session：{}", report.removed_sessions.join("、"));
+    }
+
+    Ok(())
+}
+
+fn run_reset_command(args: ResetArgs) -> Result<()> {
+    let target_dir = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let report = reset_session_lineage(&target_dir, &args.session)?;
+
+    if let Some(reset_to) = &report.reset_to {
+        println!(
+            "已回滚 {} 个 commit，仓库重置到：{}",
+            report.reset_commits.len(),
+            reset_to
+        );
+    } else {
+        println!("目标 session 没有落地 commit，仅清理历史痕迹。");
+    }
+    println!("删除 session 数：{}", report.removed_sessions.len());
+    if !report.removed_sessions.is_empty() {
+        println!("删除的 session：{}", report.removed_sessions.join("、"));
+    }
+
+    Ok(())
 }
 
 fn run_config_validate(args: ConfigValidateArgs) -> Result<()> {

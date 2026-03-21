@@ -358,37 +358,39 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
 
     try:
         start_mark = session.mark()
-        session.wait_for("启动首页", ["任务主路径", "默认摘要"], timeout=15, since=start_mark)
+        session.wait_for("启动首页", ["任务输入", "主操作"], timeout=15, since=start_mark)
 
         mark = session.mark()
-        session.send("e")
+        session.send("\r")
         session.wait_for("打开任务编辑", ["编辑字段：任务描述"], timeout=5, since=mark)
 
         session.send("真实 PTY smoke 脚本")
         mark = session.mark()
-        session.send("\x1b", pause=0.15)
-        session.wait_for("保存任务", ["任务已保存"], timeout=5, since=mark)
+        session.send("\x13", pause=0.15)
+        session.wait_for("保存任务", ["内容已保存"], timeout=5, since=mark)
 
         mark = session.mark()
-        session.send("d")
-        session.wait_for("进入 Doctor", ["动作：检查环境"], timeout=5, since=mark)
+        session.send("\x1b[C")
+        session.send("\r")
+        session.wait_for("进入 Doctor", ["检查环境/运行中"], timeout=5, since=mark)
         session.wait_for("Doctor 完成", ["检查环境 已结束：成功"], timeout=20, since=mark)
 
         mark = session.mark()
         session.send("\x1b", pause=0.15)
         session.wait_for(
             "Doctor 后返回开始页",
-            ["任务主路径", "最近环境检查：绿色"],
+            ["任务输入", "最近检查：绿色"],
             timeout=8,
             since=mark,
         )
 
         mark = session.mark()
-        session.send("p")
-        session.wait_for("进入 Plan", ["动作：先看方案"], timeout=5, since=mark)
+        session.send("\x1b[B")
+        session.send("\r")
+        session.wait_for("进入 Plan", ["先看方案/运行中"], timeout=5, since=mark)
         session.wait_for(
             "Plan 完成并进入历史页",
-            ["先看方案 已结束：成功", "历史会话", "历史结果详情"],
+            ["先看方案 已结束：成功", "历史会话", "当前会话"],
             timeout=20,
             since=mark,
         )
@@ -397,35 +399,40 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
         session.send("\x1b", pause=0.15)
         session.wait_for(
             "从历史页回到执行页",
-            ["执行状态/事件", "动作：先看方案", "已返回执行页"],
+            ["先看方案/成功", "已返回执行页"],
             timeout=8,
             since=mark,
         )
 
         mark = session.mark()
         session.send("\x1b", pause=0.15)
-        session.wait_for("从执行页回到开始页", ["任务主路径"], timeout=8, since=mark)
+        session.wait_for("从执行页回到开始页", ["任务输入", "主操作"], timeout=8, since=mark)
 
         mark = session.mark()
-        session.send("r")
-        session.wait_for("进入 Run", ["动作：开始执行"], timeout=5, since=mark)
+        session.send("\x1b[B")
+        session.send("\r")
+        session.wait_for("进入 Run", ["开始执行/运行中"], timeout=5, since=mark)
         session.wait_for(
             "Run 完成并进入历史页",
-            ["开始执行 已结束：成功", "历史会话", "历史结果详情"],
+            ["开始执行 已结束：成功", "历史会话", "当前会话"],
             timeout=25,
             since=mark,
         )
 
         mark = session.mark()
-        session.send("l")
-        session.wait_for("进入 Replay", ["动作：回放过程"], timeout=5, since=mark)
+        session.send("\x1b[C")
+        session.send("\x1b[B")
+        session.send("\x1b[B")
+        session.send("\x1b[B")
+        session.send("\r")
+        session.wait_for("进入 Replay", ["回放过程/运行中"], timeout=5, since=mark)
         session.pump(5.0)
 
         mark = session.mark()
         session.send("\x1b", pause=0.15)
         session.wait_for(
             "Replay 后回到历史页",
-            ["历史会话", "历史结果详情"],
+            ["历史会话", "当前会话"],
             timeout=8,
             since=mark,
         )

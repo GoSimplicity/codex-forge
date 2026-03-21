@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,6 +20,8 @@ pub enum Commands {
     Plan(PlanArgs),
     Continue(ContinueArgs),
     Replay(ReplayArgs),
+    Reset(ResetArgs),
+    Clean(CleanArgs),
     Agents(AgentsArgs),
     Doctor(DoctorArgs),
     Config(ConfigArgs),
@@ -47,7 +49,10 @@ pub struct SharedTaskArgs {
     pub thinking_mode: Option<ThinkingModeArg>,
     #[arg(long, value_enum, default_value_t = UiModeArg::Rich, help = "终端展示模式")]
     pub ui: UiModeArg,
-    #[arg(long, help = "要协同开发的目标仓库目录；不传则优先复用上次指定目录")]
+    #[arg(
+        long,
+        help = "要协同开发的目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -82,7 +87,10 @@ pub struct RunArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct TuiArgs {
-    #[arg(long, help = "主界面默认打开的目标仓库目录；不传则优先复用上次目录")]
+    #[arg(
+        long,
+        help = "主界面默认打开的目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -111,7 +119,10 @@ pub struct ContinueArgs {
     pub title: Option<String>,
     #[arg(long, value_enum, default_value_t = UiModeArg::Rich, help = "终端展示模式")]
     pub ui: UiModeArg,
-    #[arg(long, help = "目标仓库目录；不传则优先复用上次指定目录")]
+    #[arg(
+        long,
+        help = "目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -123,11 +134,40 @@ pub struct ReplayArgs {
     pub ui: UiModeArg,
     #[arg(
         long,
-        help = "仓库目录，用于定位 .codex-forge 会话；不传则优先复用上次指定目录"
+        help = "仓库目录，用于定位 .codex-forge 会话；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
     )]
     pub target_dir: Option<PathBuf>,
     #[arg(long, help = "按关键决策时间线输出，不走动态 UI 回放")]
     pub timeline: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ResetArgs {
+    #[arg(long, help = "要重置的 session id；会连同其后续迭代一起回退并删除")]
+    pub session: String,
+    #[arg(
+        long,
+        help = "目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("clean_scope")
+        .required(true)
+        .args(["session", "all"])
+))]
+pub struct CleanArgs {
+    #[arg(
+        long,
+        help = "目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
+    pub target_dir: Option<PathBuf>,
+    #[arg(long, help = "要清理的 session id；会连同其后续迭代一起删除")]
+    pub session: Option<String>,
+    #[arg(long, help = "一键清空当前仓库下整个 .codex-forge 目录")]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -143,13 +183,19 @@ pub enum AgentCommands {
 
 #[derive(Debug, Clone, Args)]
 pub struct AgentListArgs {
-    #[arg(long, help = "目标仓库目录；不传则优先复用上次指定目录")]
+    #[arg(
+        long,
+        help = "目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
     pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct DoctorArgs {
-    #[arg(long, help = "要检查的目标仓库目录；不传则优先复用上次指定目录")]
+    #[arg(
+        long,
+        help = "要检查的目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
     pub target_dir: Option<PathBuf>,
     #[arg(long, help = "项目配置文件路径；默认尝试读取 codex-forge.toml")]
     pub config: Option<PathBuf>,
@@ -172,7 +218,10 @@ pub enum ConfigCommands {
 
 #[derive(Debug, Clone, Args)]
 pub struct ConfigValidateArgs {
-    #[arg(long, help = "目标仓库目录；不传则优先复用上次指定目录")]
+    #[arg(
+        long,
+        help = "目标仓库目录；不传则默认使用当前所在仓库（若在子目录执行则自动取 Git 根）"
+    )]
     pub target_dir: Option<PathBuf>,
     #[arg(long, help = "显式指定配置文件路径")]
     pub config: Option<PathBuf>,

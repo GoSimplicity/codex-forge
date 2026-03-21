@@ -26,21 +26,19 @@ pub struct WorkspacePreparation {
 }
 
 pub fn resolve_target_dir(explicit: Option<&Path>) -> Result<ResolvedTargetDir> {
-    if let Some(path) = explicit {
-        let resolved = normalize_existing_dir(path)?;
+    let base_dir = match explicit {
+        Some(path) => normalize_existing_dir(path)?,
+        None => {
+            let cwd = env::current_dir().context("读取当前目录失败")?;
+            normalize_existing_dir(&cwd)?
+        }
+    };
+    let resolved = git_toplevel_or_self(&base_dir)?;
+    if explicit.is_some() {
         remember_target_dir(&resolved)?;
-        return Ok(ResolvedTargetDir { path: resolved });
     }
 
-    if let Some(path) = load_workspace_state()?.last_target_dir
-        && path.exists()
-    {
-        return Ok(ResolvedTargetDir { path });
-    }
-
-    Ok(ResolvedTargetDir {
-        path: env::current_dir().context("读取当前目录失败")?,
-    })
+    Ok(ResolvedTargetDir { path: resolved })
 }
 
 pub fn remember_target_dir(path: &Path) -> Result<()> {

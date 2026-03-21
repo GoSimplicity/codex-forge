@@ -1029,8 +1029,107 @@ fn summarize_worker_update(kind: &str, message: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeViewState, planning_activity_lines};
-    use crate::model::{RuntimeEvent, TodoStatus};
+    use std::path::PathBuf;
+
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+    use super::{
+        RuntimeViewState, compact_status_lines, compact_summary_lines, describe_runtime_event,
+        planning_activity_lines, render_runtime_dashboard,
+    };
+    use crate::model::{
+        ApplyDecision, ApplyStatus, FinalSummary, ResultStatus, ReviewGateReport, RuntimeEvent,
+        TodoStatus, TrustLevel, WorkerResult, WorkerStatus,
+    };
+
+    fn sample_review_report(decision: ApplyDecision) -> ReviewGateReport {
+        ReviewGateReport {
+            decision,
+            blocking_findings: vec!["存在阻断项".to_string()],
+            accepted_scopes: vec!["src/ui.rs".to_string()],
+            rejected_scopes: vec!["README.md".to_string()],
+            confidence_reasoning: Some("证据充分".to_string()),
+        }
+    }
+
+    fn sample_summary(overview: &str) -> FinalSummary {
+        FinalSummary {
+            overview: overview.to_string(),
+            result_status: ResultStatus::Completed,
+            review_gate: Some(ApplyDecision::AllowFull),
+            apply_status: ApplyStatus::Applied,
+            trust_level: TrustLevel::High,
+            accepted_files: vec!["src/ui.rs".to_string()],
+            manual_review_files: vec!["tests/ui.rs".to_string()],
+            rejected_files: Vec::new(),
+            verified_capabilities: vec!["cargo test".to_string()],
+            blocked_verifications: Vec::new(),
+            open_risks: vec!["需要补一条真实终端回归".to_string()],
+            recommended_next_action: vec!["补充冒烟".to_string()],
+            todo_states: Vec::new(),
+            used_fallback: false,
+            review_report: Some(sample_review_report(ApplyDecision::AllowFull)),
+            evidence_summary: vec!["单测通过".to_string()],
+            iteration_index: 1,
+            based_on_session_id: None,
+            feedback_summary: Vec::new(),
+            delta_summary: Vec::new(),
+            completed_this_iteration: vec!["补测完成".to_string()],
+            unaccepted_feedback: Vec::new(),
+        }
+    }
+
+    fn sample_worker_result(status: WorkerStatus) -> WorkerResult {
+        WorkerResult {
+            agent_id: "implementer-1".to_string(),
+            role: "implementer".to_string(),
+            task_title: "补齐 TUI".to_string(),
+            status,
+            exit_code: Some(0),
+            attempts: 1,
+            diagnostic_summary: Some("diagnostic".to_string()),
+            final_message: "final message".to_string(),
+            summary: Some("实现完成".to_string()),
+            changed_files: vec!["src/ui.rs".to_string()],
+            worktree_path: PathBuf::from("/tmp/demo-worktree"),
+            prompt_path: PathBuf::from("/tmp/prompt.md"),
+            stdout_path: PathBuf::from("/tmp/stdout.log"),
+            stderr_path: PathBuf::from("/tmp/stderr.log"),
+            events_path: PathBuf::from("/tmp/events.jsonl"),
+            final_output_path: PathBuf::from("/tmp/final.md"),
+            diff_path: None,
+            git_status_path: None,
+            handoff_path: None,
+            handoff: None,
+            error: None,
+        }
+    }
+
+    fn render_to_text(state: &RuntimeViewState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_runtime_dashboard(frame, frame.area(), state, "测试态势");
+            })
+            .expect("draw dashboard");
+        buffer_to_text(terminal.backend().buffer())
+    }
+
+    fn buffer_to_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn normalize_rendered_text(text: &str) -> String {
+        text.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
 
     #[test]
     fn planning_activity_lines_show_todos_and_notes_without_workers() {
@@ -1084,5 +1183,216 @@ mod tests {
 
         assert!(rendered.contains("implementer-1"));
         assert!(rendered.contains("命令完成"));
+    }
+
+    #[test]
+    fn runtime_view_state_tracks_full_event_flow_and_limits_notes() {
+        let mut state = RuntimeViewState::new("session-3", "覆盖全部事件");
+
+        for index in 0..10 {
+            state.apply(&RuntimeEvent::CommanderNote {
+                message: format!("note-{index}"),
+            });
+        }
+        assert_eq!(state.commander_notes.len(), 8);
+        assert_eq!(
+            state.commander_notes.first().map(String::as_str),
+            Some("note-2")
+        );
+
+        state.apply(&RuntimeEvent::GraphReady {
+            nodes: 3,
+            dependencies: 2,
+        });
+        state.apply(&RuntimeEvent::TodoStateChanged {
+            todo_id: "todo-1".to_string(),
+            title: "补齐紧凑布局".to_string(),
+            status: TodoStatus::Running,
+            message: "开始处理".to_string(),
+            commit_hash: Some("1234567890abcdef".to_string()),
+        });
+        state.apply(&RuntimeEvent::WorkerDispatched {
+            agent_id: "implementer-1".to_string(),
+            role: "implementer".to_string(),
+            title: "补齐 TUI".to_string(),
+            worktree_path: "/tmp/demo".into(),
+        });
+        state.apply(&RuntimeEvent::WorkerUpdate {
+            agent_id: "implementer-1".to_string(),
+            kind: "stderr:error".to_string(),
+            message: "发现一个渲染边界".to_string(),
+        });
+        state.apply(&RuntimeEvent::HandoffReady {
+            agent_id: "implementer-1".to_string(),
+            handoff_path: "/tmp/demo/handoff.md".into(),
+        });
+        state.apply(&RuntimeEvent::WorkerFinished {
+            result: Box::new(sample_worker_result(WorkerStatus::Succeeded)),
+        });
+        state.apply(&RuntimeEvent::ApplyPlanReady {
+            mode: crate::model::ApplyMode::AutoSafe,
+            operations: 2,
+        });
+        state.apply(&RuntimeEvent::ReviewGateReady {
+            report: Box::new(sample_review_report(ApplyDecision::AllowPartial)),
+        });
+        state.apply(&RuntimeEvent::ApplyUpdate {
+            message: "集成完成".to_string(),
+        });
+        state.apply(&RuntimeEvent::VerificationReady {
+            stage: "integration".to_string(),
+            success: false,
+            message: "存在一条失败验证".to_string(),
+        });
+        state.apply(&RuntimeEvent::SummaryReady {
+            summary: Box::new(sample_summary("TUI 已稳定")),
+        });
+
+        assert_eq!(state.graph_summary.as_deref(), Some("节点 3 / 依赖 2"));
+        assert_eq!(
+            state.todos.get("todo-1").map(|item| item.1),
+            Some(TodoStatus::Running)
+        );
+        assert_eq!(
+            state
+                .workers
+                .get("implementer-1")
+                .map(|worker| worker.status),
+            Some(WorkerStatus::Succeeded)
+        );
+        assert_eq!(
+            state
+                .workers
+                .get("implementer-1")
+                .map(|worker| worker.last_event.as_str()),
+            Some("实现完成")
+        );
+        assert_eq!(state.apply_status.as_deref(), Some("集成完成"));
+        assert_eq!(
+            state.verify_status.as_deref(),
+            Some("integration / 失败 / 存在一条失败验证")
+        );
+        assert_eq!(
+            state
+                .summary
+                .as_ref()
+                .map(|summary| summary.overview.as_str()),
+            Some("TUI 已稳定")
+        );
+        assert!(
+            state
+                .commander_notes
+                .iter()
+                .any(|note| note.contains("stderr：发现一个渲染边界"))
+        );
+    }
+
+    #[test]
+    fn compact_helpers_and_event_descriptions_cover_review_and_summary_fallbacks() {
+        let mut state = RuntimeViewState::new("session-4", "紧凑模式");
+        state.graph_summary = Some("节点 2 / 依赖 1".to_string());
+        state.apply_status = Some("等待 apply".to_string());
+        state.verify_status = Some("等待 verify".to_string());
+        state.commander_notes.push("最近一次决策".to_string());
+        state.todos.insert(
+            "todo-1".to_string(),
+            (
+                "补齐摘要".to_string(),
+                TodoStatus::NeedsManualFollowup,
+                "需要人工复核".to_string(),
+            ),
+        );
+        state.review_report = Some(sample_review_report(ApplyDecision::Block));
+
+        let compact = compact_status_lines(&state, 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(compact.contains("todo-1"));
+        assert!(compact.contains("Gate：阻止应用 / 证据充分"));
+
+        let fallback_summary = compact_summary_lines(&state, 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(fallback_summary.contains("等待最终摘要"));
+        assert!(fallback_summary.contains("最近一次决策"));
+
+        state.summary = Some(sample_summary("最终摘要可见"));
+        let ready_summary = compact_summary_lines(&state, 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(ready_summary.contains("最终摘要可见"));
+        assert!(ready_summary.contains("结果：完成 / Apply：已应用"));
+
+        let event = RuntimeEvent::ReviewGateReady {
+            report: Box::new(sample_review_report(ApplyDecision::AllowFull)),
+        };
+        let rendered = describe_runtime_event(&event);
+        assert!(rendered.contains("review gate：全部放行"));
+        assert!(rendered.contains("证据充分"));
+    }
+
+    #[test]
+    fn render_runtime_dashboard_shows_wide_worker_matrix_and_summary() {
+        let mut state = RuntimeViewState::new("session-5", "宽屏渲染");
+        state.apply(&RuntimeEvent::WorkerDispatched {
+            agent_id: "implementer-1".to_string(),
+            role: "implementer".to_string(),
+            title: "补齐摘要".to_string(),
+            worktree_path: "/tmp/demo".into(),
+        });
+        state.apply(&RuntimeEvent::TodoStateChanged {
+            todo_id: "todo-1".to_string(),
+            title: "覆盖 worker 面板".to_string(),
+            status: TodoStatus::Verified,
+            message: "验证完成".to_string(),
+            commit_hash: None,
+        });
+        state.apply(&RuntimeEvent::ReviewGateReady {
+            report: Box::new(sample_review_report(ApplyDecision::AllowFull)),
+        });
+        state.apply(&RuntimeEvent::SummaryReady {
+            summary: Box::new(sample_summary("宽屏 dashboard 就绪")),
+        });
+
+        let screen = render_to_text(&state, 120, 36);
+        let normalized = normalize_rendered_text(&screen);
+        assert!(normalized.contains("补齐摘要"), "{screen}");
+        assert!(normalized.contains("todo-1"), "{screen}");
+        assert!(normalized.contains("结论：全部放行"), "{screen}");
+        assert!(normalized.contains("宽屏dashboard就绪"), "{screen}");
+    }
+
+    #[test]
+    fn render_runtime_dashboard_shows_compact_planning_view_without_workers() {
+        let mut state = RuntimeViewState::new("session-6", "紧凑渲染");
+        state.apply(&RuntimeEvent::PhaseChanged {
+            phase: "规划中".to_string(),
+        });
+        state.apply(&RuntimeEvent::CommanderNote {
+            message: "正在生成 todo".to_string(),
+        });
+        state.apply(&RuntimeEvent::TodoStateChanged {
+            todo_id: "todo-1".to_string(),
+            title: "补齐紧凑视图".to_string(),
+            status: TodoStatus::Pending,
+            message: "等待执行".to_string(),
+            commit_hash: None,
+        });
+
+        let screen = render_to_text(&state, 80, 20);
+        let normalized = normalize_rendered_text(&screen);
+        assert!(normalized.contains("当前阶段：规划中"), "{screen}");
+        assert!(normalized.contains("todo-1"), "{screen}");
+        assert!(normalized.contains("等待最终摘要"), "{screen}");
+        assert!(
+            normalized.contains("最近决策：todo-1补齐紧凑视图->待执行/等待执行"),
+            "{screen}"
+        );
     }
 }

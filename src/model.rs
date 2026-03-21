@@ -38,6 +38,7 @@ impl ThinkingMode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn description(self) -> &'static str {
         match self {
             Self::Quick => "快速收敛，优先推进，减少过度分析。",
