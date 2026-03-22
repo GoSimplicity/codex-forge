@@ -7,11 +7,13 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
+use crate::memory;
 use crate::model::{
     ApplyMode, ApplyResult, ArtifactEntry, ArtifactIndexEntry, ArtifactManifest, ChangeTrustReport,
-    ExecutionContract, ExecutionGraph, FinalSummary, PlanTodo, RepoSnapshot, RuntimeEvent,
-    RuntimeEventRecord, SessionConfig, SessionLineageEntry, SessionManifest, SessionStatus,
-    TimelineEventSummary, TodoStateRecord, TodoStatus, VerificationReport, WorkerResult,
+    ExecutionContract, ExecutionGraph, FinalSummary, ManualDeliveryResult, ManualReviewState,
+    PlanTodo, RepoSnapshot, RuntimeEvent, RuntimeEventRecord, SessionConfig, SessionKind,
+    SessionLineageEntry, SessionManifest, SessionStatus, TimelineEventSummary, TodoStateRecord,
+    TodoStatus, VerificationReport, WorkerResult,
 };
 
 #[derive(Debug, Clone)]
@@ -104,6 +106,11 @@ impl SessionContext {
             repo_snapshot,
             created_at,
             status: SessionStatus::Planning,
+            session_kind: if config.plan_only {
+                SessionKind::Plan
+            } else {
+                SessionKind::Run
+            },
             ui_mode: config.ui_mode,
             workers_requested: config.workers,
             role_set: config.role_set.clone(),
@@ -117,6 +124,7 @@ impl SessionContext {
             config_path: config.config_path.clone(),
             preset: config.preset,
             iteration_index,
+            shared_context_version: 1,
             root_session_id,
             parent_session_id: config
                 .continuation
@@ -148,6 +156,14 @@ impl SessionContext {
             change_trust_report: None,
             doctor_report: None,
             final_summary: None,
+            manual_delivery_result: None,
+            manual_review_state: None,
+            review_fix: config
+                .continuation
+                .as_ref()
+                .and_then(|item| item.review_fix.clone()),
+            memory_manifest: None,
+            source_plan_session_id: config.source_plan_session_id.clone(),
             reused_plan_session_id: None,
             resumed_from_session_id: None,
             artifact_index: Vec::new(),
@@ -180,6 +196,7 @@ impl SessionContext {
         };
         ctx.persist()?;
         ctx.persist_artifact_manifest()?;
+        ctx.sync_memory_manifest()?;
         Ok(ctx)
     }
 
@@ -222,6 +239,18 @@ impl SessionContext {
         fs::write(&markdown_path, render_plan_todo_markdown(&plan_todo)).with_context(|| {
             format!("写入 plan todo Markdown 失败：{}", markdown_path.display())
         })?;
+        let deliverable_plan_path = self.manifest.deliverable_plan_path();
+        fs::create_dir_all(self.manifest.deliverables_dir()).with_context(|| {
+            format!(
+                "创建过程工件目录失败：{}",
+                self.manifest.deliverables_dir().display()
+            )
+        })?;
+        fs::write(
+            &deliverable_plan_path,
+            render_user_plan_deliverable(&self.manifest, &plan_todo),
+        )
+        .with_context(|| format!("写入过程计划摘要失败：{}", deliverable_plan_path.display()))?;
         self.manifest.artifact_manifest.plan_todo_path = Some(json_path);
         self.persist_todo_states()?;
         self.persist_artifact_manifest()?;
@@ -360,6 +389,42 @@ impl SessionContext {
                 self.manifest.summary_markdown_path.display()
             )
         })?;
+        fs::create_dir_all(self.manifest.deliverables_dir()).with_context(|| {
+            format!(
+                "创建过程工件目录失败：{}",
+                self.manifest.deliverables_dir().display()
+            )
+        })?;
+        fs::write(
+            self.manifest.deliverable_summary_path(),
+            render_user_summary_deliverable(&self.manifest, &summary),
+        )
+        .with_context(|| {
+            format!(
+                "写入过程总结摘要失败：{}",
+                self.manifest.deliverable_summary_path().display()
+            )
+        })?;
+        fs::write(
+            self.manifest.deliverable_changes_path(),
+            render_user_changes_deliverable(&self.manifest, &summary),
+        )
+        .with_context(|| {
+            format!(
+                "写入过程变更摘要失败：{}",
+                self.manifest.deliverable_changes_path().display()
+            )
+        })?;
+        fs::write(
+            self.manifest.deliverable_verify_path(),
+            render_user_verify_deliverable(&self.manifest, &summary),
+        )
+        .with_context(|| {
+            format!(
+                "写入过程验证摘要失败：{}",
+                self.manifest.deliverable_verify_path().display()
+            )
+        })?;
         self.persist()
     }
 
@@ -405,8 +470,14 @@ impl SessionContext {
             .join("latest.md")
     }
 
+    #[allow(dead_code)]
     pub fn set_reused_plan_session_id(&mut self, session_id: impl Into<String>) -> Result<()> {
         self.manifest.reused_plan_session_id = Some(session_id.into());
+        self.persist()
+    }
+
+    pub fn set_source_plan_session_id(&mut self, session_id: impl Into<String>) -> Result<()> {
+        self.manifest.source_plan_session_id = Some(session_id.into());
         self.persist()
     }
 
@@ -496,6 +567,12 @@ impl SessionContext {
                 self.manifest.artifact_manifest_path.display()
             )
         })
+    }
+
+    pub fn sync_memory_manifest(&mut self) -> Result<()> {
+        memory::sync_memory_manifest(&mut self.manifest)?;
+        self.persist_artifact_manifest()?;
+        self.persist()
     }
 
     pub fn append_timeline(&mut self, event: &RuntimeEvent) -> Result<()> {
@@ -614,6 +691,88 @@ pub fn load_session(target_dir: &Path, session_id: Option<&str>) -> Result<Sessi
         .with_context(|| format!("读取 manifest 失败：{}", manifest_path.display()))?;
     let manifest = serde_json::from_str(&content).context("解析 manifest 失败")?;
     Ok(normalize_loaded_manifest(manifest))
+}
+
+pub fn set_manual_delivery_result_for_loaded_session(
+    manifest: &mut SessionManifest,
+    result: ManualDeliveryResult,
+) -> Result<()> {
+    let path = manifest.manual_delivery_result_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建手动交付目录失败：{}", parent.display()))?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&result).context("序列化手动交付结果失败")?,
+    )
+    .with_context(|| format!("写入手动交付结果失败：{}", path.display()))?;
+    manifest.manual_delivery_result = Some(result);
+    manifest.artifact_manifest.manual_delivery_result_path = Some(path);
+    manifest.artifact_index = build_artifact_index(manifest);
+    fs::write(
+        manifest.session_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest).context("序列化 session manifest 失败")?,
+    )
+    .with_context(|| {
+        format!(
+            "写入 session manifest 失败：{}",
+            manifest.session_dir.join("manifest.json").display()
+        )
+    })?;
+    fs::write(
+        &manifest.artifact_manifest_path,
+        serde_json::to_vec_pretty(&manifest.artifact_manifest)
+            .context("序列化 artifact manifest 失败")?,
+    )
+    .with_context(|| {
+        format!(
+            "写入 artifact manifest 失败：{}",
+            manifest.artifact_manifest_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub fn set_manual_review_state_for_loaded_session(
+    manifest: &mut SessionManifest,
+    state: ManualReviewState,
+) -> Result<()> {
+    let path = manifest.manual_review_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建人工审查目录失败：{}", parent.display()))?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&state).context("序列化人工审查状态失败")?,
+    )
+    .with_context(|| format!("写入人工审查状态失败：{}", path.display()))?;
+    manifest.manual_review_state = Some(state);
+    manifest.artifact_manifest.manual_review_state_path = Some(path);
+    manifest.artifact_index = build_artifact_index(manifest);
+    fs::write(
+        manifest.session_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest).context("序列化 session manifest 失败")?,
+    )
+    .with_context(|| {
+        format!(
+            "写入 session manifest 失败：{}",
+            manifest.session_dir.join("manifest.json").display()
+        )
+    })?;
+    fs::write(
+        &manifest.artifact_manifest_path,
+        serde_json::to_vec_pretty(&manifest.artifact_manifest)
+            .context("序列化 artifact manifest 失败")?,
+    )
+    .with_context(|| {
+        format!(
+            "写入 artifact manifest 失败：{}",
+            manifest.artifact_manifest_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn cleanup_session_lineage(target_dir: &Path, session_id: &str) -> Result<CleanupReport> {
@@ -748,6 +907,7 @@ pub fn reset_session_lineage(target_dir: &Path, session_id: &str) -> Result<Rese
     })
 }
 
+#[allow(dead_code)]
 pub fn find_reusable_plan_session(
     target_dir: &Path,
     task: &str,
@@ -1018,6 +1178,9 @@ fn normalize_loaded_manifest(mut manifest: SessionManifest) -> SessionManifest {
     if manifest.iteration_index == 0 {
         manifest.iteration_index = 1;
     }
+    if manifest.shared_context_version == 0 {
+        manifest.shared_context_version = 1;
+    }
     if manifest.root_session_id.is_empty() {
         manifest.root_session_id = manifest.id.clone();
     }
@@ -1030,7 +1193,25 @@ fn normalize_loaded_manifest(mut manifest: SessionManifest) -> SessionManifest {
             created_at: manifest.created_at,
         });
     }
+    if manifest.source_plan_session_id.is_none() {
+        manifest.source_plan_session_id = manifest.reused_plan_session_id.clone();
+    }
+    manifest.session_kind = infer_session_kind(&manifest);
     manifest
+}
+
+fn infer_session_kind(manifest: &SessionManifest) -> SessionKind {
+    if !manifest.worker_results.is_empty()
+        || manifest.apply_result.is_some()
+        || manifest.final_summary.is_some()
+        || manifest.resumed_from_session_id.is_some()
+        || manifest.source_plan_session_id.is_some()
+        || !matches!(manifest.apply_mode, ApplyMode::None)
+    {
+        SessionKind::Run
+    } else {
+        SessionKind::Plan
+    }
 }
 
 fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -> String {
@@ -1097,6 +1278,7 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
 - 结果：{}\n\
 - reviewer gate：{}\n\
 - apply：{}\n\
+- 目标目录交付：{}\n\
 - 可信度：{}\n\n\
 ## 执行图\n\n`{}`\n\n\
 ## Worker 结果\n\n{}\n\n\
@@ -1134,6 +1316,11 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
             .map(|item| item.label().to_string())
             .unwrap_or_else(|| "无".to_string()),
         summary.apply_status.label(),
+        if manifest.delivered_to_target() {
+            "已交付"
+        } else {
+            "未交付"
+        },
         summary.trust_level.label(),
         manifest.graph_path.display(),
         worker_lines,
@@ -1156,6 +1343,55 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
         open_risks,
         unaccepted_feedback,
         recommended_next_action,
+    )
+}
+
+fn render_user_plan_deliverable(manifest: &SessionManifest, plan_todo: &PlanTodo) -> String {
+    let todos = plan_todo
+        .todos
+        .iter()
+        .map(|item| {
+            let deps = if item.dependencies.is_empty() {
+                "无依赖".to_string()
+            } else {
+                format!("依赖：{}", item.dependencies.join("、"))
+            };
+            let criteria = if item.completion_criteria.is_empty() {
+                "完成标准：待补充".to_string()
+            } else {
+                format!("完成标准：{}", item.completion_criteria.join("；"))
+            };
+            format!(
+                "## {} {}\n\n- 目标：{}\n- {}\n- {}\n",
+                item.id, item.title, item.goal, deps, criteria
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let risks = render_bullets(&plan_todo.risks);
+
+    format!(
+        "# Codex Forge 计划\n\n\
+- 目标仓库：`{}`\n\
+- 会话：`{}`\n\
+- 当前轮次：V{}\n\
+- 系统记录目录：`{}`\n\
+- 你直接看的交付物目录：`{}`\n\n\
+## 任务\n\n{}\n\n\
+## 方案摘要\n\n{}\n\n\
+## 推进策略\n\n{}\n\n\
+## 待办清单\n\n{}\n\
+## 主要风险\n\n{}\n",
+        manifest.repo_root().display(),
+        manifest.id,
+        plan_todo.iteration_index,
+        manifest.session_dir.display(),
+        manifest.repo_root().display(),
+        manifest.task,
+        plan_todo.summary,
+        plan_todo.approach,
+        todos,
+        risks,
     )
 }
 
@@ -1211,6 +1447,172 @@ fn render_plan_todo_markdown(plan_todo: &PlanTodo) -> String {
     )
 }
 
+fn render_user_summary_deliverable(manifest: &SessionManifest, summary: &FinalSummary) -> String {
+    let next_steps = render_bullets(&summary.recommended_next_action);
+    let completed = render_bullets(&summary.completed_this_iteration);
+    let risks = render_bullets(&summary.open_risks);
+
+    format!(
+        "# Codex Forge 最终交付\n\n\
+- 目标仓库：`{}`\n\
+- 会话：`{}`\n\
+- 系统记录目录：`{}`\n\
+- 你直接看的交付物目录：`{}`\n\n\
+## 任务\n\n{}\n\n\
+## 结果结论\n\n{}\n\n\
+- 结果：{}\n\
+- 审阅结论：{}\n\
+- 应用状态：{}\n\
+- 目标目录交付：{}\n\
+- 可信度：{}\n\n\
+## 本轮完成内容\n\n{}\n\n\
+## 下一步建议\n\n{}\n\n\
+## 风险提示\n\n{}\n",
+        manifest.repo_root().display(),
+        manifest.id,
+        manifest.session_dir.display(),
+        manifest.repo_root().display(),
+        manifest.task,
+        summary.overview,
+        summary.result_status.label(),
+        summary
+            .review_gate
+            .map(|item| item.label().to_string())
+            .unwrap_or_else(|| "无".to_string()),
+        summary.apply_status.label(),
+        if manifest.delivered_to_target() {
+            "已交付"
+        } else {
+            "未交付"
+        },
+        summary.trust_level.label(),
+        completed,
+        next_steps,
+        risks,
+    )
+}
+
+fn render_user_changes_deliverable(manifest: &SessionManifest, summary: &FinalSummary) -> String {
+    let accepted = render_bullets(&summary.accepted_files);
+    let manual_review = render_bullets(&summary.manual_review_files);
+    let rejected = render_bullets(&summary.rejected_files);
+    let todo_states = render_todo_states(&summary.todo_states);
+    let apply_result = manifest
+        .apply_result
+        .as_ref()
+        .map(|result| {
+            let commits = if result.todo_commits.is_empty() {
+                "- 无".to_string()
+            } else {
+                result
+                    .todo_commits
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "- {} / {} / {}",
+                            item.todo_id,
+                            item.status.label(),
+                            item.commit_hash.as_deref().unwrap_or("未记录 commit")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "## 应用结果\n\n- 模式：{}\n- 状态：{}\n- 已同步到目标仓库：{}\n\n## Todo 提交记录\n\n{}\n",
+                result.mode.label(),
+                result.status.label(),
+                if result.synced_to_target { "是" } else { "否" },
+                commits
+            )
+        })
+        .unwrap_or_else(|| "## 应用结果\n\n- 当前没有 apply 记录。\n".to_string());
+
+    format!(
+        "# Codex Forge 变更摘要\n\n\
+- 目标仓库：`{}`\n\
+- 会话：`{}`\n\n\
+## 已接收变更\n\n{}\n\n\
+## 需要人工复核\n\n{}\n\n\
+## 被拒绝或未接收\n\n{}\n\n\
+## Todo 当前状态\n\n{}\n\n\
+{}\n",
+        manifest.repo_root().display(),
+        manifest.id,
+        accepted,
+        manual_review,
+        rejected,
+        todo_states,
+        apply_result,
+    )
+}
+
+fn render_user_verify_deliverable(manifest: &SessionManifest, summary: &FinalSummary) -> String {
+    let verified = render_bullets(&summary.verified_capabilities);
+    let blocked = render_bullets(&summary.blocked_verifications);
+    let verification_report = manifest
+        .verification_report
+        .as_ref()
+        .map(|report| {
+            let integration = if report.integration.is_empty() {
+                "- 无".to_string()
+            } else {
+                report
+                    .integration
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "- {} / {} / {}",
+                            item.stage,
+                            item.capability,
+                            item.status.label()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let final_run = if report.final_run.is_empty() {
+                "- 无".to_string()
+            } else {
+                report
+                    .final_run
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "- {} / {} / {}",
+                            item.stage,
+                            item.capability,
+                            item.status.label()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "## 验证明细\n\n- 总体结论：{}\n\n### 集成验证\n\n{}\n\n### 最终验证\n\n{}\n",
+                report.overall_status.label(),
+                integration,
+                final_run
+            )
+        })
+        .unwrap_or_else(|| "## 验证明细\n\n- 当前没有验证报告。\n".to_string());
+
+    format!(
+        "# Codex Forge 验证摘要\n\n\
+- 目标仓库：`{}`\n\
+- 会话：`{}`\n\n\
+## 已通过能力\n\n{}\n\n\
+## 受阻项目\n\n{}\n\n\
+{}\n",
+        manifest.repo_root().display(),
+        manifest.id,
+        verified,
+        blocked,
+        verification_report,
+    )
+}
+
+#[allow(dead_code)]
 fn is_reusable_plan_manifest(
     manifest: &SessionManifest,
     task: &str,
@@ -1357,84 +1759,177 @@ fn build_artifact_index(manifest: &SessionManifest) -> Vec<ArtifactIndexEntry> {
     if let Some(path) = &manifest.artifact_manifest.plan_todo_path {
         items.push(ArtifactIndexEntry {
             key: "plan_todo".to_string(),
+            kind: "plan".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     items.push(ArtifactIndexEntry {
         key: "timeline".to_string(),
+        kind: "timeline".to_string(),
+        scope: "session".to_string(),
         path: manifest.timeline_path.clone(),
     });
     items.push(ArtifactIndexEntry {
         key: "graph".to_string(),
+        kind: "graph".to_string(),
+        scope: "session".to_string(),
         path: manifest.graph_path.clone(),
     });
     items.push(ArtifactIndexEntry {
         key: "summary_json".to_string(),
+        kind: "summary".to_string(),
+        scope: "session".to_string(),
         path: manifest.summary_json_path.clone(),
     });
     items.push(ArtifactIndexEntry {
         key: "summary_markdown".to_string(),
+        kind: "summary".to_string(),
+        scope: "session".to_string(),
         path: manifest.summary_markdown_path.clone(),
     });
     if let Some(path) = &manifest.artifact_manifest.execution_contract_path {
         items.push(ArtifactIndexEntry {
             key: "execution_contract".to_string(),
+            kind: "contract".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.apply_plan_path {
         items.push(ArtifactIndexEntry {
             key: "apply_plan".to_string(),
+            kind: "apply".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.apply_result_path {
         items.push(ArtifactIndexEntry {
             key: "apply_result".to_string(),
+            kind: "apply".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.verification_report_path {
         items.push(ArtifactIndexEntry {
             key: "verification_report".to_string(),
+            kind: "verification".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.change_trust_report_path {
         items.push(ArtifactIndexEntry {
             key: "change_trust_report".to_string(),
+            kind: "trust".to_string(),
+            scope: "session".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.manual_delivery_result_path {
+        items.push(ArtifactIndexEntry {
+            key: "manual_delivery_result".to_string(),
+            kind: "delivery".to_string(),
+            scope: "session".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.manual_review_state_path {
+        items.push(ArtifactIndexEntry {
+            key: "manual_review_state".to_string(),
+            kind: "review".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.feedback_json_path {
         items.push(ArtifactIndexEntry {
             key: "feedback_json".to_string(),
+            kind: "feedback".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.feedback_markdown_path {
         items.push(ArtifactIndexEntry {
             key: "feedback_markdown".to_string(),
+            kind: "feedback".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.iteration_summary_path {
         items.push(ArtifactIndexEntry {
             key: "iteration_summary".to_string(),
+            kind: "summary".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.lineage_path {
         items.push(ArtifactIndexEntry {
             key: "lineage".to_string(),
+            kind: "lineage".to_string(),
+            scope: "session".to_string(),
             path: path.clone(),
         });
     }
     if let Some(path) = &manifest.artifact_manifest.latest_pointer_path {
         items.push(ArtifactIndexEntry {
             key: "latest".to_string(),
+            kind: "pointer".to_string(),
+            scope: "shared".to_string(),
             path: path.clone(),
         });
+    }
+    if let Some(path) = &manifest.artifact_manifest.memory_manifest_path {
+        items.push(ArtifactIndexEntry {
+            key: "memory_manifest".to_string(),
+            kind: "memory".to_string(),
+            scope: "session".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.shared_memory_index_path {
+        items.push(ArtifactIndexEntry {
+            key: "shared_memory_index".to_string(),
+            kind: "memory".to_string(),
+            scope: "shared".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.session_memory_entries_path {
+        items.push(ArtifactIndexEntry {
+            key: "session_memory_entries".to_string(),
+            kind: "memory".to_string(),
+            scope: "session".to_string(),
+            path: path.clone(),
+        });
+    }
+    if let Some(path) = &manifest.artifact_manifest.task_brief_path {
+        items.push(ArtifactIndexEntry {
+            key: "task_brief".to_string(),
+            kind: "memory".to_string(),
+            scope: "session".to_string(),
+            path: path.clone(),
+        });
+    }
+    for (key, path) in [
+        ("deliverable_plan", manifest.deliverable_plan_path()),
+        ("deliverable_summary", manifest.deliverable_summary_path()),
+        ("deliverable_changes", manifest.deliverable_changes_path()),
+        ("deliverable_verify", manifest.deliverable_verify_path()),
+    ] {
+        if path.exists() {
+            items.push(ArtifactIndexEntry {
+                key: key.to_string(),
+                kind: "deliverable".to_string(),
+                scope: "session".to_string(),
+                path,
+            });
+        }
     }
     items
 }
@@ -1459,41 +1954,100 @@ fn build_demo_summary(manifest: &SessionManifest, summary: &FinalSummary) -> Vec
 
 fn timeline_title(event: &RuntimeEvent) -> String {
     match event {
+        RuntimeEvent::BrainStarted { .. } => "Brain 已接管".to_string(),
+        RuntimeEvent::BrainThought { .. } => "Brain 思考".to_string(),
+        RuntimeEvent::BrainDecisionMade { .. } => "Brain 决策".to_string(),
+        RuntimeEvent::BrainEscalationRaised { .. } => "Brain 升级".to_string(),
+        RuntimeEvent::SchedulerSnapshotUpdated { .. } => "调度快照".to_string(),
         RuntimeEvent::PhaseChanged { .. } => "阶段切换".to_string(),
-        RuntimeEvent::CommanderNote { .. } => "指挥备注".to_string(),
-        RuntimeEvent::GraphReady { .. } => "执行图就绪".to_string(),
+        RuntimeEvent::CommanderNote { .. } => "过程说明".to_string(),
+        RuntimeEvent::GraphReady { .. } => "方案完成".to_string(),
         RuntimeEvent::TodoStateChanged { title, .. } => format!("Todo 更新：{title}"),
-        RuntimeEvent::WorkerDispatched { agent_id, .. } => format!("启动 {agent_id}"),
-        RuntimeEvent::WorkerUpdate { agent_id, .. } => format!("Worker 更新：{agent_id}"),
-        RuntimeEvent::HandoffReady { agent_id, .. } => format!("交接就绪：{agent_id}"),
-        RuntimeEvent::WorkerFinished { result } => format!("Worker 完成：{}", result.agent_id),
-        RuntimeEvent::ApplyPlanReady { .. } => "应用计划就绪".to_string(),
-        RuntimeEvent::ReviewGateReady { .. } => "审阅关卡结论".to_string(),
-        RuntimeEvent::ApplyUpdate { .. } => "应用更新".to_string(),
+        RuntimeEvent::WorkerQueued { title, .. } => format!("队列更新：{title}"),
+        RuntimeEvent::WorkerBlocked { title, .. } => format!("阻塞：{title}"),
+        RuntimeEvent::WorkerRequeued { agent_id, .. } => format!("重新入队：{agent_id}"),
+        RuntimeEvent::WorkerDispatched { .. } => "子任务开始".to_string(),
+        RuntimeEvent::WorkerUpdate { .. } => "子任务推进".to_string(),
+        RuntimeEvent::WorkerOutput { stream, .. } => match stream.as_str() {
+            "stderr" => "错误流输出".to_string(),
+            _ => "标准流输出".to_string(),
+        },
+        RuntimeEvent::HandoffReady { .. } => "阶段产物已生成".to_string(),
+        RuntimeEvent::MemoryViewReady { .. } => "上下文整理完成".to_string(),
+        RuntimeEvent::WorkerFinished { result } => format!("子任务完成：{}", result.task_title),
+        RuntimeEvent::ApplyPlanReady { .. } => "落地计划就绪".to_string(),
+        RuntimeEvent::ReviewGateReady { .. } => "审阅结论".to_string(),
+        RuntimeEvent::ApplyUpdate { .. } => "落地更新".to_string(),
         RuntimeEvent::VerificationReady { stage, .. } => format!("验证完成：{stage}"),
-        RuntimeEvent::SummaryReady { .. } => "总结完成".to_string(),
+        RuntimeEvent::MemoryUpdated { reason, .. } => format!("记忆更新：{reason}"),
+        RuntimeEvent::SummaryReady { .. } => "交付摘要完成".to_string(),
     }
 }
 
 fn timeline_detail(event: &RuntimeEvent) -> String {
     match event {
+        RuntimeEvent::BrainStarted { state } => {
+            format!("{} / {}", state.status, truncate(&state.objective, 96))
+        }
+        RuntimeEvent::BrainThought { thought } => truncate(thought, 120),
+        RuntimeEvent::BrainDecisionMade { decision } => format!(
+            "{} / {}",
+            decision.action.label(),
+            truncate(&decision.rationale, 96)
+        ),
+        RuntimeEvent::BrainEscalationRaised { message } => truncate(message, 120),
+        RuntimeEvent::SchedulerSnapshotUpdated { snapshot } => format!(
+            "ready {} / running {} / 阻塞(依赖{} 角色{} 上游{}) / 关键路径 {}",
+            snapshot.ready_count,
+            snapshot.running_count,
+            snapshot.blocked_dependency_count,
+            snapshot.blocked_role_limit_count,
+            snapshot.blocked_upstream_failed_count,
+            snapshot.critical_path_remaining
+        ),
         RuntimeEvent::PhaseChanged { phase } => phase.clone(),
-        RuntimeEvent::CommanderNote { message } => message.clone(),
+        RuntimeEvent::CommanderNote { message } => truncate(message, 120),
         RuntimeEvent::GraphReady {
             nodes,
             dependencies,
-        } => format!("节点 {nodes} / 依赖 {dependencies}"),
+        } => format!("共 {nodes} 个执行节点 / {dependencies} 条依赖"),
         RuntimeEvent::TodoStateChanged {
-            todo_id,
+            title,
             status,
             message,
             ..
-        } => format!("{todo_id} -> {} / {}", status.label(), message),
-        RuntimeEvent::WorkerDispatched { role, title, .. } => format!("{role} / {title}"),
-        RuntimeEvent::WorkerUpdate { kind, message, .. } => {
-            format!("{kind} / {}", message.replace('\n', " "))
+        } => format!("{title} / {} / {}", status.label(), truncate(message, 96)),
+        RuntimeEvent::WorkerQueued {
+            role,
+            lane,
+            todo_id,
+            ..
+        } => format!(
+            "{} / 队列位次 {} / {}",
+            role,
+            lane,
+            todo_id.as_deref().unwrap_or("未映射 todo")
+        ),
+        RuntimeEvent::WorkerBlocked { reason, .. } => {
+            format!("{} / {}", reason.label(), truncate(&reason.detail, 96))
         }
-        RuntimeEvent::HandoffReady { handoff_path, .. } => handoff_path.display().to_string(),
+        RuntimeEvent::WorkerRequeued { reason, .. } => truncate(reason, 120),
+        RuntimeEvent::WorkerDispatched { role, title, .. } => format!("{role} / {title}"),
+        RuntimeEvent::WorkerUpdate { message, .. } => truncate(&message.replace('\n', " "), 120),
+        RuntimeEvent::WorkerOutput {
+            agent_id,
+            stream,
+            message,
+        } => format!(
+            "{} / {} / {}",
+            agent_id,
+            stream,
+            truncate(&message.replace('\n', " "), 120)
+        ),
+        RuntimeEvent::HandoffReady { .. } => "已生成交接稿，等待整合。".to_string(),
+        RuntimeEvent::MemoryViewReady { entries, .. } => {
+            format!("已整理 {} 条共享上下文。", entries)
+        }
         RuntimeEvent::WorkerFinished { result } => {
             format!("{} / {}", result.task_title, result.status.label())
         }
@@ -1508,10 +2062,151 @@ fn timeline_detail(event: &RuntimeEvent) -> String {
                 .clone()
                 .unwrap_or_else(|| "无补充说明".to_string())
         ),
-        RuntimeEvent::ApplyUpdate { message } => message.clone(),
+        RuntimeEvent::ApplyUpdate { message } => truncate(message, 120),
         RuntimeEvent::VerificationReady {
             success, message, ..
-        } => format!("{} / {}", if *success { "成功" } else { "失败" }, message),
+        } => format!(
+            "{} / {}",
+            if *success { "成功" } else { "失败" },
+            truncate(message, 120)
+        ),
+        RuntimeEvent::MemoryUpdated { scope, entries, .. } => format!("{scope} / {} 条", entries),
         RuntimeEvent::SummaryReady { summary } => summary.overview.clone(),
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    let trimmed = text.replace('\n', " ");
+    if trimmed.chars().count() <= max {
+        trimmed
+    } else {
+        format!("{}…", trimmed.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionContext;
+    use crate::model::{
+        ApplyMode, ApplyStatus, FinalSummary, PlanTodo, PlanTodoItem, RepoSnapshot, ResultStatus,
+        SessionConfig, ThinkingMode, TodoStateRecord, TrustLevel, UiMode,
+    };
+    use tempfile::TempDir;
+
+    fn sample_config(root: &std::path::Path) -> SessionConfig {
+        SessionConfig {
+            task: "优化 TUI 体验".to_string(),
+            workers: 2,
+            role_set: "default".to_string(),
+            model: None,
+            thinking_mode: ThinkingMode::Balanced,
+            ui_mode: UiMode::Minimal,
+            target_dir: root.to_path_buf(),
+            cleanup_success: false,
+            apply_mode: ApplyMode::Bundle,
+            max_retries: 1,
+            fail_fast: false,
+            verification_commands: Vec::new(),
+            config_path: None,
+            global_rule_prompt: String::new(),
+            reviewer_rule_prompt: None,
+            plan_only: false,
+            preset: None,
+            source_plan_session_id: None,
+            resume_session_id: None,
+            continuation: None,
+        }
+    }
+
+    fn sample_repo_snapshot(root: &std::path::Path) -> RepoSnapshot {
+        RepoSnapshot {
+            repo_root: root.to_path_buf(),
+            display_name: "demo".to_string(),
+            top_level_entries: vec!["src".to_string()],
+            detected_stacks: vec!["rust".to_string()],
+            readme_excerpt: None,
+        }
+    }
+
+    fn sample_plan() -> PlanTodo {
+        PlanTodo {
+            summary: "先梳理执行方案，再决定是否真正运行。".to_string(),
+            approach: "优先展示方案和交付物目录。".to_string(),
+            todos: vec![PlanTodoItem {
+                id: "todo-1".to_string(),
+                title: "重做信息架构".to_string(),
+                goal: "让用户先看到方案，再决定执行".to_string(),
+                details: vec!["优化 Start 页".to_string()],
+                dependencies: Vec::new(),
+                completion_criteria: vec!["主路径清晰".to_string()],
+            }],
+            risks: vec!["旧断言需要同步调整".to_string()],
+            used_fallback: false,
+            planning_notes: Vec::new(),
+            iteration_index: 1,
+            source_session_id: None,
+            feedback_summary: Vec::new(),
+            delta_summary: Vec::new(),
+        }
+    }
+
+    fn sample_summary() -> FinalSummary {
+        FinalSummary {
+            overview: "TUI 已改成先看方案、再看执行与交付。".to_string(),
+            result_status: ResultStatus::Completed,
+            review_gate: None,
+            apply_status: ApplyStatus::Bundled,
+            trust_level: TrustLevel::High,
+            accepted_files: vec!["src/app_shell.rs".to_string()],
+            manual_review_files: vec!["src/ui.rs".to_string()],
+            rejected_files: Vec::new(),
+            verified_capabilities: vec!["cargo test".to_string()],
+            blocked_verifications: Vec::new(),
+            open_risks: vec!["真实 PTY 文案断言需要同步".to_string()],
+            recommended_next_action: vec!["进入目标仓库根目录查看交付物".to_string()],
+            todo_states: vec![TodoStateRecord {
+                todo_id: "todo-1".to_string(),
+                title: "重做信息架构".to_string(),
+                status: crate::model::TodoStatus::Verified,
+                node_ids: Vec::new(),
+                completed_node_ids: Vec::new(),
+                commit_hash: None,
+                last_message: Some("验证通过".to_string()),
+            }],
+            used_fallback: false,
+            review_report: None,
+            evidence_summary: Vec::new(),
+            iteration_index: 1,
+            based_on_session_id: None,
+            feedback_summary: Vec::new(),
+            delta_summary: Vec::new(),
+            completed_this_iteration: vec!["完成 TUI 主路径重构".to_string()],
+            unaccepted_feedback: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn writes_process_deliverables_into_session_dir() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path();
+        let mut ctx =
+            SessionContext::init(&sample_config(root), sample_repo_snapshot(root)).expect("init");
+
+        ctx.set_plan_todo(sample_plan()).expect("plan export");
+        assert!(ctx.manifest.deliverable_plan_path().exists());
+        assert!(
+            ctx.manifest
+                .deliverable_plan_path()
+                .starts_with(ctx.manifest.session_dir.join("deliverables"))
+        );
+        assert!(!root.join("codex-forge-plan.md").exists());
+
+        ctx.set_summary(sample_summary()).expect("summary export");
+        assert!(ctx.manifest.deliverable_summary_path().exists());
+        assert!(ctx.manifest.deliverable_changes_path().exists());
+        assert!(ctx.manifest.deliverable_verify_path().exists());
+        assert!(!root.join("codex-forge-summary.md").exists());
+        assert!(!root.join("codex-forge-changes.md").exists());
+        assert!(!root.join("codex-forge-verify.md").exists());
     }
 }

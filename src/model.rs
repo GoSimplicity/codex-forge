@@ -114,6 +114,23 @@ impl SessionStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    Plan,
+    Run,
+}
+
+impl SessionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "方案会话",
+            Self::Run => "执行会话",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
@@ -254,6 +271,15 @@ pub enum VerificationStatus {
 impl VerificationStatus {
     pub fn is_success_like(self) -> bool {
         matches!(self, Self::Passed)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "通过",
+            Self::Failed => "失败",
+            Self::BlockedByEnvironment => "受环境阻塞",
+            Self::Skipped => "跳过",
+        }
     }
 }
 
@@ -422,6 +448,8 @@ pub struct ContinuationConfig {
     pub parent_summary_overview: Option<String>,
     #[serde(default)]
     pub parent_recommended_next_action: Vec<String>,
+    #[serde(default)]
+    pub review_fix: Option<ReviewFixRequest>,
 }
 
 impl ContinuationConfig {
@@ -458,6 +486,8 @@ pub struct SessionConfig {
     pub reviewer_rule_prompt: Option<String>,
     pub plan_only: bool,
     pub preset: Option<SessionPreset>,
+    #[serde(default)]
+    pub source_plan_session_id: Option<String>,
     pub resume_session_id: Option<String>,
     #[serde(default)]
     pub continuation: Option<ContinuationConfig>,
@@ -506,6 +536,8 @@ pub struct ExecutionNode {
     pub required_verifications: Vec<String>,
     #[serde(default)]
     pub scope_guard_ref: Option<String>,
+    #[serde(default)]
+    pub scheduler_hint: Option<SchedulerHint>,
     #[serde(default = "default_scope_drift_none")]
     pub acceptable_drift: ScopeDrift,
 }
@@ -686,6 +718,164 @@ impl TodoStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerHint {
+    CriticalPath,
+    Unlock,
+    Closure,
+}
+
+impl SchedulerHint {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CriticalPath => "关键路径",
+            Self::Unlock => "解锁下游",
+            Self::Closure => "收口收尾",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerQueueState {
+    Queued,
+    Ready,
+    Running,
+    Blocked,
+    Finished,
+}
+
+impl WorkerQueueState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "排队中",
+            Self::Ready => "可派发",
+            Self::Running => "执行中",
+            Self::Blocked => "阻塞",
+            Self::Finished => "已完成",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedReasonKind {
+    WaitingDependencies,
+    RoleConcurrencyLimit,
+    UpstreamFailed,
+    WaitingReview,
+    WaitingVerification,
+    UserStop,
+}
+
+impl BlockedReasonKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitingDependencies => "等待依赖",
+            Self::RoleConcurrencyLimit => "角色并发上限",
+            Self::UpstreamFailed => "上游失败",
+            Self::WaitingReview => "等待审阅",
+            Self::WaitingVerification => "等待验证",
+            Self::UserStop => "用户停止",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedReason {
+    pub kind: BlockedReasonKind,
+    pub detail: String,
+}
+
+impl BlockedReason {
+    pub fn label(&self) -> &str {
+        self.kind.label()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainRiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl BrainRiskLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "低",
+            Self::Medium => "中",
+            Self::High => "高",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainActionKind {
+    DispatchNode,
+    Reprioritize,
+    Hold,
+    RequestRepair,
+    RequestVerification,
+    AdvancePhase,
+    EscalateToUser,
+}
+
+impl BrainActionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DispatchNode => "派发节点",
+            Self::Reprioritize => "重排优先级",
+            Self::Hold => "暂缓等待",
+            Self::RequestRepair => "请求修复",
+            Self::RequestVerification => "请求验证",
+            Self::AdvancePhase => "推进阶段",
+            Self::EscalateToUser => "升级给用户",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainState {
+    pub status: String,
+    pub objective: String,
+    pub current_focus: String,
+    pub latest_thought: String,
+    pub latest_decision: String,
+    pub risk_level: BrainRiskLevel,
+    #[serde(default)]
+    pub needs_user_attention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrainDecision {
+    pub action: BrainActionKind,
+    pub summary: String,
+    pub rationale: String,
+    #[serde(default)]
+    pub target_agents: Vec<String>,
+    #[serde(default)]
+    pub focus_todos: Vec<String>,
+    pub risk_level: BrainRiskLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerSnapshot {
+    pub total_nodes: usize,
+    pub queued_count: usize,
+    pub ready_count: usize,
+    pub running_count: usize,
+    pub blocked_dependency_count: usize,
+    pub blocked_role_limit_count: usize,
+    pub blocked_upstream_failed_count: usize,
+    pub finished_count: usize,
+    pub idle_slots: usize,
+    pub critical_path_remaining: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoStateRecord {
     pub todo_id: String,
@@ -804,6 +994,12 @@ pub struct ChangeTrustReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewFixRequest {
+    pub target_file: String,
+    pub issue_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyResult {
     pub mode: ApplyMode,
     pub status: ApplyStatus,
@@ -826,6 +1022,64 @@ pub struct ApplyResult {
     pub todo_commits: Vec<TodoCommitRecord>,
     #[serde(default)]
     pub review_report: Option<ReviewGateReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualDeliveryResult {
+    pub delivered_at: DateTime<Utc>,
+    pub target_dir: PathBuf,
+    pub delivered_files: Vec<String>,
+    #[serde(default)]
+    pub skipped_files: Vec<String>,
+    pub success: bool,
+    #[serde(default)]
+    pub source_apply_status: Option<ApplyStatus>,
+    #[serde(default)]
+    pub review_gate: Option<ApplyDecision>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualReviewFileStatus {
+    Pending,
+    NeedsFix,
+    FixedPendingReview,
+    Approved,
+}
+
+impl ManualReviewFileStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "待审查",
+            Self::NeedsFix => "需修复",
+            Self::FixedPendingReview => "返修后待复查",
+            Self::Approved => "已通过",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualReviewFileRecord {
+    pub path: String,
+    pub status: ManualReviewFileStatus,
+    #[serde(default)]
+    pub source_workers: Vec<String>,
+    #[serde(default)]
+    pub issue_summary: Option<String>,
+    #[serde(default)]
+    pub fix_session_ids: Vec<String>,
+    #[serde(default)]
+    pub latest_fix_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualReviewState {
+    pub source_session_id: String,
+    #[serde(default)]
+    pub selected_file: Option<String>,
+    pub files: Vec<ManualReviewFileRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -887,6 +1141,10 @@ pub struct ArtifactManifest {
     pub verification_report_path: Option<PathBuf>,
     pub change_trust_report_path: Option<PathBuf>,
     #[serde(default)]
+    pub manual_delivery_result_path: Option<PathBuf>,
+    #[serde(default)]
+    pub manual_review_state_path: Option<PathBuf>,
+    #[serde(default)]
     pub feedback_json_path: Option<PathBuf>,
     #[serde(default)]
     pub feedback_markdown_path: Option<PathBuf>,
@@ -896,12 +1154,95 @@ pub struct ArtifactManifest {
     pub lineage_path: Option<PathBuf>,
     #[serde(default)]
     pub latest_pointer_path: Option<PathBuf>,
+    #[serde(default)]
+    pub memory_manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    pub shared_memory_index_path: Option<PathBuf>,
+    #[serde(default)]
+    pub session_memory_entries_path: Option<PathBuf>,
+    #[serde(default)]
+    pub task_brief_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactIndexEntry {
     pub key: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub scope: String,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    Shared,
+    Session,
+    View,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEntryKind {
+    Feedback,
+    Handoff,
+    ReviewGate,
+    Verification,
+    Summary,
+}
+
+impl MemoryEntryKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Feedback => "feedback",
+            Self::Handoff => "handoff",
+            Self::ReviewGate => "review_gate",
+            Self::Verification => "verification",
+            Self::Summary => "summary",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub scope: MemoryScope,
+    pub kind: MemoryEntryKind,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub details: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub role_hints: Vec<String>,
+    pub source_session_id: String,
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryView {
+    pub id: String,
+    pub role: String,
+    pub agent_id: String,
+    pub summary: String,
+    pub generated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub entries: Vec<MemoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryManifest {
+    pub version: u32,
+    pub manifest_path: PathBuf,
+    pub shared_index_path: PathBuf,
+    pub session_entries_path: PathBuf,
+    pub task_brief_path: PathBuf,
+    #[serde(default)]
+    pub view_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -984,6 +1325,21 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    BrainStarted {
+        state: Box<BrainState>,
+    },
+    BrainThought {
+        thought: String,
+    },
+    BrainDecisionMade {
+        decision: Box<BrainDecision>,
+    },
+    BrainEscalationRaised {
+        message: String,
+    },
+    SchedulerSnapshotUpdated {
+        snapshot: Box<SchedulerSnapshot>,
+    },
     PhaseChanged {
         phase: String,
     },
@@ -1007,14 +1363,42 @@ pub enum RuntimeEvent {
         title: String,
         worktree_path: PathBuf,
     },
+    WorkerQueued {
+        agent_id: String,
+        role: String,
+        title: String,
+        todo_id: Option<String>,
+        lane: usize,
+    },
+    WorkerBlocked {
+        agent_id: String,
+        role: String,
+        title: String,
+        todo_id: Option<String>,
+        reason: BlockedReason,
+    },
+    WorkerRequeued {
+        agent_id: String,
+        reason: String,
+    },
     WorkerUpdate {
         agent_id: String,
         kind: String,
         message: String,
     },
+    WorkerOutput {
+        agent_id: String,
+        stream: String,
+        message: String,
+    },
     HandoffReady {
         agent_id: String,
         handoff_path: PathBuf,
+    },
+    MemoryViewReady {
+        agent_id: String,
+        memory_view_path: PathBuf,
+        entries: usize,
     },
     WorkerFinished {
         result: Box<WorkerResult>,
@@ -1033,6 +1417,12 @@ pub enum RuntimeEvent {
         stage: String,
         success: bool,
         message: String,
+    },
+    MemoryUpdated {
+        scope: String,
+        reason: String,
+        path: PathBuf,
+        entries: usize,
     },
     SummaryReady {
         summary: Box<FinalSummary>,
@@ -1059,6 +1449,8 @@ pub struct SessionManifest {
     pub repo_snapshot: RepoSnapshot,
     pub created_at: DateTime<Utc>,
     pub status: SessionStatus,
+    #[serde(default)]
+    pub session_kind: SessionKind,
     pub ui_mode: UiMode,
     pub workers_requested: usize,
     pub role_set: String,
@@ -1075,6 +1467,8 @@ pub struct SessionManifest {
     pub preset: Option<SessionPreset>,
     #[serde(default = "default_iteration_index")]
     pub iteration_index: u32,
+    #[serde(default = "default_shared_context_version")]
+    pub shared_context_version: u32,
     #[serde(default)]
     pub root_session_id: String,
     #[serde(default)]
@@ -1099,6 +1493,17 @@ pub struct SessionManifest {
     pub change_trust_report: Option<ChangeTrustReport>,
     pub doctor_report: Option<DoctorReport>,
     pub final_summary: Option<FinalSummary>,
+    #[serde(default)]
+    pub manual_delivery_result: Option<ManualDeliveryResult>,
+    #[serde(default)]
+    pub manual_review_state: Option<ManualReviewState>,
+    #[serde(default)]
+    pub review_fix: Option<ReviewFixRequest>,
+    #[serde(default)]
+    pub memory_manifest: Option<MemoryManifest>,
+    #[serde(default)]
+    pub source_plan_session_id: Option<String>,
+    #[serde(default)]
     pub reused_plan_session_id: Option<String>,
     #[serde(default)]
     pub resumed_from_session_id: Option<String>,
@@ -1124,6 +1529,14 @@ pub struct SessionManifest {
 }
 
 impl SessionManifest {
+    pub fn repo_root(&self) -> &std::path::Path {
+        &self.repo_snapshot.repo_root
+    }
+
+    pub fn deliverables_dir(&self) -> PathBuf {
+        self.session_dir.join("deliverables")
+    }
+
     pub fn root_session_id_ref(&self) -> &str {
         if self.root_session_id.is_empty() {
             self.id.as_str()
@@ -1142,6 +1555,51 @@ impl SessionManifest {
 
     pub fn continuable(&self) -> bool {
         self.status == SessionStatus::Completed
+    }
+
+    pub fn is_plan_session(&self) -> bool {
+        self.session_kind == SessionKind::Plan
+    }
+
+    pub fn is_run_session(&self) -> bool {
+        self.session_kind == SessionKind::Run
+    }
+
+    pub fn deliverable_plan_path(&self) -> PathBuf {
+        self.deliverables_dir().join("plan.md")
+    }
+
+    pub fn deliverable_summary_path(&self) -> PathBuf {
+        self.deliverables_dir().join("summary.md")
+    }
+
+    pub fn deliverable_changes_path(&self) -> PathBuf {
+        self.deliverables_dir().join("changes.md")
+    }
+
+    pub fn deliverable_verify_path(&self) -> PathBuf {
+        self.deliverables_dir().join("verify.md")
+    }
+
+    pub fn manual_delivery_result_path(&self) -> PathBuf {
+        self.session_dir
+            .join("integration")
+            .join("manual-delivery-result.json")
+    }
+
+    pub fn manual_review_state_path(&self) -> PathBuf {
+        self.session_dir
+            .join("integration")
+            .join("manual-review-state.json")
+    }
+
+    pub fn delivered_to_target(&self) -> bool {
+        self.manual_delivery_result
+            .as_ref()
+            .is_some_and(|result| result.success)
+            || self.apply_result.as_ref().is_some_and(|result| {
+                result.synced_to_target && matches!(result.status, ApplyStatus::Applied)
+            })
     }
 }
 
@@ -1167,9 +1625,13 @@ fn default_scope_drift_none() -> ScopeDrift {
     ScopeDrift::None
 }
 
+fn default_shared_context_version() -> u32 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionGraph, ExecutionNode, ScopeDrift};
+    use super::{ExecutionGraph, ExecutionNode, SchedulerHint, ScopeDrift};
 
     fn sample_node(id: &str, dependencies: &[&str]) -> ExecutionNode {
         ExecutionNode {
@@ -1188,6 +1650,7 @@ mod tests {
             expected_artifacts: vec![],
             required_verifications: vec![],
             scope_guard_ref: None,
+            scheduler_hint: Some(SchedulerHint::CriticalPath),
             acceptable_drift: ScopeDrift::None,
         }
     }

@@ -331,7 +331,12 @@ fn run_auto_safe_applies_and_replay() {
         .output()
         .expect("replay timeline");
     assert!(timeline_output.status.success(), "{:?}", timeline_output);
-    assert!(String::from_utf8_lossy(&timeline_output.stdout).contains("阶段切换"));
+    let timeline_text = String::from_utf8_lossy(&timeline_output.stdout);
+    assert!(
+        timeline_text.contains("方案完成") || timeline_text.contains("子任务开始"),
+        "{}",
+        timeline_text
+    );
 }
 
 #[test]
@@ -352,17 +357,14 @@ fn run_apply_mode_none_outputs_review_package() {
         ])
         .output()
         .expect("run forge");
-    assert!(output.status.success(), "{:?}", output);
+    assert_undelivered_run(&output);
 
     let file_a = fs::read_to_string(repo.path().join("file-a.txt")).expect("read file-a");
     assert_eq!(file_a, "alpha\n");
 
     let manifest = load_manifest(repo.path());
     assert_eq!(manifest["apply_result"]["status"], "skipped");
-    assert_eq!(
-        manifest["final_summary"]["result_status"],
-        "completed_with_manual_review"
-    );
+    assert_eq!(manifest["final_summary"]["result_status"], "failed");
     assert_eq!(
         manifest["apply_result"]["accepted_files"]
             .as_array()
@@ -446,7 +448,7 @@ fn conflict_degrades_to_bundle() {
         ])
         .output()
         .expect("run forge");
-    assert!(output.status.success(), "{:?}", output);
+    assert_undelivered_run(&output);
 
     let manifest = load_manifest(repo.path());
     assert_eq!(manifest["apply_result"]["status"], "bundled");
@@ -472,7 +474,7 @@ fn reviewer_block_stops_auto_apply() {
         ])
         .output()
         .expect("run forge");
-    assert!(output.status.success(), "{:?}", output);
+    assert_undelivered_run(&output);
 
     let manifest = load_manifest(repo.path());
     assert_eq!(manifest["apply_result"]["status"], "bundled");
@@ -540,7 +542,7 @@ fn failed_worker_patch_is_excluded_from_apply_plan() {
         ])
         .output()
         .expect("run forge");
-    assert!(output.status.success(), "{:?}", output);
+    assert_undelivered_run(&output);
 
     let session_id = latest_session_id(repo.path());
     let apply_plan_path = repo
@@ -666,7 +668,7 @@ fn plan_writes_user_facing_todo_artifacts() {
 }
 
 #[test]
-fn run_reuses_latest_matching_plan_session() {
+fn run_without_from_plan_does_not_reuse_latest_plan_session() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
@@ -698,10 +700,53 @@ fn run_reuses_latest_matching_plan_session() {
     assert!(run_output.status.success(), "{:?}", run_output);
 
     let manifest = load_manifest(repo.path());
+    assert_eq!(manifest["source_plan_session_id"].as_str(), None);
+    assert_eq!(manifest["reused_plan_session_id"].as_str(), None);
+    assert_eq!(manifest["session_kind"], "run");
+    assert_eq!(manifest["plan_todo"]["summary"], "todo summary");
+    assert_ne!(latest_session_id(repo.path()), plan_session_id);
+}
+
+#[test]
+fn run_with_explicit_from_plan_reuses_selected_plan_session() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let plan_output = command(bin, repo.path())
+        .args([
+            "plan",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run plan");
+    assert!(plan_output.status.success(), "{:?}", plan_output);
+    let plan_session_id = latest_session_id(repo.path());
+
+    let run_output = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--from-plan",
+            &plan_session_id,
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run from selected plan");
+    assert!(run_output.status.success(), "{:?}", run_output);
+
+    let manifest = load_manifest(repo.path());
     assert_eq!(
-        manifest["reused_plan_session_id"].as_str(),
+        manifest["source_plan_session_id"].as_str(),
         Some(plan_session_id.as_str())
     );
+    assert_eq!(manifest["session_kind"], "run");
     assert_eq!(manifest["plan_todo"]["summary"], "todo summary");
 }
 
@@ -737,7 +782,7 @@ fn run_can_resume_previous_session() {
         ])
         .output()
         .expect("resume run");
-    assert!(resumed.status.success(), "{:?}", resumed);
+    assert_undelivered_run(&resumed);
 
     let manifest = load_manifest(repo.path());
     assert_eq!(
@@ -826,6 +871,94 @@ fn continue_from_plan_creates_iteration_artifacts() {
 }
 
 #[test]
+fn shared_memory_is_persisted_and_injected_into_worker_prompt() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let first = command(bin, repo.path())
+        .args([
+            "run",
+            "创建一个简单博客",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("first run");
+    assert!(first.status.success(), "{:?}", first);
+    let parent_session_id = latest_session_id(repo.path());
+
+    let second = command(bin, repo.path())
+        .args([
+            "continue",
+            "--session",
+            &parent_session_id,
+            "--mode",
+            "run",
+            "--feedback",
+            "补充验证说明，并继承上一轮的稳定结论",
+            "--ui",
+            "minimal",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("continue run");
+    assert!(second.status.success(), "{:?}", second);
+
+    let session_id = latest_session_id(repo.path());
+    let memory_root = repo.path().join(".codex-forge").join("memory");
+    let shared_index_path = memory_root.join("shared").join("index.json");
+    let session_memory_dir = memory_root.join("session").join(&session_id);
+    let worker_prompt_path = repo
+        .path()
+        .join(".codex-forge")
+        .join("sessions")
+        .join(&session_id)
+        .join("workers")
+        .join("implementer-1")
+        .join("prompt.md");
+
+    assert!(shared_index_path.exists());
+    assert!(session_memory_dir.join("manifest.json").exists());
+    assert!(session_memory_dir.join("entries.json").exists());
+    assert!(session_memory_dir.join("task-brief.md").exists());
+    assert!(
+        session_memory_dir
+            .join("views")
+            .join("implementer-1.md")
+            .exists()
+    );
+
+    let shared_index: Value =
+        serde_json::from_str(&fs::read_to_string(&shared_index_path).expect("read shared index"))
+            .expect("parse shared index");
+    assert!(
+        shared_index
+            .as_array()
+            .expect("shared entries")
+            .iter()
+            .any(|item| item["kind"] == "summary")
+    );
+
+    let prompt = fs::read_to_string(worker_prompt_path).expect("read prompt");
+    assert!(prompt.contains("共享记忆视图"));
+    assert!(prompt.contains("补充验证说明"));
+
+    let manifest = load_manifest(repo.path());
+    assert_eq!(manifest["shared_context_version"], 1);
+    assert!(manifest["memory_manifest"].is_object());
+    assert!(
+        manifest["artifact_index"]
+            .as_array()
+            .expect("artifact index")
+            .iter()
+            .any(|item| item["key"] == "shared_memory_index")
+    );
+}
+
+#[test]
 fn auto_safe_supports_unborn_repo() {
     let (repo, fake_bin) = make_unborn_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
@@ -897,14 +1030,11 @@ verification_commands = ["git status --short >/dev/null"]
         ])
         .output()
         .expect("run forge");
-    assert!(output.status.success(), "{:?}", output);
+    assert_undelivered_run(&output);
 
     let manifest = load_manifest(repo.path());
     assert_eq!(manifest["final_summary"]["apply_status"], "skipped");
-    assert_eq!(
-        manifest["final_summary"]["result_status"],
-        "completed_with_manual_review"
-    );
+    assert_eq!(manifest["final_summary"]["result_status"], "failed");
 }
 
 #[test]
@@ -1089,6 +1219,12 @@ fn latest_session_id(repo: &Path) -> String {
 
 fn session_dir(repo: &Path, session_id: &str) -> PathBuf {
     repo.join(".codex-forge").join("sessions").join(session_id)
+}
+
+fn assert_undelivered_run(output: &std::process::Output) {
+    assert!(!output.status.success(), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("代码未交付到目标目录"), "{stderr}");
 }
 
 fn load_manifest(repo: &Path) -> Value {

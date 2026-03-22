@@ -15,17 +15,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap};
 
 use crate::model::{
-    FinalSummary, ReviewGateReport, RuntimeEvent, TodoStatus, UiMode, WorkerResult, WorkerStatus,
+    BlockedReason, BrainRiskLevel, BrainState, FinalSummary, ReviewGateReport, RuntimeEvent,
+    SchedulerSnapshot, TodoStatus, UiMode, WorkerQueueState, WorkerResult, WorkerStatus,
 };
+
+const MAX_EXECUTION_LINES: usize = 160;
 
 /// Dashboard 里展示的单个 worker 视图状态。
 #[derive(Debug, Clone)]
 pub struct WorkerView {
+    pub todo_id: Option<String>,
     pub role: String,
     pub title: String,
     pub status: WorkerStatus,
+    pub queue_state: WorkerQueueState,
+    pub blocked_reason: Option<BlockedReason>,
+    pub lane: Option<usize>,
+    pub attempts: usize,
+    pub started_at: Option<Instant>,
+    pub finished_at: Option<Instant>,
+    pub phase_label: String,
+    pub latest_brain_decision: Option<String>,
     pub last_event: String,
     pub worktree_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionLogEntry {
+    pub source: String,
+    pub message: String,
 }
 
 /// 运行态共享视图模型。
@@ -35,6 +53,11 @@ pub struct RuntimeViewState {
     pub session_id: String,
     pub task: String,
     pub phase: String,
+    pub brain: Option<BrainState>,
+    pub scheduler_snapshot: Option<SchedulerSnapshot>,
+    pub current_user_stage: String,
+    pub current_user_message: String,
+    pub next_user_step: String,
     pub started_at: Instant,
     pub commander_notes: Vec<String>,
     pub workers: BTreeMap<String, WorkerView>,
@@ -44,6 +67,9 @@ pub struct RuntimeViewState {
     pub graph_summary: Option<String>,
     pub apply_status: Option<String>,
     pub verify_status: Option<String>,
+    pub deliverable_paths: Vec<String>,
+    pub execution_lines: Vec<ExecutionLogEntry>,
+    pub active_worker: Option<String>,
 }
 
 impl RuntimeViewState {
@@ -52,6 +78,11 @@ impl RuntimeViewState {
             session_id: session_id.to_string(),
             task: task.to_string(),
             phase: "初始化".to_string(),
+            brain: None,
+            scheduler_snapshot: None,
+            current_user_stage: "准备开始".to_string(),
+            current_user_message: "等待生成方案或开始执行。".to_string(),
+            next_user_step: "先在开始页确认任务，再选择“先看方案”或“开始执行”。".to_string(),
             started_at: Instant::now(),
             commander_notes: Vec::new(),
             workers: BTreeMap::new(),
@@ -61,6 +92,9 @@ impl RuntimeViewState {
             graph_summary: None,
             apply_status: None,
             verify_status: None,
+            deliverable_paths: Vec::new(),
+            execution_lines: Vec::new(),
+            active_worker: None,
         }
     }
 
@@ -69,20 +103,195 @@ impl RuntimeViewState {
         self.task = task.into();
     }
 
+    pub fn execution_entry_texts(&self, limit: usize) -> Vec<String> {
+        self.execution_lines
+            .iter()
+            .rev()
+            .take(limit)
+            .rev()
+            .map(|entry| format!("[{}] {}", entry.source, entry.message))
+            .collect()
+    }
+
+    pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        self.scheduler_snapshot
+            .clone()
+            .unwrap_or_else(|| SchedulerSnapshot {
+                total_nodes: self.workers.len(),
+                queued_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| worker.queue_state == WorkerQueueState::Queued)
+                    .count(),
+                ready_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| worker.queue_state == WorkerQueueState::Queued)
+                    .count(),
+                running_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| worker.status == WorkerStatus::Running)
+                    .count(),
+                blocked_dependency_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| {
+                        worker.blocked_reason.as_ref().is_some_and(|reason| {
+                            matches!(
+                                reason.kind,
+                                crate::model::BlockedReasonKind::WaitingDependencies
+                            )
+                        })
+                    })
+                    .count(),
+                blocked_role_limit_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| {
+                        worker.blocked_reason.as_ref().is_some_and(|reason| {
+                            matches!(
+                                reason.kind,
+                                crate::model::BlockedReasonKind::RoleConcurrencyLimit
+                            )
+                        })
+                    })
+                    .count(),
+                blocked_upstream_failed_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| {
+                        worker.blocked_reason.as_ref().is_some_and(|reason| {
+                            matches!(reason.kind, crate::model::BlockedReasonKind::UpstreamFailed)
+                        })
+                    })
+                    .count(),
+                finished_count: self
+                    .workers
+                    .values()
+                    .filter(|worker| worker.queue_state == WorkerQueueState::Finished)
+                    .count(),
+                idle_slots: 0,
+                critical_path_remaining: 0,
+            })
+    }
+
     pub fn apply(&mut self, event: &RuntimeEvent) {
         // 所有 RuntimeEvent 都在这里被折叠成“终端可渲染的稳定状态”。
         match event {
+            RuntimeEvent::BrainStarted { state } => {
+                self.brain = Some(state.as_ref().clone());
+                self.current_user_stage = "Brain 已接管".to_string();
+                self.current_user_message = truncate(&state.objective, 72);
+                self.next_user_step = "观察 Brain 的调度决策和 agent 队列态变化。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "Brain",
+                    format!("接管控制平面：{}", truncate(&state.objective, 120)),
+                );
+            }
+            RuntimeEvent::BrainThought { thought } => {
+                if let Some(brain) = self.brain.as_mut() {
+                    brain.latest_thought = thought.clone();
+                }
+                self.current_user_message = truncate(thought, 72);
+                push_note(
+                    &mut self.commander_notes,
+                    &format!("Brain：{}", truncate(thought, 72)),
+                );
+                push_execution_line(&mut self.execution_lines, "Brain", truncate(thought, 120));
+            }
+            RuntimeEvent::BrainDecisionMade { decision } => {
+                let decision = decision.as_ref();
+                let brain = self.brain.get_or_insert_with(|| BrainState {
+                    status: "在线".to_string(),
+                    objective: "统一指挥多 agent".to_string(),
+                    current_focus: decision.summary.clone(),
+                    latest_thought: decision.rationale.clone(),
+                    latest_decision: decision.summary.clone(),
+                    risk_level: decision.risk_level,
+                    needs_user_attention: false,
+                });
+                brain.current_focus = decision.summary.clone();
+                brain.latest_decision = decision.summary.clone();
+                brain.latest_thought = decision.rationale.clone();
+                brain.risk_level = decision.risk_level;
+                brain.needs_user_attention = decision.risk_level == BrainRiskLevel::High;
+                self.current_user_stage = "Brain 决策中".to_string();
+                self.current_user_message = truncate(&decision.summary, 72);
+                self.next_user_step = "继续观察被派发的 agent、阻塞原因和验证收口。".to_string();
+                for agent_id in &decision.target_agents {
+                    if let Some(worker) = self.workers.get_mut(agent_id) {
+                        worker.latest_brain_decision = Some(decision.summary.clone());
+                    }
+                }
+                push_note(
+                    &mut self.commander_notes,
+                    &format!("Brain 决策：{}", truncate(&decision.summary, 72)),
+                );
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "Brain",
+                    format!(
+                        "{} / {}",
+                        decision.action.label(),
+                        truncate(&decision.rationale, 88)
+                    ),
+                );
+            }
+            RuntimeEvent::BrainEscalationRaised { message } => {
+                let brain = self.brain.get_or_insert_with(|| BrainState {
+                    status: "在线".to_string(),
+                    objective: "统一指挥多 agent".to_string(),
+                    current_focus: "等待升级处理".to_string(),
+                    latest_thought: message.clone(),
+                    latest_decision: "升级给用户".to_string(),
+                    risk_level: BrainRiskLevel::High,
+                    needs_user_attention: true,
+                });
+                brain.current_focus = "等待升级处理".to_string();
+                brain.latest_thought = message.clone();
+                brain.latest_decision = "升级给用户".to_string();
+                brain.risk_level = BrainRiskLevel::High;
+                brain.needs_user_attention = true;
+                self.current_user_stage = "等待处理".to_string();
+                self.current_user_message = truncate(message, 72);
+                self.next_user_step = "优先处理 Brain 抛出的阻断或风险。".to_string();
+                push_execution_line(&mut self.execution_lines, "Brain", truncate(message, 120));
+            }
+            RuntimeEvent::SchedulerSnapshotUpdated { snapshot } => {
+                self.scheduler_snapshot = Some(snapshot.as_ref().clone());
+            }
             RuntimeEvent::PhaseChanged { phase } => {
                 self.phase = phase.clone();
+                self.current_user_stage = user_stage_from_phase(phase).to_string();
+                self.current_user_message = user_message_from_phase(phase).to_string();
+                self.next_user_step = user_next_step_from_phase(phase).to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "阶段",
+                    format!("进入 {}。", truncate(phase, 48)),
+                );
             }
             RuntimeEvent::CommanderNote { message } => {
-                push_note(&mut self.commander_notes, message)
+                push_note(&mut self.commander_notes, message);
+                self.current_user_message = truncate(message, 72);
+                push_execution_line(&mut self.execution_lines, "指挥", truncate(message, 120));
             }
             RuntimeEvent::GraphReady {
                 nodes,
                 dependencies,
             } => {
                 self.graph_summary = Some(format!("节点 {} / 依赖 {}", nodes, dependencies));
+                self.current_user_stage = "方案已完成".to_string();
+                self.current_user_message =
+                    format!("已拆出 {} 个执行节点，主依赖 {} 条。", nodes, dependencies);
+                self.next_user_step = "查看方案是否合理，再决定是否开始执行。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "规划",
+                    format!("执行图已生成：节点 {nodes} / 依赖 {dependencies}"),
+                );
             }
             RuntimeEvent::TodoStateChanged {
                 todo_id,
@@ -108,6 +317,94 @@ impl RuntimeViewState {
                         suffix
                     ),
                 );
+                self.current_user_stage = user_stage_from_todo_status(*status).to_string();
+                self.current_user_message =
+                    format!("{} 目前处于{}。", truncate(title, 24), status.label());
+                self.next_user_step = user_next_step_from_todo_status(*status).to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "Todo",
+                    format!(
+                        "{} {} -> {} / {}",
+                        todo_id,
+                        truncate(title, 24),
+                        status.label(),
+                        truncate(message, 80)
+                    ),
+                );
+            }
+            RuntimeEvent::WorkerQueued {
+                agent_id,
+                role,
+                title,
+                todo_id,
+                lane,
+            } => {
+                upsert_worker(
+                    &mut self.workers,
+                    agent_id,
+                    role,
+                    title,
+                    todo_id.clone(),
+                    WorkerStatus::Pending,
+                    WorkerQueueState::Queued,
+                );
+                if let Some(worker) = self.workers.get_mut(agent_id) {
+                    worker.blocked_reason = None;
+                    worker.lane = Some(*lane);
+                    worker.phase_label = "等待 Brain 派发".to_string();
+                    worker.last_event = format!("已进入可派发队列（位次 {}）", lane);
+                }
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "队列",
+                    format!("{agent_id} 已进入可派发队列 / 位次 {lane}"),
+                );
+            }
+            RuntimeEvent::WorkerBlocked {
+                agent_id,
+                role,
+                title,
+                todo_id,
+                reason,
+            } => {
+                upsert_worker(
+                    &mut self.workers,
+                    agent_id,
+                    role,
+                    title,
+                    todo_id.clone(),
+                    WorkerStatus::Pending,
+                    WorkerQueueState::Blocked,
+                );
+                if let Some(worker) = self.workers.get_mut(agent_id) {
+                    worker.blocked_reason = Some(reason.clone());
+                    worker.lane = None;
+                    worker.phase_label = reason.label().to_string();
+                    worker.last_event = truncate(&reason.detail, 72);
+                }
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "阻塞",
+                    format!(
+                        "{agent_id} / {} / {}",
+                        reason.label(),
+                        truncate(&reason.detail, 80)
+                    ),
+                );
+            }
+            RuntimeEvent::WorkerRequeued { agent_id, reason } => {
+                if let Some(worker) = self.workers.get_mut(agent_id) {
+                    worker.queue_state = WorkerQueueState::Queued;
+                    worker.blocked_reason = None;
+                    worker.phase_label = "重新进入可派发队列".to_string();
+                    worker.last_event = truncate(reason, 72);
+                }
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "队列",
+                    format!("{agent_id} 已重新入队 / {}", truncate(reason, 88)),
+                );
             }
             RuntimeEvent::WorkerDispatched {
                 agent_id,
@@ -115,15 +412,33 @@ impl RuntimeViewState {
                 title,
                 worktree_path,
             } => {
-                self.workers.insert(
-                    agent_id.clone(),
-                    WorkerView {
-                        role: role.clone(),
-                        title: title.clone(),
-                        status: WorkerStatus::Running,
-                        last_event: "已下发任务".to_string(),
-                        worktree_path: worktree_path.display().to_string(),
-                    },
+                upsert_worker(
+                    &mut self.workers,
+                    agent_id,
+                    role,
+                    title,
+                    None,
+                    WorkerStatus::Running,
+                    WorkerQueueState::Running,
+                );
+                if let Some(worker) = self.workers.get_mut(agent_id) {
+                    worker.status = WorkerStatus::Running;
+                    worker.queue_state = WorkerQueueState::Running;
+                    worker.blocked_reason = None;
+                    worker.lane = None;
+                    worker.phase_label = "执行中".to_string();
+                    worker.started_at.get_or_insert_with(Instant::now);
+                    worker.last_event = "已开始处理".to_string();
+                    worker.worktree_path = worktree_path.display().to_string();
+                }
+                self.active_worker = Some(agent_id.clone());
+                self.current_user_stage = "开始执行".to_string();
+                self.current_user_message = format!("{} 正在处理“{}”。", role, truncate(title, 28));
+                self.next_user_step = "等待子任务推进，再看审阅与验证结果。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    agent_id.as_str(),
+                    format!("{role} 已启动：{}", truncate(title, 80)),
                 );
             }
             RuntimeEvent::WorkerUpdate {
@@ -131,33 +446,136 @@ impl RuntimeViewState {
                 kind,
                 message,
             } => {
+                self.active_worker = Some(agent_id.clone());
                 if let Some(worker) = self.workers.get_mut(agent_id) {
-                    worker.last_event = format!("{kind}: {}", truncate(message, 72));
+                    worker.last_event = summarize_worker_update(kind, message)
+                        .unwrap_or_else(|| truncate(message, 72));
+                    worker.phase_label = "执行中".to_string();
                 }
                 if let Some(note) = summarize_worker_update(kind, message) {
-                    push_note(&mut self.commander_notes, &format!("{agent_id} / {note}"));
+                    push_note(&mut self.commander_notes, &note);
+                    self.current_user_message = note.clone();
+                    push_execution_line(
+                        &mut self.execution_lines,
+                        agent_id.as_str(),
+                        truncate(&note, 120),
+                    );
                 }
+            }
+            RuntimeEvent::WorkerOutput {
+                agent_id,
+                stream,
+                message,
+            } => {
+                self.active_worker = Some(agent_id.clone());
+                if let Some(worker) = self.workers.get_mut(agent_id) {
+                    worker.last_event = format!(
+                        "{} 输出：{}",
+                        if stream == "stderr" {
+                            "错误流"
+                        } else {
+                            "标准流"
+                        },
+                        truncate(message, 56)
+                    );
+                    worker.phase_label = "命令执行中".to_string();
+                }
+                push_execution_line(
+                    &mut self.execution_lines,
+                    format!("{agent_id}/{stream}"),
+                    truncate(message, 120),
+                );
             }
             RuntimeEvent::HandoffReady {
                 agent_id,
                 handoff_path,
             } => {
+                self.active_worker = Some(agent_id.clone());
                 if let Some(worker) = self.workers.get_mut(agent_id) {
-                    worker.last_event = format!("handoff: {}", handoff_path.display());
+                    worker.last_event = "已产出交接稿".to_string();
+                    worker.phase_label = "等待整合".to_string();
                 }
+                push_unique_path(
+                    &mut self.deliverable_paths,
+                    handoff_path.display().to_string(),
+                );
+                self.current_user_stage = "阶段产物已生成".to_string();
+                self.current_user_message = "某个子任务已经交付了可供整合的结果。".to_string();
+                self.next_user_step = "继续等待审阅、应用和验证收口。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    agent_id.as_str(),
+                    "已产出交接稿".to_string(),
+                );
+            }
+            RuntimeEvent::MemoryViewReady {
+                agent_id,
+                memory_view_path,
+                entries,
+            } => {
+                self.active_worker = Some(agent_id.clone());
+                if let Some(worker) = self.workers.get_mut(agent_id) {
+                    worker.last_event = format!("已整理上下文（{} 条）", entries);
+                    worker.phase_label = "整理上下文".to_string();
+                }
+                push_unique_path(
+                    &mut self.deliverable_paths,
+                    memory_view_path.display().to_string(),
+                );
+                push_execution_line(
+                    &mut self.execution_lines,
+                    agent_id.as_str(),
+                    format!("共享上下文已整理（{} 条）", entries),
+                );
             }
             RuntimeEvent::WorkerFinished { result } => {
                 upsert_result(&mut self.workers, result);
+                self.active_worker = Some(result.agent_id.clone());
+                self.current_user_message = format!(
+                    "子任务“{}”已{}。",
+                    truncate(&result.task_title, 24),
+                    result.status.label()
+                );
+                push_execution_line(
+                    &mut self.execution_lines,
+                    result.agent_id.as_str(),
+                    format!(
+                        "子任务“{}”已{}",
+                        truncate(&result.task_title, 40),
+                        result.status.label()
+                    ),
+                );
             }
             RuntimeEvent::ApplyPlanReady { mode, operations } => {
                 self.apply_status = Some(format!("计划：{} / {} 个 patch", mode, operations));
+                self.current_user_stage = "准备落地".to_string();
+                self.current_user_message =
+                    format!("已形成结果落地计划，共 {} 个 patch。", operations);
+                self.next_user_step = "等待审阅关卡决定哪些结果可以进入目标仓库。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "交付",
+                    format!("已形成落地计划：{} / {} 个 patch", mode, operations),
+                );
             }
             RuntimeEvent::ReviewGateReady { report } => {
                 self.review_report = Some(report.as_ref().clone());
                 self.apply_status = Some(format!("review gate：{}", report.decision.label()));
+                self.current_user_stage = "审阅完成".to_string();
+                self.current_user_message = format!("审阅结论：{}。", report.decision.label());
+                self.next_user_step = "继续查看应用结果和验证结论。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "审阅",
+                    format!("审阅结论：{}", report.decision.label()),
+                );
             }
             RuntimeEvent::ApplyUpdate { message } => {
                 self.apply_status = Some(message.clone());
+                self.current_user_stage = "结果落地中".to_string();
+                self.current_user_message = truncate(message, 72);
+                self.next_user_step = "等待应用完成，再看验证是否通过。".to_string();
+                push_execution_line(&mut self.execution_lines, "交付", truncate(message, 120));
             }
             RuntimeEvent::VerificationReady {
                 stage,
@@ -170,9 +588,52 @@ impl RuntimeViewState {
                     if *success { "成功" } else { "失败" },
                     truncate(message, 60)
                 ));
+                self.current_user_stage = "验证完成".to_string();
+                self.current_user_message =
+                    format!("{} 已{}。", stage, if *success { "通过" } else { "失败" });
+                self.next_user_step = if *success {
+                    "等待最终交付摘要。".to_string()
+                } else {
+                    "查看失败原因，并决定是否继续修正。".to_string()
+                };
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "验证",
+                    format!(
+                        "{} / {} / {}",
+                        stage,
+                        if *success { "通过" } else { "失败" },
+                        truncate(message, 96)
+                    ),
+                );
+            }
+            RuntimeEvent::MemoryUpdated {
+                scope,
+                reason,
+                entries,
+                ..
+            } => {
+                push_note(
+                    &mut self.commander_notes,
+                    &format!("memory / {scope} / {reason} / {entries} 条"),
+                );
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "记忆",
+                    format!("{scope} / {reason} / {entries} 条"),
+                );
             }
             RuntimeEvent::SummaryReady { summary } => {
                 self.summary = Some(summary.as_ref().clone());
+                self.current_user_stage = "已完成".to_string();
+                self.current_user_message = truncate(&summary.overview, 72);
+                self.next_user_step =
+                    "去“最终交付”查看结果和产物目录，或到历史页继续优化。".to_string();
+                push_execution_line(
+                    &mut self.execution_lines,
+                    "总结",
+                    truncate(&summary.overview, 120),
+                );
             }
         }
     }
@@ -269,34 +730,16 @@ pub fn render_runtime_dashboard(
         render_runtime_dashboard_compact(frame, area, state, title);
         return;
     }
-
-    // 这个布局是 v6 执行页主视图，也是旧 Rich UI 的基础信息源：
-    // 顶部总览 / 中间 worker+todo / 下方 commander notes / 底部状态面板。
+    let snapshot = state.scheduler_snapshot();
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Min(10),
-            Constraint::Length(8),
             Constraint::Length(6),
+            Constraint::Min(12),
+            Constraint::Length(8),
+            Constraint::Length(7),
         ])
         .split(area);
-
-    let success = state
-        .workers
-        .values()
-        .filter(|worker| worker.status == WorkerStatus::Succeeded)
-        .count();
-    let failed = state
-        .workers
-        .values()
-        .filter(|worker| matches!(worker.status, WorkerStatus::Failed | WorkerStatus::Skipped))
-        .count();
-    let running = state
-        .workers
-        .values()
-        .filter(|worker| worker.status == WorkerStatus::Running)
-        .count();
 
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -314,28 +757,32 @@ pub fn render_runtime_dashboard(
         ]),
         Line::from(format!("任务：{}", truncate(&state.task, 100))),
         Line::from(format!(
-            "阶段：{}   运行中：{}   成功：{}   失败/跳过：{}   已耗时：{}s",
-            state.phase,
-            running,
-            success,
-            failed,
+            "Brain：{}   风险：{}   阶段：{}   已耗时：{}s",
+            state
+                .brain
+                .as_ref()
+                .map(|brain| truncate(&brain.current_focus, 28))
+                .unwrap_or_else(|| "等待接管".to_string()),
+            state
+                .brain
+                .as_ref()
+                .map(|brain| brain.risk_level.label())
+                .unwrap_or("低"),
+            state.current_user_stage,
             state.started_at.elapsed().as_secs()
         )),
         Line::from(format!(
-            "执行图：{}   应用：{}   验证：{}",
-            state
-                .graph_summary
-                .clone()
-                .unwrap_or_else(|| "等待".to_string()),
-            state
-                .apply_status
-                .clone()
-                .unwrap_or_else(|| "等待".to_string()),
-            state
-                .verify_status
-                .clone()
-                .unwrap_or_else(|| "等待".to_string())
+            "并行：ready {} / running {} / dep-block {} / role-block {} / upstream-fail {} / idle {} / critical {}",
+            snapshot.ready_count,
+            snapshot.running_count,
+            snapshot.blocked_dependency_count,
+            snapshot.blocked_role_limit_count,
+            snapshot.blocked_upstream_failed_count,
+            snapshot.idle_slots,
+            snapshot.critical_path_remaining
         )),
+        Line::from(format!("现在在做：{}", truncate(&state.current_user_message, 110))),
+        Line::from(format!("下一步：{}", truncate(&state.next_user_step, 110))),
     ])
     .block(Block::default().title(title).borders(Borders::ALL))
     .wrap(Wrap { trim: true });
@@ -343,7 +790,7 @@ pub fn render_runtime_dashboard(
 
     let middle_sections = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(sections[1]);
 
     if state.workers.is_empty() {
@@ -358,14 +805,33 @@ pub fn render_runtime_dashboard(
             .workers
             .iter()
             .map(|(agent_id, worker)| {
+                let runtime_hint = worker
+                    .blocked_reason
+                    .as_ref()
+                    .map(|reason| format!("{} / {}", reason.label(), truncate(&reason.detail, 28)))
+                    .unwrap_or_else(|| truncate(&worker.last_event, 28));
                 Row::new(vec![
-                    Cell::from(agent_id.clone()),
-                    Cell::from(worker.role.clone()),
-                    Cell::from(worker.status.label()),
-                    Cell::from(truncate(&worker.title, 24)),
-                    Cell::from(truncate(&worker.last_event, 44)),
+                    Cell::from(truncate(agent_id, 14)),
+                    Cell::from(worker.todo_id.clone().unwrap_or_else(|| "-".to_string())),
+                    Cell::from(worker.queue_state.label()),
+                    Cell::from(truncate(&worker.title, 14)),
+                    Cell::from(truncate(&worker.phase_label, 14)),
+                    Cell::from(
+                        worker
+                            .lane
+                            .map(|lane| lane.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(format!(
+                        "{}s",
+                        worker
+                            .started_at
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or(0)
+                    )),
+                    Cell::from(runtime_hint),
                 ])
-                .style(style_for_status(worker.status))
+                .style(style_for_worker(worker))
             })
             .collect::<Vec<_>>();
 
@@ -373,75 +839,91 @@ pub fn render_runtime_dashboard(
             worker_rows,
             [
                 Constraint::Length(14),
-                Constraint::Length(12),
                 Constraint::Length(10),
-                Constraint::Length(24),
+                Constraint::Length(10),
+                Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Length(6),
+                Constraint::Length(6),
                 Constraint::Min(20),
             ],
         )
         .header(
-            Row::new(vec!["Agent", "角色", "状态", "任务", "最新事件"]).style(
+            Row::new(vec![
+                "Agent",
+                "Todo",
+                "队列态",
+                "任务",
+                "阶段",
+                "Lane",
+                "耗时",
+                "最近变化/阻塞",
+            ])
+            .style(
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
         )
-        .block(Block::default().title("Worker 矩阵").borders(Borders::ALL))
+        .block(Block::default().title("Agent Matrix").borders(Borders::ALL))
         .column_spacing(1);
         frame.render_widget(workers_table, middle_sections[0]);
     }
-
-    let todo_items = state
-        .todos
-        .iter()
-        .map(|(todo_id, (title, status, message))| {
-            ListItem::new(Line::from(format!(
-                "{} {} / {} / {}",
-                todo_id,
-                truncate(title, 18),
-                status.label(),
-                truncate(message, 22)
-            )))
-        })
-        .collect::<Vec<_>>();
-    let review_lines = if let Some(report) = &state.review_report {
-        vec![
-            Line::from(format!("结论：{}", report.decision.label())),
-            Line::from(format!(
-                "说明：{}",
-                truncate(
-                    report
-                        .confidence_reasoning
-                        .as_deref()
-                        .unwrap_or("无补充说明"),
-                    44
-                )
-            )),
-            Line::from(format!(
-                "阻断项：{}",
-                truncate(&report.blocking_findings.join("；"), 44)
-            )),
-        ]
-    } else {
-        vec![
-            Line::from("结论：等待 reviewer"),
-            Line::from("说明：尚未形成 gate"),
-            Line::from("阻断项：无"),
-        ]
-    };
     let right_sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Min(8),
+        ])
         .split(middle_sections[1]);
     frame.render_widget(
-        List::new(todo_items).block(Block::default().title("Todo 态势").borders(Borders::ALL)),
+        Paragraph::new(brain_panel_lines(state, area.width))
+            .block(Block::default().title("Brain").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
         right_sections[0],
     );
     frame.render_widget(
-        Paragraph::new(review_lines)
-            .block(Block::default().title("Review Gate").borders(Borders::ALL))
+        Paragraph::new(scheduler_panel_lines(state, area.width))
+            .block(Block::default().title("并行态势").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
         right_sections[1],
+    );
+    let mut todo_items = Vec::new();
+    if let Some(report) = &state.review_report {
+        todo_items.push(ListItem::new(Line::from(format!(
+            "结论：{}",
+            report.decision.label()
+        ))));
+        todo_items.push(ListItem::new(Line::from(format!(
+            "说明：{}",
+            truncate(
+                report
+                    .confidence_reasoning
+                    .as_deref()
+                    .unwrap_or("无补充说明"),
+                18
+            )
+        ))));
+    }
+    todo_items.extend(
+        state
+            .todos
+            .iter()
+            .take(4)
+            .map(|(todo_id, (title, status, message))| {
+                ListItem::new(Line::from(format!(
+                    "{} {} / {} / {}",
+                    todo_id,
+                    truncate(title, 16),
+                    status.label(),
+                    truncate(message, 20)
+                )))
+            }),
+    );
+    frame.render_widget(
+        List::new(todo_items).block(Block::default().title("Todo / Gate").borders(Borders::ALL)),
+        right_sections[2],
     );
 
     let note_items = state
@@ -450,11 +932,8 @@ pub fn render_runtime_dashboard(
         .rev()
         .map(|note| ListItem::new(Line::from(Span::raw(note.clone()))))
         .collect::<Vec<_>>();
-    let notes = List::new(note_items).block(
-        Block::default()
-            .title("Commander 决策流")
-            .borders(Borders::ALL),
-    );
+    let notes =
+        List::new(note_items).block(Block::default().title("过程摘要").borders(Borders::ALL));
     frame.render_widget(notes, sections[2]);
 
     let summary_text = if let Some(summary) = &state.summary {
@@ -466,6 +945,14 @@ pub fn render_runtime_dashboard(
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(summary.overview.clone()),
+            Line::from(format!(
+                "目标目录交付：{}",
+                if matches!(summary.apply_status, crate::model::ApplyStatus::Applied) {
+                    "已交付".to_string()
+                } else {
+                    "未交付".to_string()
+                }
+            )),
             Line::from(format!(
                 "接收文件：{}",
                 if summary.accepted_files.is_empty() {
@@ -503,7 +990,7 @@ pub fn render_runtime_dashboard(
         vec![Line::from("等待 worker 启动…")]
     };
     let footer = Paragraph::new(summary_text)
-        .block(Block::default().title("状态面板").borders(Borders::ALL))
+        .block(Block::default().title("交付状态").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(footer, sections[3]);
 }
@@ -514,26 +1001,11 @@ fn render_runtime_dashboard_compact(
     state: &RuntimeViewState,
     title: &str,
 ) {
+    let snapshot = state.scheduler_snapshot();
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints(compact_dashboard_constraints(area))
         .split(area);
-
-    let success = state
-        .workers
-        .values()
-        .filter(|worker| worker.status == WorkerStatus::Succeeded)
-        .count();
-    let failed = state
-        .workers
-        .values()
-        .filter(|worker| matches!(worker.status, WorkerStatus::Failed | WorkerStatus::Skipped))
-        .count();
-    let running = state
-        .workers
-        .values()
-        .filter(|worker| worker.status == WorkerStatus::Running)
-        .count();
 
     let header_lines = if area.width < 72 {
         vec![
@@ -551,11 +1023,13 @@ fn render_runtime_dashboard_compact(
                 ),
             ]),
             Line::from(format!(
-                "{} | 运行{} 成功{} 失败{}",
-                truncate(&state.phase, 10),
-                running,
-                success,
-                failed
+                "{} | ready{} run{} block{}",
+                truncate(&state.current_user_stage, 10),
+                snapshot.ready_count,
+                snapshot.running_count,
+                snapshot.blocked_dependency_count
+                    + snapshot.blocked_role_limit_count
+                    + snapshot.blocked_upstream_failed_count
             )),
             Line::from(format!("任务：{}", truncate(&state.task, 36))),
         ]
@@ -576,11 +1050,13 @@ fn render_runtime_dashboard_compact(
             ]),
             Line::from(format!("任务：{}", truncate(&state.task, 72))),
             Line::from(format!(
-                "阶段：{}   运行中：{}   成功：{}   失败/跳过：{}   {}s",
-                state.phase,
-                running,
-                success,
-                failed,
+                "阶段：{}   ready：{}   running：{}   blocked：{}   {}s",
+                state.current_user_stage,
+                snapshot.ready_count,
+                snapshot.running_count,
+                snapshot.blocked_dependency_count
+                    + snapshot.blocked_role_limit_count
+                    + snapshot.blocked_upstream_failed_count,
                 state.started_at.elapsed().as_secs()
             )),
         ]
@@ -605,18 +1081,25 @@ fn render_runtime_dashboard_compact(
             .iter()
             .take(if area.height < 20 { 4 } else { 6 })
             .map(|(agent_id, worker)| {
+                let detail = worker
+                    .blocked_reason
+                    .as_ref()
+                    .map(|reason| truncate(&reason.detail, if area.width < 72 { 18 } else { 32 }))
+                    .unwrap_or_else(|| {
+                        truncate(&worker.last_event, if area.width < 72 { 18 } else { 32 })
+                    });
                 ListItem::new(Line::from(format!(
-                    "{} {} / {} / {}",
+                    "{} / {} / {} / {}",
                     truncate(agent_id, 10),
-                    truncate(&worker.role, 8),
-                    worker.status.label(),
-                    truncate(&worker.last_event, if area.width < 72 { 20 } else { 42 })
+                    worker.queue_state.label(),
+                    truncate(&worker.phase_label, 10),
+                    detail
                 )))
-                .style(style_for_status(worker.status))
+                .style(style_for_worker(worker))
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            List::new(worker_items).block(Block::default().title("Workers").borders(Borders::ALL)),
+            List::new(worker_items).block(Block::default().title("Agent").borders(Borders::ALL)),
             sections[1],
         );
     }
@@ -662,17 +1145,37 @@ fn compact_dashboard_constraints(area: Rect) -> Vec<Constraint> {
 }
 
 fn compact_status_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'static>> {
-    let todo_limit = if width < 72 { 2 } else { 3 };
+    let snapshot = state.scheduler_snapshot();
+    let todo_limit = if width < 72 { 1 } else { 2 };
     let mut lines = vec![
         Line::from(format!(
-            "执行图：{}",
-            state
-                .graph_summary
-                .clone()
-                .unwrap_or_else(|| "等待".to_string())
+            "Brain：{}",
+            truncate(
+                &state
+                    .brain
+                    .as_ref()
+                    .map(|brain| brain.current_focus.clone())
+                    .unwrap_or_else(|| "等待接管".to_string()),
+                if width < 72 { 20 } else { 44 }
+            )
         )),
         Line::from(format!(
-            "应用：{}",
+            "并行：ready {} / run {} / block {}",
+            snapshot.ready_count,
+            snapshot.running_count,
+            snapshot.blocked_dependency_count
+                + snapshot.blocked_role_limit_count
+                + snapshot.blocked_upstream_failed_count
+        )),
+        Line::from(format!(
+            "现在在做：{}",
+            truncate(
+                &state.current_user_message,
+                if width < 72 { 24 } else { 48 }
+            )
+        )),
+        Line::from(format!(
+            "Apply：{}",
             truncate(
                 &state
                     .apply_status
@@ -682,7 +1185,7 @@ fn compact_status_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'stati
             )
         )),
         Line::from(format!(
-            "验证：{}",
+            "Verify：{}",
             truncate(
                 &state
                     .verify_status
@@ -716,18 +1219,26 @@ fn compact_status_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'stati
             )
         )));
     }
+    if let Some(brain) = &state.brain {
+        lines.push(Line::from(format!(
+            "风险：{} / {}",
+            brain.risk_level.label(),
+            if brain.needs_user_attention {
+                "需处理"
+            } else {
+                "自动推进"
+            }
+        )));
+    }
     lines
 }
 
 fn planning_activity_lines(state: &RuntimeViewState, compact: bool) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(format!("当前阶段：{}", state.phase)),
+        Line::from(format!("当前阶段：{}", state.current_user_stage)),
         Line::from(format!(
-            "执行图：{}",
-            state
-                .graph_summary
-                .clone()
-                .unwrap_or_else(|| "尚未生成".to_string())
+            "现在在做：{}",
+            truncate(&state.current_user_message, if compact { 28 } else { 72 })
         )),
     ];
 
@@ -780,70 +1291,200 @@ fn compact_summary_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'stat
         ]
     } else if let Some(note) = state.commander_notes.last() {
         vec![
-            Line::from("等待最终摘要…"),
+            Line::from(format!("下一步：{}", state.next_user_step)),
             Line::from(format!(
                 "最近决策：{}",
                 truncate(note, if width < 72 { 26 } else { 56 })
             )),
         ]
     } else {
-        vec![Line::from("等待更多运行事件…")]
+        vec![Line::from(format!("下一步：{}", state.next_user_step))]
     }
+}
+
+fn brain_panel_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'static>> {
+    if let Some(brain) = &state.brain {
+        vec![
+            Line::from(format!("状态：{}", brain.status)),
+            Line::from(format!(
+                "目标：{}",
+                truncate(&brain.objective, if width < 120 { 36 } else { 52 })
+            )),
+            Line::from(format!(
+                "焦点：{}",
+                truncate(&brain.current_focus, if width < 120 { 36 } else { 52 })
+            )),
+            Line::from(format!(
+                "思考：{}",
+                truncate(&brain.latest_thought, if width < 120 { 36 } else { 52 })
+            )),
+            Line::from(format!(
+                "决策：{}",
+                truncate(&brain.latest_decision, if width < 120 { 36 } else { 52 })
+            )),
+            Line::from(format!(
+                "风险：{} / {}",
+                brain.risk_level.label(),
+                if brain.needs_user_attention {
+                    "需要人工介入"
+                } else {
+                    "自动推进中"
+                }
+            )),
+        ]
+    } else {
+        vec![
+            Line::from("状态：等待 Brain 接管"),
+            Line::from("目标：尚未进入运行期控制"),
+        ]
+    }
+}
+
+fn scheduler_panel_lines(state: &RuntimeViewState, width: u16) -> Vec<Line<'static>> {
+    let snapshot = state.scheduler_snapshot();
+    let mut lines = vec![
+        Line::from(format!(
+            "ready {} / running {} / queued {}",
+            snapshot.ready_count, snapshot.running_count, snapshot.queued_count
+        )),
+        Line::from(format!(
+            "blocked：依赖 {} / 角色 {} / 上游失败 {}",
+            snapshot.blocked_dependency_count,
+            snapshot.blocked_role_limit_count,
+            snapshot.blocked_upstream_failed_count
+        )),
+        Line::from(format!(
+            "idle slots：{} / critical path：{}",
+            snapshot.idle_slots, snapshot.critical_path_remaining
+        )),
+    ];
+    if let Some(active_worker) = state.active_worker.as_deref() {
+        lines.push(Line::from(format!("当前焦点：{active_worker}")));
+    }
+    if let Some(report) = &state.review_report {
+        lines.push(Line::from(format!("结论：{}", report.decision.label())));
+        lines.push(Line::from(format!(
+            "说明：{}",
+            truncate(
+                report
+                    .confidence_reasoning
+                    .as_deref()
+                    .unwrap_or("无补充说明"),
+                if width < 120 { 36 } else { 52 }
+            )
+        )));
+    } else {
+        lines.push(Line::from("Gate：等待 reviewer"));
+    }
+    lines
 }
 
 pub fn describe_runtime_event(event: &RuntimeEvent) -> String {
     match event {
-        RuntimeEvent::PhaseChanged { phase } => format!("阶段切换 -> {phase}"),
-        RuntimeEvent::CommanderNote { message } => format!("指挥备注：{message}"),
+        RuntimeEvent::BrainStarted { state } => {
+            format!("Brain 已接管：{}", truncate(&state.objective, 72))
+        }
+        RuntimeEvent::BrainThought { thought } => format!("Brain 思考：{}", truncate(thought, 72)),
+        RuntimeEvent::BrainDecisionMade { decision } => format!(
+            "Brain 决策：{} / {}",
+            decision.action.label(),
+            truncate(&decision.summary, 60)
+        ),
+        RuntimeEvent::BrainEscalationRaised { message } => {
+            format!("Brain 升级：{}", truncate(message, 72))
+        }
+        RuntimeEvent::SchedulerSnapshotUpdated { snapshot } => format!(
+            "调度快照：ready {} / running {} / 阻塞 {} / 关键路径 {}",
+            snapshot.ready_count,
+            snapshot.running_count,
+            snapshot.blocked_dependency_count
+                + snapshot.blocked_role_limit_count
+                + snapshot.blocked_upstream_failed_count,
+            snapshot.critical_path_remaining
+        ),
+        RuntimeEvent::PhaseChanged { phase } => {
+            format!("进入{}阶段", user_stage_from_phase(phase))
+        }
+        RuntimeEvent::CommanderNote { message } => format!("说明：{}", truncate(message, 80)),
         RuntimeEvent::GraphReady {
             nodes,
             dependencies,
-        } => format!("执行图就绪：节点 {nodes} / 依赖 {dependencies}"),
+        } => format!("方案完成：共 {nodes} 个执行节点，依赖 {dependencies} 条"),
         RuntimeEvent::TodoStateChanged {
-            todo_id,
             title,
             status,
             message,
             ..
-        } => format!("{todo_id} {title} -> {} / {message}", status.label()),
-        RuntimeEvent::WorkerDispatched {
+        } => format!("{}：{} / {}", title, status.label(), truncate(message, 60)),
+        RuntimeEvent::WorkerQueued {
+            role, lane, title, ..
+        } => format!("{role} 入队：{} / 位次 {}", truncate(title, 42), lane),
+        RuntimeEvent::WorkerBlocked { title, reason, .. } => format!(
+            "{} 阻塞：{} / {}",
+            truncate(title, 30),
+            reason.label(),
+            truncate(&reason.detail, 42)
+        ),
+        RuntimeEvent::WorkerRequeued { agent_id, reason } => {
+            format!("{agent_id} 重新入队：{}", truncate(reason, 54))
+        }
+        RuntimeEvent::WorkerDispatched { role, title, .. } => {
+            format!("{role} 开始处理：{}", truncate(title, 48))
+        }
+        RuntimeEvent::WorkerUpdate { kind, message, .. } => {
+            summarize_worker_update(kind, message).unwrap_or_else(|| truncate(message, 80))
+        }
+        RuntimeEvent::WorkerOutput {
             agent_id,
-            role,
-            title,
-            ..
-        } => format!("启动 {agent_id} / {role} / {title}"),
-        RuntimeEvent::WorkerUpdate {
-            agent_id,
-            kind,
+            stream,
             message,
-        } => format!("{agent_id} [{kind}] {message}"),
-        RuntimeEvent::HandoffReady {
+        } => format!(
+            "{} {}：{}",
             agent_id,
-            handoff_path,
-        } => format!("交接就绪 {agent_id} -> {}", handoff_path.display()),
+            if stream == "stderr" {
+                "错误流"
+            } else {
+                "标准流"
+            },
+            truncate(message, 80)
+        ),
+        RuntimeEvent::HandoffReady { .. } => "已生成阶段交接稿".to_string(),
+        RuntimeEvent::MemoryViewReady { entries, .. } => {
+            format!("已整理共享上下文（{} 条）", entries)
+        }
         RuntimeEvent::WorkerFinished { result } => {
-            format!("{} 完成：{}", result.agent_id, result.status.label())
+            format!("子任务“{}”已{}", result.task_title, result.status.label())
         }
         RuntimeEvent::ApplyPlanReady { mode, operations } => {
-            format!("apply 计划：{} / {} 个 patch", mode, operations)
+            format!("已形成落地计划：{} / {} 个 patch", mode, operations)
         }
         RuntimeEvent::ReviewGateReady { report } => format!(
-            "review gate：{} / {}",
+            "审阅结论：{} / {}",
             report.decision.label(),
             report
                 .confidence_reasoning
                 .clone()
                 .unwrap_or_else(|| "无补充说明".to_string())
         ),
-        RuntimeEvent::ApplyUpdate { message } => format!("应用更新：{message}"),
+        RuntimeEvent::ApplyUpdate { message } => format!("落地更新：{}", truncate(message, 80)),
         RuntimeEvent::VerificationReady {
             stage,
             success,
             message,
         } => format!(
-            "验证 {stage}：{} / {message}",
-            if *success { "成功" } else { "失败" }
+            "{} 已{} / {}",
+            stage,
+            if *success { "通过" } else { "失败" },
+            truncate(message, 60)
         ),
+        RuntimeEvent::MemoryUpdated {
+            scope,
+            reason,
+            entries,
+            ..
+        } => {
+            format!("记忆已更新：{scope} / {reason} / {entries} 条")
+        }
         RuntimeEvent::SummaryReady { summary } => format!("总结：{}", summary.overview),
     }
 }
@@ -858,6 +1499,33 @@ fn render_rich(rich: &mut RichTerminal, state: &RuntimeViewState) -> Result<()> 
 
 fn render_plain(event: &RuntimeEvent) {
     match event {
+        RuntimeEvent::BrainStarted { state } => {
+            println!("🧠 Brain 接管：{}", state.objective);
+        }
+        RuntimeEvent::BrainThought { thought } => {
+            println!("💭 {}", truncate(thought, 120));
+        }
+        RuntimeEvent::BrainDecisionMade { decision } => {
+            println!(
+                "🧠 决策：{} / {}",
+                decision.action.label(),
+                truncate(&decision.summary, 120)
+            );
+        }
+        RuntimeEvent::BrainEscalationRaised { message } => {
+            println!("🚨 Brain 升级：{}", truncate(message, 120));
+        }
+        RuntimeEvent::SchedulerSnapshotUpdated { snapshot } => {
+            println!(
+                "📊 ready={} running={} blocked(dep={} role={} upstream={}) critical={}",
+                snapshot.ready_count,
+                snapshot.running_count,
+                snapshot.blocked_dependency_count,
+                snapshot.blocked_role_limit_count,
+                snapshot.blocked_upstream_failed_count,
+                snapshot.critical_path_remaining
+            );
+        }
         RuntimeEvent::PhaseChanged { phase } => {
             println!("== 阶段切换：{phase}");
         }
@@ -888,6 +1556,30 @@ fn render_plain(event: &RuntimeEvent) {
                 println!("📝 {todo_id} {title}：{} - {}", status.label(), message);
             }
         }
+        RuntimeEvent::WorkerQueued {
+            agent_id,
+            role,
+            title,
+            lane,
+            ..
+        } => {
+            println!(
+                "🗂️ {agent_id} / {role} 入队：{}（位次 {lane}）",
+                truncate(title, 72)
+            );
+        }
+        RuntimeEvent::WorkerBlocked {
+            agent_id, reason, ..
+        } => {
+            println!(
+                "⛔ {agent_id} 阻塞：{} / {}",
+                reason.label(),
+                truncate(&reason.detail, 120)
+            );
+        }
+        RuntimeEvent::WorkerRequeued { agent_id, reason } => {
+            println!("🔁 {agent_id} 重新入队：{}", truncate(reason, 120));
+        }
         RuntimeEvent::WorkerDispatched {
             agent_id,
             role,
@@ -908,11 +1600,37 @@ fn render_plain(event: &RuntimeEvent) {
                 println!("⚠️  {agent_id} [{kind}] {}", truncate(message, 120));
             }
         }
+        RuntimeEvent::WorkerOutput {
+            agent_id,
+            stream,
+            message,
+        } => {
+            println!(
+                "📡 {agent_id} [{}] {}",
+                if stream == "stderr" {
+                    "stderr"
+                } else {
+                    "stdout"
+                },
+                truncate(message, 120)
+            );
+        }
         RuntimeEvent::HandoffReady {
             agent_id,
             handoff_path,
         } => {
             println!("📦 {agent_id} handoff 就绪：{}", handoff_path.display());
+        }
+        RuntimeEvent::MemoryViewReady {
+            agent_id,
+            memory_view_path,
+            entries,
+        } => {
+            println!(
+                "🧠 {agent_id} 共享记忆就绪：{}（{} 条）",
+                memory_view_path.display(),
+                entries
+            );
         }
         RuntimeEvent::WorkerFinished { result } => {
             println!(
@@ -950,6 +1668,18 @@ fn render_plain(event: &RuntimeEvent) {
                 message
             );
         }
+        RuntimeEvent::MemoryUpdated {
+            scope,
+            reason,
+            path,
+            entries,
+        } => {
+            println!(
+                "🧠 共享记忆更新：{scope} / {reason} / {}（{} 条）",
+                path.display(),
+                entries
+            );
+        }
         RuntimeEvent::SummaryReady { summary } => {
             println!("📦 最终摘要：{}", summary.overview);
         }
@@ -957,12 +1687,22 @@ fn render_plain(event: &RuntimeEvent) {
 }
 
 fn upsert_result(workers: &mut BTreeMap<String, WorkerView>, result: &WorkerResult) {
+    let previous = workers.get(&result.agent_id).cloned();
     workers.insert(
         result.agent_id.clone(),
         WorkerView {
+            todo_id: previous.as_ref().and_then(|item| item.todo_id.clone()),
             role: result.role.clone(),
             title: result.task_title.clone(),
             status: result.status,
+            queue_state: WorkerQueueState::Finished,
+            blocked_reason: None,
+            lane: None,
+            attempts: result.attempts,
+            started_at: previous.as_ref().and_then(|item| item.started_at),
+            finished_at: Some(Instant::now()),
+            phase_label: "已完成".to_string(),
+            latest_brain_decision: previous.and_then(|item| item.latest_brain_decision),
             last_event: result
                 .summary
                 .clone()
@@ -973,6 +1713,145 @@ fn upsert_result(workers: &mut BTreeMap<String, WorkerView>, result: &WorkerResu
     );
 }
 
+fn upsert_worker(
+    workers: &mut BTreeMap<String, WorkerView>,
+    agent_id: &str,
+    role: &str,
+    title: &str,
+    todo_id: Option<String>,
+    status: WorkerStatus,
+    queue_state: WorkerQueueState,
+) {
+    let existing = workers.get(agent_id).cloned();
+    workers.insert(
+        agent_id.to_string(),
+        WorkerView {
+            todo_id: todo_id.or_else(|| existing.as_ref().and_then(|item| item.todo_id.clone())),
+            role: role.to_string(),
+            title: title.to_string(),
+            status,
+            queue_state,
+            blocked_reason: existing
+                .as_ref()
+                .and_then(|item| item.blocked_reason.clone()),
+            lane: existing.as_ref().and_then(|item| item.lane),
+            attempts: existing.as_ref().map(|item| item.attempts).unwrap_or(0),
+            started_at: existing.as_ref().and_then(|item| item.started_at),
+            finished_at: existing.as_ref().and_then(|item| item.finished_at),
+            phase_label: existing
+                .as_ref()
+                .map(|item| item.phase_label.clone())
+                .unwrap_or_else(|| queue_state.label().to_string()),
+            latest_brain_decision: existing
+                .as_ref()
+                .and_then(|item| item.latest_brain_decision.clone()),
+            last_event: existing
+                .as_ref()
+                .map(|item| item.last_event.clone())
+                .unwrap_or_else(|| queue_state.label().to_string()),
+            worktree_path: existing
+                .as_ref()
+                .map(|item| item.worktree_path.clone())
+                .unwrap_or_default(),
+        },
+    );
+}
+
+fn push_execution_line(
+    lines: &mut Vec<ExecutionLogEntry>,
+    source: impl Into<String>,
+    message: impl Into<String>,
+) {
+    lines.push(ExecutionLogEntry {
+        source: source.into(),
+        message: message.into(),
+    });
+    if lines.len() > MAX_EXECUTION_LINES {
+        let overflow = lines.len() - MAX_EXECUTION_LINES;
+        lines.drain(0..overflow);
+    }
+}
+
+fn user_stage_from_phase(phase: &str) -> &'static str {
+    if phase.contains("规划") {
+        "方案规划中"
+    } else if phase.contains("执行") || phase.contains("调度") {
+        "执行中"
+    } else if phase.contains("审") {
+        "审阅中"
+    } else if phase.contains("应用") || phase.contains("集成") {
+        "结果落地中"
+    } else if phase.contains("验证") {
+        "验证中"
+    } else if phase.contains("总结") {
+        "收尾中"
+    } else {
+        "准备中"
+    }
+}
+
+fn user_message_from_phase(phase: &str) -> &'static str {
+    if phase.contains("规划") {
+        "系统正在把需求拆成可执行的方案和待办。"
+    } else if phase.contains("执行") || phase.contains("调度") {
+        "系统正在并行推进子任务，并持续收集结果。"
+    } else if phase.contains("审") {
+        "系统正在审阅结果，判断哪些改动可以放行。"
+    } else if phase.contains("应用") || phase.contains("集成") {
+        "系统正在把通过审阅的结果落到目标仓库。"
+    } else if phase.contains("验证") {
+        "系统正在验证改动是否真的可用。"
+    } else if phase.contains("总结") {
+        "系统正在整理最终交付摘要。"
+    } else {
+        "系统正在准备本轮任务。"
+    }
+}
+
+fn user_next_step_from_phase(phase: &str) -> &'static str {
+    if phase.contains("规划") {
+        "等待方案和待办清单生成完成。"
+    } else if phase.contains("执行") || phase.contains("调度") {
+        "重点看子任务推进、审阅和验证是否顺利。"
+    } else if phase.contains("审") {
+        "等待审阅结论，确认哪些结果能继续落地。"
+    } else if phase.contains("应用") || phase.contains("集成") {
+        "等待应用完成，再看验证结果。"
+    } else if phase.contains("验证") {
+        "等待验证结束，再查看最终交付。"
+    } else if phase.contains("总结") {
+        "等待交付摘要生成后回看结果。"
+    } else {
+        "先生成方案或开始执行。"
+    }
+}
+
+fn user_stage_from_todo_status(status: TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Pending | TodoStatus::Ready => "方案已就绪",
+        TodoStatus::Running => "执行中",
+        TodoStatus::InReview => "审阅中",
+        TodoStatus::Verifying => "验证中",
+        TodoStatus::Applied | TodoStatus::Committed => "结果已落地",
+        TodoStatus::Verified => "验证通过",
+        TodoStatus::Failed | TodoStatus::Blocked => "执行受阻",
+        TodoStatus::NeedsManualFollowup => "待人工跟进",
+    }
+}
+
+fn user_next_step_from_todo_status(status: TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Pending | TodoStatus::Ready => "查看是否要开始执行。",
+        TodoStatus::Running => "等待子任务完成，再看审阅意见。",
+        TodoStatus::InReview => "等待审阅结论确认放行范围。",
+        TodoStatus::Verifying => "等待验证结果确认是否可交付。",
+        TodoStatus::Applied | TodoStatus::Committed => "继续查看验证与最终摘要。",
+        TodoStatus::Verified => "可以转到最终交付页确认结果。",
+        TodoStatus::Failed | TodoStatus::Blocked => "查看失败原因，决定是否继续修正。",
+        TodoStatus::NeedsManualFollowup => "需要人工判断下一步动作。",
+    }
+}
+
 fn style_for_status(status: WorkerStatus) -> Style {
     match status {
         WorkerStatus::Pending => Style::default().fg(Color::Gray),
@@ -980,6 +1859,14 @@ fn style_for_status(status: WorkerStatus) -> Style {
         WorkerStatus::Succeeded => Style::default().fg(Color::Green),
         WorkerStatus::Failed => Style::default().fg(Color::Red),
         WorkerStatus::Skipped => Style::default().fg(Color::Yellow),
+    }
+}
+
+fn style_for_worker(worker: &WorkerView) -> Style {
+    if worker.queue_state == WorkerQueueState::Blocked {
+        Style::default().fg(Color::Yellow)
+    } else {
+        style_for_status(worker.status)
     }
 }
 
@@ -997,6 +1884,17 @@ fn push_note(notes: &mut Vec<String>, note: &str) {
     if notes.len() > 8 {
         let overflow = notes.len() - 8;
         notes.drain(0..overflow);
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: String) {
+    if paths.iter().any(|item| item == &path) {
+        return;
+    }
+    paths.push(path);
+    if paths.len() > 6 {
+        let overflow = paths.len() - 6;
+        paths.drain(0..overflow);
     }
 }
 
@@ -1155,7 +2053,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("规划清单已生成"));
+        assert!(rendered.contains("方案已就绪"));
         assert!(rendered.contains("todo-1"));
         assert!(rendered.contains("计划清单已生成，共 2 项 todo。"));
     }
@@ -1181,7 +2079,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("implementer-1"));
         assert!(rendered.contains("命令完成"));
     }
 
@@ -1221,6 +2118,11 @@ mod tests {
             agent_id: "implementer-1".to_string(),
             kind: "stderr:error".to_string(),
             message: "发现一个渲染边界".to_string(),
+        });
+        state.apply(&RuntimeEvent::WorkerOutput {
+            agent_id: "implementer-1".to_string(),
+            stream: "stdout".to_string(),
+            message: "cargo test -q".to_string(),
         });
         state.apply(&RuntimeEvent::HandoffReady {
             agent_id: "implementer-1".to_string(),
@@ -1285,6 +2187,13 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("stderr：发现一个渲染边界"))
         );
+        assert!(
+            state
+                .execution_entry_texts(12)
+                .iter()
+                .any(|line| line.contains("cargo test -q"))
+        );
+        assert_eq!(state.active_worker.as_deref(), Some("implementer-1"));
     }
 
     #[test]
@@ -1317,7 +2226,7 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(fallback_summary.contains("等待最终摘要"));
+        assert!(fallback_summary.contains("下一步："));
         assert!(fallback_summary.contains("最近一次决策"));
 
         state.summary = Some(sample_summary("最终摘要可见"));
@@ -1333,7 +2242,7 @@ mod tests {
             report: Box::new(sample_review_report(ApplyDecision::AllowFull)),
         };
         let rendered = describe_runtime_event(&event);
-        assert!(rendered.contains("review gate：全部放行"));
+        assert!(rendered.contains("审阅结论：全部放行"));
         assert!(rendered.contains("证据充分"));
     }
 
@@ -1387,9 +2296,12 @@ mod tests {
 
         let screen = render_to_text(&state, 80, 20);
         let normalized = normalize_rendered_text(&screen);
-        assert!(normalized.contains("当前阶段：规划中"), "{screen}");
+        assert!(normalized.contains("当前阶段：方案已就绪"), "{screen}");
         assert!(normalized.contains("todo-1"), "{screen}");
-        assert!(normalized.contains("等待最终摘要"), "{screen}");
+        assert!(
+            normalized.contains("下一步：查看是否要开始执行。"),
+            "{screen}"
+        );
         assert!(
             normalized.contains("最近决策：todo-1补齐紧凑视图->待执行/等待执行"),
             "{screen}"

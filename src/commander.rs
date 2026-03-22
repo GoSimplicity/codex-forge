@@ -10,7 +10,7 @@ use crate::codex::run_json_once;
 use crate::model::{
     ApplyDecision, ApplyStatus, DriftPolicy, ExecutionContract, ExecutionGraph, ExecutionNode,
     FinalSummary, NodeContract, PlanTodo, PlanTodoItem, RepoSnapshot, ResultStatus, RoleConfig,
-    ScopeDrift, SessionConfig, SessionManifest, TrustLevel,
+    SchedulerHint, ScopeDrift, SessionConfig, SessionManifest, TrustLevel,
 };
 
 const PLAN_TODO_SCHEMA: &str = r#"{
@@ -128,6 +128,7 @@ pub async fn build_plan(
     roles: &[RoleConfig],
     commander_dir: &Path,
     plan_todo: Option<&PlanTodo>,
+    memory_prompt: Option<&str>,
 ) -> Result<ExecutionGraph> {
     fs::create_dir_all(commander_dir)
         .with_context(|| format!("创建 commander 目录失败：{}", commander_dir.display()))?;
@@ -139,7 +140,7 @@ pub async fn build_plan(
     fs::write(&schema_path, PLAN_SCHEMA)
         .with_context(|| format!("写入计划 schema 失败：{}", schema_path.display()))?;
 
-    let prompt = build_planner_prompt(config, repo, roles, plan_todo);
+    let prompt = build_planner_prompt(config, repo, roles, plan_todo, memory_prompt);
     fs::write(&prompt_path, &prompt)
         .with_context(|| format!("写入 planner prompt 失败：{}", prompt_path.display()))?;
 
@@ -190,6 +191,7 @@ pub async fn build_plan_todo(
     config: &SessionConfig,
     repo: &RepoSnapshot,
     commander_dir: &Path,
+    memory_prompt: Option<&str>,
 ) -> Result<PlanTodo> {
     fs::create_dir_all(commander_dir)
         .with_context(|| format!("创建 commander 目录失败：{}", commander_dir.display()))?;
@@ -201,7 +203,7 @@ pub async fn build_plan_todo(
     fs::write(&schema_path, PLAN_TODO_SCHEMA)
         .with_context(|| format!("写入 todo schema 失败：{}", schema_path.display()))?;
 
-    let prompt = build_plan_todo_prompt(config, repo);
+    let prompt = build_plan_todo_prompt(config, repo, memory_prompt);
     fs::write(&prompt_path, &prompt)
         .with_context(|| format!("写入 todo prompt 失败：{}", prompt_path.display()))?;
 
@@ -250,6 +252,11 @@ pub fn derive_execution_contract(
     config: &SessionConfig,
     graph: &ExecutionGraph,
 ) -> ExecutionContract {
+    let review_allowed_paths = config
+        .continuation
+        .as_ref()
+        .and_then(|item| item.review_fix.as_ref())
+        .map(|item| vec![item.target_file.clone()]);
     let forbidden_paths = vec![
         ".git/**".to_string(),
         ".codex-forge/**".to_string(),
@@ -261,7 +268,9 @@ pub fn derive_execution_contract(
         .map(|node| NodeContract {
             node_id: node.id.clone(),
             allowed_paths: if node.allow_code_changes {
-                vec!["*".to_string()]
+                review_allowed_paths
+                    .clone()
+                    .unwrap_or_else(|| vec!["*".to_string()])
             } else {
                 Vec::new()
             },
@@ -282,7 +291,7 @@ pub fn derive_execution_contract(
 
     ExecutionContract {
         task_fingerprint: task_fingerprint(config, graph),
-        allowed_paths: vec!["*".to_string()],
+        allowed_paths: review_allowed_paths.unwrap_or_else(|| vec!["*".to_string()]),
         forbidden_paths,
         node_contracts,
         drift_policy: DriftPolicy::default(),
@@ -297,7 +306,18 @@ pub fn derive_execution_contract(
             "blocked_verifications".to_string(),
             "recommended_next_action".to_string(),
         ],
-        compatibility_notes: vec!["V3 默认契约使用保守禁止列表和宽松允许列表。".to_string()],
+        compatibility_notes: if let Some(review_fix) = config
+            .continuation
+            .as_ref()
+            .and_then(|item| item.review_fix.as_ref())
+        {
+            vec![format!(
+                "人工审查返修模式：仅允许修改 `{}`。",
+                review_fix.target_file
+            )]
+        } else {
+            vec!["V3 默认契约使用保守禁止列表和宽松允许列表。".to_string()]
+        },
     }
 }
 
@@ -313,7 +333,11 @@ pub async fn summarize_run(
     Ok(build_local_summary(manifest))
 }
 
-fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String {
+fn build_plan_todo_prompt(
+    config: &SessionConfig,
+    repo: &RepoSnapshot,
+    memory_prompt: Option<&str>,
+) -> String {
     let readme = repo
         .readme_excerpt
         .clone()
@@ -330,6 +354,7 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
 仓库摘要：\n\
 - 顶层目录：{}\n\
 - README 摘要：\n{}\n\n\
+{}\
 {}\
 规划要求：\n\
 - todo 必须直接对应用户要推进的工作，而不是角色名。\n\
@@ -349,6 +374,7 @@ fn build_plan_todo_prompt(config: &SessionConfig, repo: &RepoSnapshot) -> String
         },
         repo.top_level_entries.join("、"),
         readme,
+        memory_prompt.unwrap_or(""),
         continuation_block,
     )
 }
@@ -358,6 +384,7 @@ fn build_planner_prompt(
     repo: &RepoSnapshot,
     roles: &[RoleConfig],
     plan_todo: Option<&PlanTodo>,
+    memory_prompt: Option<&str>,
 ) -> String {
     let roles_text = roles
         .iter()
@@ -419,6 +446,7 @@ fn build_planner_prompt(
 - README 摘要：\n{}\n\n\
 {}\
 {}\
+{}\
 规划要求：\n\
 - 输出 1 到 {} 个节点。\n\
 - 每个节点必须绑定一个可用角色。\n\
@@ -444,6 +472,7 @@ fn build_planner_prompt(
         roles_text,
         repo.top_level_entries.join("、"),
         readme,
+        memory_prompt.unwrap_or(""),
         continuation_block,
         todo_context,
         config.workers,
@@ -546,6 +575,7 @@ fn normalize_plan(
                 .and_modify(|item| *item += 1)
                 .or_insert(1);
             let role = role_map.get(role_key.as_str()).context("缺少角色定义")?;
+            let dependencies = node.dependencies.clone();
             Ok(ExecutionNode {
                 id: format!("{role_key}-{index}"),
                 title: node.title,
@@ -556,7 +586,7 @@ fn normalize_plan(
                 role: role_key,
                 objective: node.objective,
                 deliverables: deliverables.clone(),
-                dependencies: node.dependencies,
+                dependencies: dependencies.clone(),
                 prompt_focus: node.prompt_focus,
                 input_artifacts: node.input_artifacts,
                 output_artifacts: node.output_artifacts,
@@ -565,6 +595,7 @@ fn normalize_plan(
                 expected_artifacts: deliverables,
                 required_verifications: Vec::new(),
                 scope_guard_ref: None,
+                scheduler_hint: infer_scheduler_hint(role, &dependencies),
                 acceptable_drift: if role.can_edit {
                     ScopeDrift::Minor
                 } else {
@@ -894,6 +925,7 @@ fn fallback_plan(
             let role = role_map
                 .get(role_key.as_str())
                 .context("fallback 角色缺失")?;
+            let dependencies = fallback_dependencies(&role_key, *count);
             Ok(ExecutionNode {
                 id: format!("{role_key}-{count}"),
                 title: fallback_title(role, *count),
@@ -901,7 +933,7 @@ fn fallback_plan(
                 role: role_key.clone(),
                 objective: fallback_objective(role, *count, &config.task),
                 deliverables: fallback_deliverables(role),
-                dependencies: fallback_dependencies(&role_key, *count),
+                dependencies: dependencies.clone(),
                 prompt_focus: fallback_focus(role, *count),
                 input_artifacts: fallback_inputs(role),
                 output_artifacts: fallback_outputs(role),
@@ -910,6 +942,7 @@ fn fallback_plan(
                 expected_artifacts: fallback_deliverables(role),
                 required_verifications: Vec::new(),
                 scope_guard_ref: None,
+                scheduler_hint: infer_scheduler_hint(role, &dependencies),
                 acceptable_drift: if role.can_edit {
                     ScopeDrift::Minor
                 } else {
@@ -1142,16 +1175,21 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
         .and_then(|item| item.review_report.clone())
         .or_else(|| latest_reviewer_report(manifest));
     let open_risks = collect_open_risks(manifest);
-    let result_status = if failed_workers > 0 || matches!(apply_status, ApplyStatus::SyncFailed) {
+    let delivered_to_target = manifest.delivered_to_target();
+    let result_status = if failed_workers > 0
+        || matches!(
+            apply_status,
+            ApplyStatus::SyncFailed
+                | ApplyStatus::Bundled
+                | ApplyStatus::VerificationFailed
+                | ApplyStatus::Skipped
+        )
+        || !delivered_to_target
+    {
         ResultStatus::Failed
     } else if !manual_review_files.is_empty()
         || !rejected_files.is_empty()
         || !blocked_verifications.is_empty()
-        || matches!(
-            apply_status,
-            ApplyStatus::Bundled | ApplyStatus::VerificationFailed
-        )
-        || manifest.apply_mode == crate::model::ApplyMode::None
     {
         ResultStatus::CompletedWithManualReview
     } else {
@@ -1172,7 +1210,12 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
 
     FinalSummary {
         overview: format!(
-            "当前可用版本为 V{}：本次运行共调度 {} 个节点，成功 {} 个、失败 {} 个；apply 状态为 `{}`，可信度为 `{}`，范围漂移为“{}”，适合{}继续推进。",
+            "{} V{}：本次运行共调度 {} 个节点，成功 {} 个、失败 {} 个；apply 状态为 `{}`，可信度为 `{}`，范围漂移为“{}”。",
+            if delivered_to_target {
+                "代码已交付到目标目录，当前可用版本为"
+            } else {
+                "本次 session 已结束，但代码尚未交付到目标目录"
+            },
             manifest.iteration_index_value(),
             manifest.worker_results.len(),
             success,
@@ -1180,11 +1223,6 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
             apply_status,
             trust_level.label(),
             scope_drift.label(),
-            if matches!(result_status, ResultStatus::Completed) {
-                "自动"
-            } else {
-                "人工"
-            }
         ),
         result_status,
         review_gate,
@@ -1285,6 +1323,10 @@ fn collect_open_risks(manifest: &SessionManifest) -> Vec<String> {
         );
     }
 
+    if !manifest.delivered_to_target() {
+        risks.push("代码尚未交付到目标目录。".to_string());
+    }
+
     risks.extend(detect_conflicts(manifest));
     risks.sort();
     risks.dedup();
@@ -1299,6 +1341,28 @@ fn recommended_next_actions(
     result_status: ResultStatus,
 ) -> Vec<String> {
     let mut actions = Vec::new();
+    if !manifest.delivered_to_target() {
+        if manifest
+            .apply_result
+            .as_ref()
+            .is_some_and(|result| !result.accepted_files.is_empty())
+        {
+            actions.push(
+                "先在历史页执行“交付已接收”，把 accepted_files 安全落地到目标目录。".to_string(),
+            );
+        }
+        if let Some(bundle_dir) = manifest
+            .apply_result
+            .as_ref()
+            .and_then(|result| result.bundle_dir.as_ref())
+        {
+            actions.push(format!(
+                "如需人工处理其余改动，请检查 bundle：`{}`。",
+                bundle_dir.display()
+            ));
+        }
+        return actions;
+    }
     match manifest.apply_mode {
         crate::model::ApplyMode::None => {
             actions.push(
@@ -1597,8 +1661,19 @@ fn ensure_reviewer_gate(nodes: &mut Vec<ExecutionNode>, roles: &[RoleConfig]) {
         expected_artifacts: vec!["reviewer handoff".to_string()],
         required_verifications: vec!["检查范围漂移与冲突".to_string()],
         scope_guard_ref: None,
+        scheduler_hint: Some(SchedulerHint::Closure),
         acceptable_drift: ScopeDrift::None,
     });
+}
+
+fn infer_scheduler_hint(role: &RoleConfig, dependencies: &[String]) -> Option<SchedulerHint> {
+    if !role.can_edit {
+        Some(SchedulerHint::Closure)
+    } else if dependencies.is_empty() {
+        Some(SchedulerHint::CriticalPath)
+    } else {
+        Some(SchedulerHint::Unlock)
+    }
 }
 
 fn normalize_dependencies(nodes: &mut [ExecutionNode]) -> Result<()> {
@@ -1904,6 +1979,7 @@ mod tests {
             reviewer_rule_prompt: Some("reviewer 规则".to_string()),
             plan_only: false,
             preset: None,
+            source_plan_session_id: None,
             resume_session_id: None,
             continuation: None,
         };

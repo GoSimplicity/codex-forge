@@ -1,4 +1,14 @@
-use crate::model::{ExecutionNode, HandoffArtifact, RepoSnapshot, RoleConfig, SessionConfig};
+use crate::model::{
+    ExecutionNode, HandoffArtifact, RepoSnapshot, ReviewFixRequest, RoleConfig, SessionConfig,
+};
+
+pub struct WorkerPromptContext<'a> {
+    pub upstream_handoffs: &'a [HandoffArtifact],
+    pub memory_prompt: &'a str,
+    pub allowed_paths: &'a [String],
+    pub forbidden_paths: &'a [String],
+    pub review_fix: Option<&'a ReviewFixRequest>,
+}
 
 pub fn find_role(roles: &[RoleConfig], name: &str) -> Option<RoleConfig> {
     roles.iter().find(|role| role.key == name).cloned()
@@ -9,17 +19,18 @@ pub fn render_worker_prompt(
     node: &ExecutionNode,
     config: &SessionConfig,
     repo: &RepoSnapshot,
-    upstream_handoffs: &[HandoffArtifact],
+    context: WorkerPromptContext<'_>,
 ) -> String {
     let deliverables = render_bullets(&node.deliverables, "无");
     let dependencies = render_bullets(&node.dependencies, "无显式依赖");
     let input_artifacts = render_bullets(&node.input_artifacts, "无");
     let output_artifacts = render_bullets(&node.output_artifacts, "无");
     let completion = render_bullets(&node.completion_criteria, "无");
-    let handoffs = if upstream_handoffs.is_empty() {
+    let handoffs = if context.upstream_handoffs.is_empty() {
         "无上游 handoff，可直接推进。".to_string()
     } else {
-        upstream_handoffs
+        context
+            .upstream_handoffs
             .iter()
             .map(|artifact| {
                 format!(
@@ -72,6 +83,8 @@ pub fn render_worker_prompt(
     } else {
         ""
     };
+    let allowed_paths = render_bullets(context.allowed_paths, "无");
+    let forbidden_paths = render_bullets(context.forbidden_paths, "无");
     let thinking_mode = config.thinking_mode;
     let continuation_block = config
         .continuation
@@ -95,6 +108,18 @@ pub fn render_worker_prompt(
             )
         })
         .unwrap_or_default();
+    let review_fix_block = context
+        .review_fix
+        .map(|item| {
+            format!(
+                "人工审查返修约束：\n\
+- 目标文件：{}\n\
+- 审查问题：{}\n\
+- 只允许围绕该文件修复，不要扩散到其他文件。\n\n",
+                item.target_file, item.issue_summary
+            )
+        })
+        .unwrap_or_default();
     format!(
         "{prompt_preamble}\n\
 角色：{}（{}）\n\
@@ -108,6 +133,7 @@ pub fn render_worker_prompt(
 思考模式要求：\n{}\n\n\
 全局任务：{}\n\
 {}\
+{}\
 当前节点：{}\n\
 节点目标：{}\n\
 聚焦点：{}\n\n\
@@ -117,11 +143,14 @@ pub fn render_worker_prompt(
 交付物：\n{}\n\n\
 依赖节点：\n{}\n\n\
 上游 handoff：\n{}\n\n\
+{}\n\
 仓库上下文：\n\
 - 仓库：{}\n\
 - 技术栈：{}\n\
 - 顶层目录：{}\n\n\
 执行约束：\n\
+- 允许修改路径：\n{}\n\
+- 禁止修改路径：\n{}\n\
 - 你工作在独立 worktree 内，与其他 worker 并行协作。\n\
 - 必须显式吸收上游 handoff，再决定是否继续实现。\n\
 - 不要假设未声明依赖的节点已经完成。\n\
@@ -160,6 +189,7 @@ pub fn render_worker_prompt(
         thinking_mode_instructions(thinking_mode),
         config.task,
         continuation_block,
+        review_fix_block,
         node.title,
         node.objective,
         node.prompt_focus,
@@ -169,9 +199,12 @@ pub fn render_worker_prompt(
         deliverables,
         dependencies,
         handoffs,
+        context.memory_prompt,
         repo.display_name,
         stacks,
         repo.top_level_entries.join("、"),
+        allowed_paths,
+        forbidden_paths,
     )
 }
 

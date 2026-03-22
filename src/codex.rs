@@ -352,6 +352,16 @@ async fn run_worker_attempt(
         let Some(line_event) = next_line else {
             break;
         };
+        let trimmed_line = line_event.line.trim();
+        if !trimmed_line.is_empty() {
+            let _ = tx
+                .send(RuntimeEvent::WorkerOutput {
+                    agent_id: spec.agent_id.clone(),
+                    stream: line_event.stream.clone(),
+                    message: trimmed_line.to_string(),
+                })
+                .await;
+        }
         let (kind, message, _) = parse_event_line(&line_event.line);
         let kind = if line_event.stream == "stderr" {
             format!("stderr:{kind}")

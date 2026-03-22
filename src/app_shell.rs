@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -19,7 +21,9 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthChar;
 
+use crate::app::build_review_fix_config;
 use crate::app::{resolve_continue_config, resolve_plan_config, resolve_run_config};
+use crate::apply::{deliver_accepted_files, deliver_selected_files_from_plan};
 use crate::cli::{
     ApplyModeArg, ContinueArgs, ContinueModeArg, PlanArgs, RunArgs, SharedTaskArgs,
     ThinkingModeArg, UiModeArg,
@@ -27,13 +31,16 @@ use crate::cli::{
 use crate::config::{LoadedProjectConfig, load_project_config};
 use crate::doctor::run_doctor;
 use crate::model::{
-    ApplyMode, DoctorReport, RuntimeEvent, SessionManifest, SessionPreset, ThinkingMode,
+    ApplyMode, ApplyPlan, ApplyStatus, DoctorReport, ManualDeliveryResult, ManualReviewFileRecord,
+    ManualReviewFileStatus, ManualReviewState, RuntimeEvent, SessionManifest, SessionPreset,
+    ThinkingMode, UiMode,
 };
 use crate::orchestrator::{EmbeddedRunOutcome, plan_session_embedded, run_session_embedded};
 use crate::replay::replay_session_embedded;
 use crate::resources::{ResourceCatalog, load_resource_catalog};
 use crate::session::{
     cleanup_all_forge_artifacts, cleanup_session_lineage, load_session, reset_session_lineage,
+    set_manual_delivery_result_for_loaded_session, set_manual_review_state_for_loaded_session,
 };
 use crate::time::format_beijing;
 use crate::ui::{RuntimeViewState, describe_runtime_event, render_runtime_dashboard};
@@ -74,7 +81,9 @@ enum FormField {
     ConfigPath,
     Task,
     ContinueFeedback,
+    ReviewIssue,
     ContinueMode,
+    FromPlanSession,
     ThinkingMode,
     RoleSet,
     Workers,
@@ -94,7 +103,9 @@ impl FormField {
             Self::ConfigPath => "配置文件",
             Self::Task => "任务描述",
             Self::ContinueFeedback => "继续反馈",
+            Self::ReviewIssue => "审查问题",
             Self::ContinueMode => "继续模式",
+            Self::FromPlanSession => "执行方案会话",
             Self::ThinkingMode => "任务强度",
             Self::RoleSet => "协作模板",
             Self::Workers => "并发 Worker",
@@ -117,6 +128,7 @@ enum ShellAction {
     Plan,
     Run,
     ContinueSelected,
+    ReviewFixSelected,
     ReplaySelected,
 }
 
@@ -127,6 +139,7 @@ impl ShellAction {
             Self::Plan => "先看方案",
             Self::Run => "开始执行",
             Self::ContinueSelected => "继续优化",
+            Self::ReviewFixSelected => "修复当前文件",
             Self::ReplaySelected => "回放过程",
         }
     }
@@ -174,9 +187,9 @@ enum RunSubview {
 impl RunSubview {
     fn label(self) -> &'static str {
         match self {
-            Self::Dashboard => "实时态势",
-            Self::Timeline => "事件流",
-            Self::Summary => "交付摘要",
+            Self::Dashboard => "进度总览",
+            Self::Timeline => "执行视图",
+            Self::Summary => "最终交付",
         }
     }
 
@@ -192,18 +205,18 @@ enum HistoryDetailTab {
     Overview,
     Plan,
     Runtime,
-    Workers,
     Artifacts,
+    Technical,
 }
 
 impl HistoryDetailTab {
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "总览",
-            Self::Plan => "计划",
-            Self::Runtime => "运行",
-            Self::Workers => "Workers",
-            Self::Artifacts => "产物",
+            Self::Plan => "方案",
+            Self::Runtime => "过程",
+            Self::Artifacts => "交付",
+            Self::Technical => "技术细节",
         }
     }
 
@@ -212,8 +225,8 @@ impl HistoryDetailTab {
             Self::Overview,
             Self::Plan,
             Self::Runtime,
-            Self::Workers,
             Self::Artifacts,
+            Self::Technical,
         ]
     }
 }
@@ -253,6 +266,9 @@ impl StartAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryAction {
+    ExecutePlan,
+    DeliverAccepted,
+    ManualReview,
     Continue,
     EditFeedback,
     ContinueMode,
@@ -264,21 +280,7 @@ enum HistoryAction {
     BackToStart,
 }
 
-impl HistoryAction {
-    fn all() -> [Self; 9] {
-        [
-            Self::Continue,
-            Self::EditFeedback,
-            Self::ContinueMode,
-            Self::Replay,
-            Self::Detail,
-            Self::ResetSelected,
-            Self::CleanSelected,
-            Self::CleanAll,
-            Self::BackToStart,
-        ]
-    }
-}
+impl HistoryAction {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAction {
@@ -298,9 +300,83 @@ impl RunAction {
 struct HistoryDetailState {
     session: SessionManifest,
     active_tab: HistoryDetailTab,
-    body: String,
+    summary: String,
+    detail: String,
     page: usize,
     scroll: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualReviewFocus {
+    Files,
+    Actions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualReviewDiffView {
+    Source,
+    LatestFix,
+    Compare,
+}
+
+impl ManualReviewDiffView {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source => "原始候选",
+            Self::LatestFix => "返修结果",
+            Self::Compare => "前后对比",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualReviewAction {
+    Approve,
+    NeedsFix,
+    EditIssue,
+    StartFix,
+    DeliverApproved,
+    Close,
+}
+
+impl ManualReviewAction {
+    fn all() -> [Self; 6] {
+        [
+            Self::Approve,
+            Self::NeedsFix,
+            Self::EditIssue,
+            Self::StartFix,
+            Self::DeliverApproved,
+            Self::Close,
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManualReviewPopupState {
+    session_id: String,
+    state: ManualReviewState,
+    file_index: usize,
+    action_index: usize,
+    focus: ManualReviewFocus,
+    diff_view: ManualReviewDiffView,
+    scroll: u16,
+}
+
+impl ManualReviewPopupState {
+    fn selected_file(&self) -> Option<&ManualReviewFileRecord> {
+        self.state.files.get(self.file_index)
+    }
+
+    fn selected_file_mut(&mut self) -> Option<&mut ManualReviewFileRecord> {
+        self.state.files.get_mut(self.file_index)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingReviewFix {
+    parent_session_id: String,
+    target_file: String,
 }
 
 impl HistoryDetailState {
@@ -309,7 +385,8 @@ impl HistoryDetailState {
         Self {
             session: session.clone(),
             active_tab,
-            body: build_history_detail_body(session, active_tab),
+            summary: build_history_detail_summary(session, active_tab),
+            detail: build_history_detail_body(session, active_tab),
             page: 0,
             scroll: 0,
         }
@@ -326,7 +403,8 @@ impl HistoryDetailState {
             .position(|item| *item == self.active_tab)
             .unwrap_or(0);
         self.active_tab = tabs[cycle_index(current, tabs.len(), forward)];
-        self.body = build_history_detail_body(&self.session, self.active_tab);
+        self.summary = build_history_detail_summary(&self.session, self.active_tab);
+        self.detail = build_history_detail_body(&self.session, self.active_tab);
         self.page = 0;
         self.scroll = 0;
     }
@@ -340,11 +418,11 @@ impl HistoryDetailState {
     }
 
     fn page_count(&self) -> usize {
-        page_count_for_text(&self.body, HISTORY_DETAIL_PAGE_LINES)
+        page_count_for_text(&self.detail, HISTORY_DETAIL_PAGE_LINES)
     }
 
     fn current_page_text(&self) -> String {
-        page_text(&self.body, self.page, HISTORY_DETAIL_PAGE_LINES)
+        page_text(&self.detail, self.page, HISTORY_DETAIL_PAGE_LINES)
     }
 
     fn page_summary(&self) -> String {
@@ -423,7 +501,10 @@ struct SessionSummary {
     id: String,
     created_at: String,
     task: String,
-    status: String,
+    stage_label: String,
+    summary: String,
+    mode_label: String,
+    continuable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -442,7 +523,9 @@ struct FormState {
     config_path: String,
     task: String,
     continue_feedback: String,
+    review_issue: String,
     continue_mode: ContinueModeArg,
+    from_plan_session_id: String,
     thinking_mode: ThinkingMode,
     role_set: String,
     workers: String,
@@ -462,7 +545,9 @@ impl Default for FormState {
             config_path: String::new(),
             task: String::new(),
             continue_feedback: String::new(),
+            review_issue: String::new(),
             continue_mode: ContinueModeArg::Auto,
+            from_plan_session_id: String::new(),
             thinking_mode: ThinkingMode::Balanced,
             role_set: "default".to_string(),
             workers: "4".to_string(),
@@ -483,6 +568,8 @@ struct EditState {
     buffer: String,
     cursor: usize,
     preferred_column: Option<usize>,
+    history_entries: Vec<String>,
+    history_index: Option<usize>,
 }
 
 struct AppShell {
@@ -506,11 +593,13 @@ struct AppShell {
     project: ProjectContext,
     selected_session: Option<SessionManifest>,
     history_detail: Option<HistoryDetailState>,
+    manual_review: Option<ManualReviewPopupState>,
     confirm_dialog: Option<ConfirmDialogState>,
     runtime_state: Option<RuntimeViewState>,
     run_subview: RunSubview,
     last_doctor_report: Option<DoctorReport>,
     active_command: Option<ActiveCommand>,
+    pending_review_fix: Option<PendingReviewFix>,
     exit_esc_armed_at: Option<Instant>,
     should_quit: bool,
 }
@@ -599,11 +688,13 @@ impl AppShell {
             project,
             selected_session,
             history_detail: None,
+            manual_review: None,
             confirm_dialog: None,
             runtime_state: None,
             run_subview: RunSubview::Dashboard,
             last_doctor_report: None,
             active_command: None,
+            pending_review_fix: None,
             exit_esc_armed_at: None,
             should_quit: false,
         })
@@ -639,6 +730,16 @@ impl AppShell {
             );
             frame.render_widget(Clear, popup);
             self.render_history_detail_popup(frame, popup);
+        }
+
+        if self.manual_review.is_some() {
+            let popup = centered_rect(
+                popup_percent(area.width, 94, 99),
+                popup_percent(area.height, 90, 98),
+                area,
+            );
+            frame.render_widget(Clear, popup);
+            self.render_manual_review_popup(frame, popup);
         }
 
         if self.confirm_dialog.is_some() {
@@ -866,7 +967,7 @@ impl AppShell {
         match self.run_subview {
             RunSubview::Dashboard => {
                 if let Some(runtime_state) = &self.runtime_state {
-                    render_runtime_dashboard(frame, sections[1], runtime_state, "实时态势");
+                    render_runtime_dashboard(frame, sections[1], runtime_state, "进度总览");
                 } else if self
                     .active_command
                     .as_ref()
@@ -878,7 +979,20 @@ impl AppShell {
                 }
             }
             RunSubview::Timeline => {
-                frame.render_widget(self.run_timeline_widget(), sections[1]);
+                let split = Layout::default()
+                    .direction(if area.width < 120 {
+                        Direction::Vertical
+                    } else {
+                        Direction::Horizontal
+                    })
+                    .constraints(if area.width < 120 {
+                        vec![Constraint::Percentage(42), Constraint::Percentage(58)]
+                    } else {
+                        vec![Constraint::Percentage(40), Constraint::Percentage(60)]
+                    })
+                    .split(sections[1]);
+                frame.render_widget(self.run_timeline_widget(), split[0]);
+                frame.render_widget(self.run_timeline_detail_widget(), split[1]);
             }
             RunSubview::Summary => {
                 frame.render_widget(self.run_summary_widget(), sections[1]);
@@ -1010,6 +1124,10 @@ impl AppShell {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
+                } else if matches!(*action, StartAction::Plan) {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -1038,32 +1156,64 @@ impl AppShell {
     fn start_recent_widget(&self) -> Paragraph<'_> {
         let preview = self.command_preview_lines(ShellAction::Run);
         let mut lines = vec![
-            Line::from("这里只放低注意力信息。"),
+            Line::from("建议流程"),
+            Line::from(""),
+            Line::from("1. 先生成方案"),
+            Line::from("2. 看方案是否可接受"),
+            Line::from("3. 再决定是否执行"),
             Line::from(""),
             Line::from(Span::styled(
-                "如果现在直接运行",
+                "当前执行来源",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(run_source_user_hint(&self.form)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "如果现在直接执行",
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(truncate(&preview.summary, 120)),
             Line::from(""),
-            Line::from(Span::styled(
-                "最近结果",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
         ];
+
+        if let Some(session) = &self.selected_session
+            && session.is_plan_session()
+            && let Some(plan) = &session.plan_todo
+        {
+            lines.push(Line::from(Span::styled(
+                "最近方案",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(format!(
+                "会话：{} / Todo {} 项",
+                truncate(&session.id, 24),
+                plan.todos.len()
+            )));
+            lines.push(Line::from(truncate(&plan.summary, 120)));
+            lines.push(Line::from(""));
+        }
+
+        lines.extend([Line::from(Span::styled(
+            "最近结果",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))]);
 
         if self.project.sessions.is_empty() {
             lines.push(Line::from("还没有会话记录。"));
         } else {
             for item in self.project.sessions.iter().take(3) {
                 lines.push(Line::from(format!(
-                    "{}  {}  {}",
+                    "{}  {} / {}",
                     item.created_at,
-                    truncate(&item.status, 8),
+                    truncate(&item.mode_label, 4),
                     truncate(&item.task, 38),
                 )));
             }
@@ -1264,10 +1414,114 @@ impl AppShell {
 
     fn run_timeline_widget(&self) -> Paragraph<'_> {
         let mut lines = Vec::new();
-        if let Some(command) = &self.active_command {
-            // 运行中优先展示实时事件流；结束后则回退到 session 自带的 timeline 摘要。
+        if let Some(runtime_state) = &self.runtime_state {
             lines.push(Line::from(format!(
-                "实时事件流 / {} / {}",
+                "当前阶段：{}",
+                runtime_state.current_user_stage
+            )));
+            lines.push(Line::from(format!(
+                "现在在做：{}",
+                runtime_state.current_user_message
+            )));
+            lines.push(Line::from(format!(
+                "下一步：{}",
+                runtime_state.next_user_step
+            )));
+            if let Some(active_worker) = runtime_state.active_worker.as_deref() {
+                lines.push(Line::from(format!("当前焦点：{active_worker}")));
+            }
+            lines.push(Line::from(""));
+            let execution_lines = runtime_state.execution_entry_texts(12);
+            if execution_lines.is_empty() {
+                lines.push(Line::from("执行流还没有新的事件。"));
+            } else {
+                for line in execution_lines {
+                    lines.push(Line::from(truncate(&line, 96)));
+                }
+            }
+        } else if let Some(session) = &self.selected_session {
+            lines.push(Line::from(format!("历史会话：{}", session.id)));
+            lines.push(Line::from(""));
+            if session.timeline_events.is_empty() {
+                lines.push(Line::from("该会话还没有执行记录。"));
+            } else {
+                for item in session.timeline_events.iter().rev().take(10).rev() {
+                    lines.push(Line::from(format!(
+                        "- {} / {} / {}",
+                        format_beijing(item.ts, "%H:%M:%S"),
+                        item.title,
+                        truncate(&item.detail, 72)
+                    )));
+                }
+            }
+        } else {
+            lines.push(Line::from("暂无可展示的执行流。"));
+            lines.push(Line::from("先执行或回放一次任务，即可在这里回看关键推进。"));
+        }
+
+        Paragraph::new(lines)
+            .block(Block::default().title("执行流").borders(Borders::ALL))
+            .wrap(Wrap { trim: false })
+    }
+
+    fn run_timeline_detail_widget(&self) -> Paragraph<'_> {
+        let mut lines = Vec::new();
+        if let Some(runtime_state) = &self.runtime_state {
+            lines.push(Line::from(format!(
+                "技术细节 / {} / {}",
+                runtime_state.phase, runtime_state.current_user_stage
+            )));
+            if let Some(brain) = &runtime_state.brain {
+                lines.push(Line::from(format!(
+                    "Brain：{} / 风险 {}",
+                    truncate(&brain.current_focus, 72),
+                    brain.risk_level.label()
+                )));
+            }
+            lines.push(Line::from(""));
+            if let Some(active_worker_id) = runtime_state.active_worker.as_deref()
+                && let Some(worker) = runtime_state.workers.get(active_worker_id)
+            {
+                lines.push(Line::from(format!("焦点 Worker：{}", active_worker_id)));
+                lines.push(Line::from(format!("角色：{}", worker.role)));
+                lines.push(Line::from(format!("标题：{}", truncate(&worker.title, 88))));
+                if let Some(todo_id) = worker.todo_id.as_deref() {
+                    lines.push(Line::from(format!("Todo：{todo_id}")));
+                }
+                lines.push(Line::from(format!(
+                    "队列态：{}",
+                    worker.queue_state.label()
+                )));
+                lines.push(Line::from(format!("状态：{}", worker.status.label())));
+                lines.push(Line::from(format!("阶段：{}", worker.phase_label)));
+                if let Some(reason) = worker.blocked_reason.as_ref() {
+                    lines.push(Line::from(format!(
+                        "阻塞：{} / {}",
+                        reason.label(),
+                        truncate(&reason.detail, 72)
+                    )));
+                }
+                lines.push(Line::from(format!(
+                    "最近事件：{}",
+                    truncate(&worker.last_event, 88)
+                )));
+                lines.push(Line::from(format!(
+                    "Worktree：{}",
+                    truncate(&worker.worktree_path, 88)
+                )));
+                lines.push(Line::from(""));
+            }
+            let execution_lines = runtime_state.execution_entry_texts(36);
+            if execution_lines.is_empty() {
+                lines.push(Line::from("当前还没有新的执行流细节。"));
+            } else {
+                for line in execution_lines {
+                    lines.push(Line::from(line));
+                }
+            }
+        } else if let Some(command) = &self.active_command {
+            lines.push(Line::from(format!(
+                "技术细节 / {} / {}",
                 command.action.label(),
                 command.state.label()
             )));
@@ -1277,11 +1531,15 @@ impl AppShell {
             }
         } else if let Some(session) = &self.selected_session {
             lines.push(Line::from(format!("历史会话：{}", session.id)));
+            lines.push(Line::from(format!(
+                "timeline：{}",
+                session.timeline_path.display()
+            )));
             lines.push(Line::from(""));
             if session.timeline_events.is_empty() {
                 lines.push(Line::from("该会话还没有事件流记录。"));
             } else {
-                for item in session.timeline_events.iter().rev().take(36).rev() {
+                for item in session.timeline_events.iter().rev().take(20).rev() {
                     lines.push(Line::from(format!(
                         "{}  {} / {}",
                         format_beijing(item.ts, "%H:%M:%S"),
@@ -1291,12 +1549,11 @@ impl AppShell {
                 }
             }
         } else {
-            lines.push(Line::from("暂无可展示的事件流。"));
-            lines.push(Line::from("先执行或回放一次任务，即可在这里回看关键过程。"));
+            lines.push(Line::from("这里显示执行流明细、Worker 焦点和技术细节。"));
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("过程").borders(Borders::ALL))
+            .block(Block::default().title("技术细节").borders(Borders::ALL))
             .wrap(Wrap { trim: false })
     }
 
@@ -1314,8 +1571,18 @@ impl AppShell {
                     .and_then(|session| session.final_summary.as_ref())
             })
         {
+            let deliverables = self
+                .selected_session
+                .as_ref()
+                .map(existing_deliverables)
+                .unwrap_or_default();
+            let system_artifacts = self
+                .selected_session
+                .as_ref()
+                .map(existing_system_artifacts)
+                .unwrap_or_default();
             lines.push(Line::from(Span::styled(
-                "最后结果",
+                "最终交付",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -1352,9 +1619,50 @@ impl AppShell {
                     truncate(&summary.open_risks.join("；"), 120)
                 }
             )));
+            if let Some(session) = self.selected_session.as_ref() {
+                lines.push(Line::from(format!(
+                    "目标目录交付：{} / {}",
+                    delivery_status_label(session),
+                    truncate(&delivery_status_detail(session), 120)
+                )));
+            }
+            lines.push(Line::from(format!(
+                "系统工件目录：{}",
+                self.selected_session
+                    .as_ref()
+                    .map(|session| session.session_dir.display().to_string())
+                    .unwrap_or_else(|| format!("{}/.codex-forge", self.project.display_target))
+            )));
+            if system_artifacts.is_empty() {
+                lines.push(Line::from("系统工件：尚未落盘。"));
+            } else {
+                lines.push(Line::from("系统工件："));
+                for path in system_artifacts {
+                    lines.push(Line::from(format!("- {}", path.display())));
+                }
+            }
+            if deliverables.is_empty() {
+                let fallback = if let Some(session) = self.selected_session.as_ref() {
+                    format!(
+                        "用户导出件：当前会话尚未交付到目标目录。{}",
+                        truncate(&delivery_status_detail(session), 96)
+                    )
+                } else {
+                    "用户导出件：当前会话未导出到仓库根目录。".to_string()
+                };
+                lines.push(Line::from(fallback));
+            } else {
+                lines.push(Line::from("用户导出件："));
+                for path in deliverables {
+                    lines.push(Line::from(format!("- {}", path.display())));
+                }
+            }
         } else if let Some(runtime_state) = &self.runtime_state {
             lines.push(Line::from("交付摘要尚未生成。"));
-            lines.push(Line::from(format!("当前阶段：{}", runtime_state.phase)));
+            lines.push(Line::from(format!(
+                "当前阶段：{}",
+                runtime_state.current_user_stage
+            )));
             lines.push(Line::from(format!(
                 "Apply：{}",
                 runtime_state
@@ -1369,9 +1677,7 @@ impl AppShell {
                     .clone()
                     .unwrap_or_else(|| "等待".to_string())
             )));
-            lines.push(Line::from(
-                "可先切到“实时态势”查看 worker / todo / review 的当前进展。",
-            ));
+            lines.push(Line::from("可先切到“进度总览”或“执行视图”查看当前进展。"));
         } else if let Some(session) = &self.selected_session {
             lines.push(Line::from(format!("历史会话：{}", session.id)));
             lines.push(Line::from(format!("状态：{}", session.status.label())));
@@ -1382,7 +1688,7 @@ impl AppShell {
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("结果").borders(Borders::ALL))
+            .block(Block::default().title("最终交付").borders(Borders::ALL))
             .wrap(Wrap { trim: true })
     }
 
@@ -1400,10 +1706,23 @@ impl AppShell {
                 } else {
                     Style::default()
                 };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{}  ", item.created_at), style),
-                    Span::raw(format!("{} / {}", item.status, truncate(&item.task, 28))),
-                ]))
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(format!("{}  ", item.created_at), style),
+                        Span::raw(format!(
+                            "{} / {} / {}",
+                            item.mode_label,
+                            item.stage_label,
+                            if item.continuable {
+                                "可继续"
+                            } else {
+                                "进行中"
+                            }
+                        )),
+                    ]),
+                    Line::from(truncate(&item.task, 52)),
+                    Line::from(truncate(&item.summary, 52)),
+                ])
             })
             .collect::<Vec<_>>();
         List::new(items).block(
@@ -1422,17 +1741,45 @@ impl AppShell {
 
     fn history_right_widget(&self) -> Paragraph<'_> {
         let lines = if let Some(session) = &self.selected_session {
+            let next_step = if can_open_manual_review(session) {
+                "下一步：右侧优先可选“人工审查”，逐文件处理 manual_review_files。"
+            } else if can_deliver_accepted_files(session) {
+                "下一步：右侧优先可选“交付已接收”，把 accepted_files 安全落地到目标目录。"
+            } else if session.is_plan_session() {
+                "下一步：右侧可选“执行此方案”“继续改方案”“回放过程”或“查看详情”。"
+            } else {
+                "下一步：右侧选“继续优化”“回放过程”或“查看详情”。"
+            };
             let mut lines = vec![
                 Line::from(format!("当前会话：{}", truncate(&session.task, 80))),
                 Line::from(format!("状态：{}", session.status.label())),
+                Line::from(format!("类型：{}", session.session_kind.label())),
                 Line::from(format!(
                     "创建时间：{}",
                     format_beijing(session.created_at, "%m-%d %H:%M")
                 )),
+                Line::from(format!("交付物目录：{}", session.repo_root().display())),
+                Line::from(format!(
+                    "目标目录状态：{} / {}",
+                    delivery_status_label(session),
+                    truncate(&delivery_status_detail(session), 80)
+                )),
                 Line::from(""),
-                Line::from("下一步：右侧选“继续优化”“回放过程”或“查看详情”。"),
-                Line::from("快捷打开：Enter/ v 查看详情，e 补反馈，z 重置，x 删除。"),
+                Line::from(next_step),
+                Line::from("详情页默认左侧是用户摘要，右侧才是技术细节。"),
             ];
+            if let Some(plan) = &session.plan_todo {
+                lines.push(Line::from(format!(
+                    "方案摘要：{}",
+                    truncate(&plan.summary, 96)
+                )));
+            }
+            if let Some(summary) = &session.final_summary {
+                lines.push(Line::from(format!(
+                    "最终结论：{}",
+                    truncate(&summary.overview, 96)
+                )));
+            }
             lines.push(Line::from(format!(
                 "继续模式：{}",
                 continue_mode_user_label(self.form.continue_mode)
@@ -1459,7 +1806,8 @@ impl AppShell {
     }
 
     fn history_actions_widget(&self) -> List<'_> {
-        let items = HistoryAction::all()
+        let actions = available_history_actions(self.selected_session.as_ref());
+        let items = actions
             .iter()
             .enumerate()
             .map(|(index, action)| {
@@ -1530,13 +1878,31 @@ impl AppShell {
             sections[0],
         );
         frame.render_widget(self.history_detail_tabs_widget(area.width), sections[1]);
+        let content_sections = Layout::default()
+            .direction(if area.width < 120 {
+                Direction::Vertical
+            } else {
+                Direction::Horizontal
+            })
+            .constraints(if area.width < 120 {
+                vec![Constraint::Percentage(36), Constraint::Percentage(64)]
+            } else {
+                vec![Constraint::Percentage(38), Constraint::Percentage(62)]
+            })
+            .split(sections[2]);
 
         frame.render_widget(
+            Paragraph::new(detail.summary.clone())
+                .block(Block::default().title("用户摘要").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            content_sections[0],
+        );
+        frame.render_widget(
             Paragraph::new(detail.current_page_text())
-                .block(Block::default().title("内容").borders(Borders::ALL))
+                .block(Block::default().title("技术细节").borders(Borders::ALL))
                 .wrap(Wrap { trim: false })
                 .scroll((detail.scroll, 0)),
-            sections[2],
+            content_sections[1],
         );
         frame.render_widget(
             Paragraph::new(history_detail_shortcuts_lines())
@@ -1544,6 +1910,387 @@ impl AppShell {
                 .wrap(Wrap { trim: true }),
             sections[3],
         );
+    }
+
+    fn render_manual_review_popup(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let Some(review) = &self.manual_review else {
+            return;
+        };
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Min(12),
+                Constraint::Length(5),
+            ])
+            .split(area);
+
+        let header = vec![
+            Line::from(Span::styled(
+                format!(
+                    "人工审查 / {} / {} / {}",
+                    truncate(&review.session_id, 24),
+                    review.diff_view.label(),
+                    review
+                        .selected_file()
+                        .map(|item| item.status.label())
+                        .unwrap_or("无文件")
+                ),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(
+                review
+                    .selected_file()
+                    .map(|item| format!("当前文件：{}", item.path))
+                    .unwrap_or_else(|| "当前没有可审查文件。".to_string()),
+            ),
+            Line::from("左侧选文件，右侧执行通过/修复/交付；`[` `]` 切换 diff 视图，`Esc` 关闭。"),
+        ];
+        frame.render_widget(
+            Paragraph::new(header)
+                .block(Block::default().title("人工审查").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            sections[0],
+        );
+
+        let content = Layout::default()
+            .direction(if area.width < 150 {
+                Direction::Vertical
+            } else {
+                Direction::Horizontal
+            })
+            .constraints(if area.width < 150 {
+                vec![
+                    Constraint::Length(10),
+                    Constraint::Min(10),
+                    Constraint::Length(9),
+                ]
+            } else {
+                vec![
+                    Constraint::Percentage(24),
+                    Constraint::Percentage(56),
+                    Constraint::Percentage(20),
+                ]
+            })
+            .split(sections[1]);
+
+        let file_items = review
+            .state
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let selected =
+                    review.focus == ManualReviewFocus::Files && index == review.file_index;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(vec![
+                    Line::from(Span::styled(truncate(&item.path, 40), style)),
+                    Line::from(format!(
+                        "{} / {}",
+                        item.status.label(),
+                        item.source_workers.join("、")
+                    )),
+                ])
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(file_items).block(
+                Block::default()
+                    .title("待审文件")
+                    .borders(Borders::ALL)
+                    .border_style(if review.focus == ManualReviewFocus::Files {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    }),
+            ),
+            content[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new(build_manual_review_detail_text(
+                self.project.target_dir.as_path(),
+                &review.state,
+                review.file_index,
+                review.diff_view,
+            ))
+            .block(Block::default().title("Diff / 细节").borders(Borders::ALL))
+            .wrap(Wrap { trim: false })
+            .scroll((review.scroll, 0)),
+            content[1],
+        );
+
+        let action_items = ManualReviewAction::all()
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let selected =
+                    review.focus == ManualReviewFocus::Actions && index == review.action_index;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let (title, detail) = self.manual_review_action_line(*action);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<10}", title), style),
+                    Span::raw(detail),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(action_items).block(
+                Block::default()
+                    .title("动作")
+                    .borders(Borders::ALL)
+                    .border_style(if review.focus == ManualReviewFocus::Actions {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    }),
+            ),
+            content[2],
+        );
+
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("快捷键：↑↓ 选文件/动作，←→ 切焦点，Enter 执行动作，a 通过，n 需修复，e 编辑问题，f 发起返修，d 交付已通过，r 刷新，PgUp/PgDn 滚动。"),
+                Line::from(format!(
+                    "审查状态：已通过 {} / 待修复 {} / 返修待复查 {}",
+                    review
+                        .state
+                        .files
+                        .iter()
+                        .filter(|item| item.status == ManualReviewFileStatus::Approved)
+                        .count(),
+                    review
+                        .state
+                        .files
+                        .iter()
+                        .filter(|item| item.status == ManualReviewFileStatus::NeedsFix)
+                        .count(),
+                    review
+                        .state
+                        .files
+                        .iter()
+                        .filter(|item| item.status == ManualReviewFileStatus::FixedPendingReview)
+                        .count(),
+                )),
+            ])
+            .block(Block::default().title("提示").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+            sections[2],
+        );
+    }
+
+    fn manual_review_action_line(&self, action: ManualReviewAction) -> (&'static str, String) {
+        match action {
+            ManualReviewAction::Approve => {
+                ("通过文件", "当前文件审查通过，可进入交付集合。".to_string())
+            }
+            ManualReviewAction::NeedsFix => {
+                ("标记问题", "把当前文件标成需修复，并记录问题。".to_string())
+            }
+            ManualReviewAction::EditIssue => (
+                "编辑问题",
+                self.manual_review
+                    .as_ref()
+                    .and_then(|review| review.selected_file())
+                    .and_then(|item| item.issue_summary.clone())
+                    .unwrap_or_else(|| "补充这次返修的具体问题描述。".to_string()),
+            ),
+            ManualReviewAction::StartFix => (
+                "发起返修",
+                "只基于当前文件启动 Codex 返修子会话。".to_string(),
+            ),
+            ManualReviewAction::DeliverApproved => (
+                "交付已通过",
+                "只把已人工通过的文件交付到目标目录。".to_string(),
+            ),
+            ManualReviewAction::Close => ("关闭审查", "返回历史页。".to_string()),
+        }
+    }
+
+    fn current_manual_review_action(&self) -> ManualReviewAction {
+        ManualReviewAction::all()[self
+            .manual_review
+            .as_ref()
+            .map(|review| review.action_index.min(ManualReviewAction::all().len() - 1))
+            .unwrap_or(0)]
+    }
+
+    fn open_manual_review_popup(&mut self) -> Result<()> {
+        let Some(session_id) = self
+            .selected_session
+            .as_ref()
+            .map(|session| session.id.clone())
+        else {
+            self.push_notice("请先在历史页选中一个会话。");
+            return Ok(());
+        };
+        self.open_manual_review_popup_for(&session_id, None)
+    }
+
+    fn open_manual_review_popup_for(
+        &mut self,
+        session_id: &str,
+        preferred_file: Option<&str>,
+    ) -> Result<()> {
+        let session = load_session(&self.project.target_dir, Some(session_id))?;
+        if !can_open_manual_review(&session) {
+            self.push_notice("当前会话没有需要人工审查的文件。");
+            return Ok(());
+        }
+        let state = load_or_initialize_manual_review_state(&self.project.target_dir, &session)?;
+        let file_index = preferred_file
+            .or(state.selected_file.as_deref())
+            .and_then(|path| state.files.iter().position(|item| item.path == path))
+            .unwrap_or(0);
+        self.selected_session = Some(session);
+        if let Some(index) = self
+            .project
+            .sessions
+            .iter()
+            .position(|item| item.id == session_id)
+        {
+            self.history_index = index;
+        }
+        self.manual_review = Some(ManualReviewPopupState {
+            session_id: session_id.to_string(),
+            state,
+            file_index,
+            action_index: 0,
+            focus: ManualReviewFocus::Files,
+            diff_view: ManualReviewDiffView::Source,
+            scroll: 0,
+        });
+        self.navigate_to(Route::History);
+        Ok(())
+    }
+
+    async fn handle_manual_review_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.manual_review.is_none() {
+            return Ok(());
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.manual_review = None;
+            }
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let review = self.manual_review.as_mut().expect("review exists");
+                review.focus = match review.focus {
+                    ManualReviewFocus::Files => ManualReviewFocus::Actions,
+                    ManualReviewFocus::Actions => ManualReviewFocus::Files,
+                };
+            }
+            KeyCode::Up => {
+                let review = self.manual_review.as_mut().expect("review exists");
+                match review.focus {
+                    ManualReviewFocus::Files => {
+                        let len = review.state.files.len().max(1);
+                        review.file_index = cycle_index(review.file_index, len, false);
+                        review.scroll = 0;
+                    }
+                    ManualReviewFocus::Actions => {
+                        review.action_index = cycle_index(
+                            review.action_index,
+                            ManualReviewAction::all().len(),
+                            false,
+                        );
+                    }
+                }
+            }
+            KeyCode::Down => {
+                let review = self.manual_review.as_mut().expect("review exists");
+                match review.focus {
+                    ManualReviewFocus::Files => {
+                        let len = review.state.files.len().max(1);
+                        review.file_index = cycle_index(review.file_index, len, true);
+                        review.scroll = 0;
+                    }
+                    ManualReviewFocus::Actions => {
+                        review.action_index =
+                            cycle_index(review.action_index, ManualReviewAction::all().len(), true);
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                let review = self.manual_review.as_mut().expect("review exists");
+                review.scroll = review.scroll.saturating_sub(12);
+            }
+            KeyCode::PageDown => {
+                let review = self.manual_review.as_mut().expect("review exists");
+                review.scroll = review.scroll.saturating_add(12);
+            }
+            KeyCode::Char('[') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let review = self.manual_review.as_mut().expect("review exists");
+                review.diff_view = match review.diff_view {
+                    ManualReviewDiffView::Source => ManualReviewDiffView::Compare,
+                    ManualReviewDiffView::LatestFix => ManualReviewDiffView::Source,
+                    ManualReviewDiffView::Compare => ManualReviewDiffView::LatestFix,
+                };
+                review.scroll = 0;
+            }
+            KeyCode::Char(']') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let review = self.manual_review.as_mut().expect("review exists");
+                review.diff_view = match review.diff_view {
+                    ManualReviewDiffView::Source => ManualReviewDiffView::LatestFix,
+                    ManualReviewDiffView::LatestFix => ManualReviewDiffView::Compare,
+                    ManualReviewDiffView::Compare => ManualReviewDiffView::Source,
+                };
+                review.scroll = 0;
+            }
+            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.approve_current_review_file()?;
+            }
+            KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.mark_current_review_file_needs_fix()?;
+            }
+            KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_editing(FormField::ReviewIssue);
+            }
+            KeyCode::Char('f') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_manual_review_fix().await?;
+            }
+            KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.deliver_manual_review_approved().await?;
+            }
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let review = self.manual_review.as_ref().expect("review exists");
+                let session_id = review.session_id.clone();
+                let preferred = review.selected_file().map(|item| item.path.clone());
+                self.open_manual_review_popup_for(&session_id, preferred.as_deref())?;
+            }
+            KeyCode::Enter => match self.current_manual_review_action() {
+                ManualReviewAction::Approve => self.approve_current_review_file()?,
+                ManualReviewAction::NeedsFix => self.mark_current_review_file_needs_fix()?,
+                ManualReviewAction::EditIssue => self.start_editing(FormField::ReviewIssue),
+                ManualReviewAction::StartFix => self.start_manual_review_fix().await?,
+                ManualReviewAction::DeliverApproved => {
+                    self.deliver_manual_review_approved().await?
+                }
+                ManualReviewAction::Close => self.manual_review = None,
+            },
+            _ => {}
+        }
+        Ok(())
     }
 
     fn history_detail_tabs_widget(&self, width: u16) -> Tabs<'static> {
@@ -1624,9 +2371,18 @@ impl AppShell {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
-                "字符数：{}   光标：{}",
+                "字符数：{}   光标：{}{}",
                 edit.buffer.chars().count(),
-                edit.cursor
+                edit.cursor,
+                if edit.field == FormField::Task && !edit.history_entries.is_empty() {
+                    format!(
+                        "   历史：{}/{}",
+                        edit.history_index.map(|index| index + 1).unwrap_or(0),
+                        edit.history_entries.len()
+                    )
+                } else {
+                    String::new()
+                }
             )),
             Line::from(edit_mode_summary(edit.field)),
         ];
@@ -1649,9 +2405,25 @@ impl AppShell {
             sections[1],
         );
         frame.render_widget(
-            Paragraph::new(edit_shortcuts_lines(edit.field))
-                .block(Block::default().title("快捷键").borders(Borders::ALL))
-                .wrap(Wrap { trim: true }),
+            Paragraph::new(
+                edit_shortcuts_lines(edit.field)
+                    .into_iter()
+                    .chain(if edit.field == FormField::Task {
+                        let lines = recent_task_history_lines(edit);
+                        if lines.is_empty() {
+                            vec![Line::from("当前目标目录还没有历史提示词。")]
+                        } else {
+                            let mut result = vec![Line::from(""), Line::from("历史提示词：")];
+                            result.extend(lines);
+                            result
+                        }
+                    } else {
+                        Vec::new()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .block(Block::default().title("快捷键").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
             sections[2],
         );
 
@@ -1674,8 +2446,11 @@ impl AppShell {
     fn start_action_line(&self, action: StartAction) -> (&'static str, String) {
         match action {
             StartAction::Doctor => ("检查环境", "先排掉明显问题。".to_string()),
-            StartAction::Plan => ("先看方案", "先拆清楚，再决定要不要跑。".to_string()),
-            StartAction::Run => ("开始执行", "直接开始这一轮协作。".to_string()),
+            StartAction::Plan => (
+                "先看方案",
+                "推荐主路径：先拆清楚，再决定要不要跑。".to_string(),
+            ),
+            StartAction::Run => ("开始执行", run_source_user_hint(&self.form)),
             StartAction::ToggleSettings => (
                 if self.advanced_settings_open {
                     "收起设置"
@@ -1693,7 +2468,29 @@ impl AppShell {
 
     fn history_action_line(&self, action: HistoryAction) -> (&'static str, String) {
         match action {
-            HistoryAction::Continue => ("继续优化", "基于这一轮继续打磨。".to_string()),
+            HistoryAction::ExecutePlan => (
+                "执行此方案",
+                "显式绑定当前 plan session，再进入 run。".to_string(),
+            ),
+            HistoryAction::DeliverAccepted => (
+                "交付已接收",
+                "仅把 accepted_files 安全落地到目标目录。".to_string(),
+            ),
+            HistoryAction::ManualReview => (
+                "人工审查",
+                "逐文件审查 manual_review_files，并可发起单文件返修。".to_string(),
+            ),
+            HistoryAction::Continue => {
+                if self
+                    .selected_session
+                    .as_ref()
+                    .is_some_and(|session| session.is_plan_session())
+                {
+                    ("继续改方案", "基于这一轮继续打磨方案。".to_string())
+                } else {
+                    ("继续优化", "基于这一轮继续打磨。".to_string())
+                }
+            }
             HistoryAction::EditFeedback => (
                 "补充反馈",
                 if self.form.continue_feedback.trim().is_empty() {
@@ -1766,9 +2563,8 @@ impl AppShell {
     }
 
     fn current_history_action(&self) -> HistoryAction {
-        HistoryAction::all()[self
-            .history_action_index
-            .min(HistoryAction::all().len() - 1)]
+        let actions = available_history_actions(self.selected_session.as_ref());
+        actions[self.history_action_index.min(actions.len() - 1)]
     }
 
     fn current_run_action(&self) -> RunAction {
@@ -1820,6 +2616,14 @@ impl AppShell {
         match self.history_focus {
             HistoryFocus::Sessions => self.open_history_detail(),
             HistoryFocus::Actions => match self.current_history_action() {
+                HistoryAction::ExecutePlan => {
+                    if let Some(session) = self.selected_session.clone() {
+                        self.use_plan_session_for_run(&session);
+                        self.start_action(ShellAction::Run).await?;
+                    }
+                }
+                HistoryAction::DeliverAccepted => self.deliver_selected_session_accepted().await?,
+                HistoryAction::ManualReview => self.open_manual_review_popup()?,
                 HistoryAction::Continue => self.start_action(ShellAction::ContinueSelected).await?,
                 HistoryAction::EditFeedback => self.start_editing(FormField::ContinueFeedback),
                 HistoryAction::ContinueMode => {
@@ -1889,6 +2693,10 @@ impl AppShell {
             return self.handle_edit_key(key).await;
         }
 
+        if self.manual_review.is_some() {
+            return self.handle_manual_review_key(key).await;
+        }
+
         if self.history_detail.is_some() {
             return self.handle_history_detail_key(key);
         }
@@ -1952,6 +2760,12 @@ impl AppShell {
             }
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::Run).await?
+            }
+            KeyCode::Char('y') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.deliver_selected_session_accepted().await?
+            }
+            KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_manual_review_popup()?
             }
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::ContinueSelected).await?
@@ -2079,7 +2893,10 @@ impl AppShell {
             let Some(edit) = &mut self.edit_state else {
                 return Ok(());
             };
-            let multiline = matches!(edit.field, FormField::Task | FormField::ContinueFeedback);
+            let multiline = matches!(
+                edit.field,
+                FormField::Task | FormField::ContinueFeedback | FormField::ReviewIssue
+            );
             match key.code {
                 KeyCode::Esc => {
                     cancel = true;
@@ -2123,6 +2940,18 @@ impl AppShell {
                         FormField::ContinueFeedback => ShellAction::ContinueSelected,
                         _ => ShellAction::Run,
                     });
+                }
+                KeyCode::Char('j')
+                    if edit.field == FormField::Task
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    cycle_edit_history(edit, true);
+                }
+                KeyCode::Char('k')
+                    if edit.field == FormField::Task
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    cycle_edit_history(edit, false);
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     insert_char_at_cursor(edit, ch);
@@ -2171,6 +3000,7 @@ impl AppShell {
             && !self.nav_focus
             && self.edit_state.is_none()
             && self.history_detail.is_none()
+            && self.manual_review.is_none()
             && self.confirm_dialog.is_none()
     }
 
@@ -2246,7 +3076,8 @@ impl AppShell {
                     }
                 }
                 HistoryFocus::Actions => {
-                    let len = HistoryAction::all().len() as isize;
+                    let len =
+                        available_history_actions(self.selected_session.as_ref()).len() as isize;
                     self.history_action_index =
                         ((self.history_action_index as isize + delta).rem_euclid(len)) as usize;
                 }
@@ -2542,6 +3373,29 @@ impl AppShell {
         }
 
         if let Some((action, state, manifest)) = finished {
+            if action == ShellAction::ReviewFixSelected {
+                let pending = self.pending_review_fix.take();
+                if let (Some(pending), Some(child_manifest)) = (pending, manifest.as_ref()) {
+                    record_review_fix_completion(
+                        &self.project.target_dir,
+                        &pending.parent_session_id,
+                        &pending.target_file,
+                        child_manifest,
+                    )?;
+                    self.refresh_project(false)?;
+                    self.open_manual_review_popup_for(
+                        &pending.parent_session_id,
+                        Some(&pending.target_file),
+                    )?;
+                    self.push_notice(&format!(
+                        "单文件返修已结束：{} / {}",
+                        pending.target_file,
+                        state.label()
+                    ));
+                    self.navigate_to(Route::History);
+                    return Ok(());
+                }
+            }
             if let Some(manifest) = manifest {
                 if let Some(runtime_state) = &mut self.runtime_state {
                     runtime_state.set_identity(manifest.id.clone(), manifest.task.clone());
@@ -2642,6 +3496,11 @@ impl AppShell {
             self.nav_focus = false;
             self.restore_page_focus();
             self.push_notice("已离开顶部导航。");
+            return;
+        }
+        if self.manual_review.is_some() {
+            self.manual_review = None;
+            self.push_notice("已关闭人工审查。");
             return;
         }
         match self.route {
@@ -2832,6 +3691,260 @@ impl AppShell {
         }
     }
 
+    async fn deliver_selected_session_accepted(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session.clone() else {
+            self.push_notice("请先在历史页选中一个会话。");
+            return Ok(());
+        };
+        if !can_deliver_accepted_files(&session) {
+            self.push_notice("当前会话没有可安全交付的 accepted_files。");
+            return Ok(());
+        }
+
+        let plan = load_apply_plan_for_session(&session)?;
+        let apply_result = session
+            .apply_result
+            .clone()
+            .with_context(|| format!("session `{}` 缺少 apply_result", session.id))?;
+        match deliver_accepted_files(&plan, &apply_result, session.repo_root()).await {
+            Ok(delivered_files) => {
+                let skipped_files = apply_result
+                    .manual_review_files
+                    .iter()
+                    .filter(|file| !delivered_files.contains(*file))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                persist_manual_delivery_result(
+                    &self.project.target_dir,
+                    &session.id,
+                    ManualDeliveryResult {
+                        delivered_at: Utc::now(),
+                        target_dir: session.repo_root().to_path_buf(),
+                        delivered_files: delivered_files.clone(),
+                        skipped_files,
+                        success: true,
+                        source_apply_status: Some(apply_result.status),
+                        review_gate: apply_result.review_gate,
+                        error: None,
+                    },
+                )?;
+                self.refresh_project(false)?;
+                self.push_notice(&format!(
+                    "已将 {} 个 accepted_files 安全交付到目标目录。",
+                    delivered_files.len()
+                ));
+            }
+            Err(error) => {
+                persist_manual_delivery_result(
+                    &self.project.target_dir,
+                    &session.id,
+                    ManualDeliveryResult {
+                        delivered_at: Utc::now(),
+                        target_dir: session.repo_root().to_path_buf(),
+                        delivered_files: Vec::new(),
+                        skipped_files: apply_result.manual_review_files.clone(),
+                        success: false,
+                        source_apply_status: Some(apply_result.status),
+                        review_gate: apply_result.review_gate,
+                        error: Some(error.to_string()),
+                    },
+                )?;
+                self.refresh_project(false)?;
+                self.push_notice(&format!("安全交付失败：{error}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn approve_current_review_file(&mut self) -> Result<()> {
+        let Some(review) = &mut self.manual_review else {
+            return Ok(());
+        };
+        let Some(index) = review
+            .state
+            .files
+            .get(review.file_index)
+            .map(|_| review.file_index)
+        else {
+            return Ok(());
+        };
+        review.state.files[index].status = ManualReviewFileStatus::Approved;
+        let file_path = review.state.files[index].path.clone();
+        review.state.selected_file = Some(file_path.clone());
+        let session_id = review.session_id.clone();
+        let state = review.state.clone();
+        persist_manual_review_state(&self.project.target_dir, &session_id, state)?;
+        self.refresh_project(false)?;
+        self.push_notice(&format!("已通过文件：{}", file_path));
+        Ok(())
+    }
+
+    fn mark_current_review_file_needs_fix(&mut self) -> Result<()> {
+        let Some(review) = &mut self.manual_review else {
+            return Ok(());
+        };
+        let Some(index) = review
+            .state
+            .files
+            .get(review.file_index)
+            .map(|_| review.file_index)
+        else {
+            return Ok(());
+        };
+        review.state.files[index].status = ManualReviewFileStatus::NeedsFix;
+        if review.state.files[index]
+            .issue_summary
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            let file_path = review.state.files[index].path.clone();
+            review.state.files[index].issue_summary = Some(format!(
+                "请修复文件 `{}` 的人工审查问题，并保持改动范围只限该文件。",
+                file_path
+            ));
+        }
+        let file_path = review.state.files[index].path.clone();
+        review.state.selected_file = Some(file_path.clone());
+        let session_id = review.session_id.clone();
+        let state = review.state.clone();
+        persist_manual_review_state(&self.project.target_dir, &session_id, state)?;
+        self.refresh_project(false)?;
+        self.push_notice(&format!("已标记需修复：{}", file_path));
+        Ok(())
+    }
+
+    async fn start_manual_review_fix(&mut self) -> Result<()> {
+        if self
+            .active_command
+            .as_ref()
+            .is_some_and(|command| command.state.is_running())
+        {
+            self.push_notice("已有动作在执行，请等待当前命令结束。");
+            self.navigate_to(Route::Run);
+            return Ok(());
+        }
+        let Some(review) = &self.manual_review else {
+            return Ok(());
+        };
+        let Some(parent_session) = self.selected_session.clone() else {
+            self.push_notice("请先在历史页选中一个会话。");
+            return Ok(());
+        };
+        let Some(file) = review.selected_file() else {
+            self.push_notice("当前没有可返修文件。");
+            return Ok(());
+        };
+        let issue = file.issue_summary.clone().unwrap_or_else(|| {
+            format!(
+                "请只基于文件 `{}` 修复人工审查问题，并保留其余文件不动。",
+                file.path
+            )
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.pending_review_fix = Some(PendingReviewFix {
+            parent_session_id: review.session_id.clone(),
+            target_file: file.path.clone(),
+        });
+        self.runtime_state = Some(RuntimeViewState::new(
+            &parent_session.id,
+            &format!("人工审查返修 {}", file.path),
+        ));
+        self.run_subview = RunSubview::Timeline;
+        spawn_review_fix_action(
+            self.project.target_dir.clone(),
+            parent_session,
+            file.path.clone(),
+            issue.clone(),
+            tx,
+            Some(cancel_rx),
+        );
+        self.active_command = Some(ActiveCommand {
+            action: ShellAction::ReviewFixSelected,
+            state: CommandState::Running,
+            started_at: Instant::now(),
+            finished_at: None,
+            stop_requested: false,
+            output: vec![
+                format!("准备动作：修复当前文件 {}", file.path),
+                format!("审查问题：{}", issue),
+                "返修完成后会自动回到人工审查页，并展示修复前后 diff。".to_string(),
+            ],
+            cancel_tx: Some(cancel_tx),
+            rx,
+        });
+        self.push_notice(&format!("已开始单文件返修：{}", file.path));
+        self.navigate_to(Route::Run);
+        Ok(())
+    }
+
+    async fn deliver_manual_review_approved(&mut self) -> Result<()> {
+        let Some(review) = &self.manual_review else {
+            return Ok(());
+        };
+        let Some(session) = self.selected_session.clone() else {
+            self.push_notice("请先在历史页选中一个会话。");
+            return Ok(());
+        };
+        let review_state = review.state.clone();
+        let approved_files = review_state
+            .files
+            .iter()
+            .filter(|item| item.status == ManualReviewFileStatus::Approved)
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        if approved_files.is_empty() {
+            self.push_notice("当前还没有人工通过的文件。");
+            return Ok(());
+        }
+
+        match deliver_manual_review_approved_files(
+            &self.project.target_dir,
+            &session.id,
+            &review_state,
+            session.repo_root(),
+        )
+        .await
+        {
+            Ok(delivered_files) => {
+                persist_manual_delivery_result(
+                    &self.project.target_dir,
+                    &session.id,
+                    ManualDeliveryResult {
+                        delivered_at: Utc::now(),
+                        target_dir: session.repo_root().to_path_buf(),
+                        delivered_files: delivered_files.clone(),
+                        skipped_files: review_state
+                            .files
+                            .iter()
+                            .filter(|item| item.status != ManualReviewFileStatus::Approved)
+                            .map(|item| item.path.clone())
+                            .collect(),
+                        success: true,
+                        source_apply_status: session.apply_result.as_ref().map(|item| item.status),
+                        review_gate: session
+                            .apply_result
+                            .as_ref()
+                            .and_then(|item| item.review_gate),
+                        error: None,
+                    },
+                )?;
+                self.refresh_project(false)?;
+                self.push_notice(&format!(
+                    "已将 {} 个人工通过文件交付到目标目录。",
+                    delivered_files.len()
+                ));
+            }
+            Err(error) => {
+                self.push_notice(&format!("人工审查交付失败：{error}"));
+            }
+        }
+        Ok(())
+    }
+
     fn push_notice(&mut self, message: &str) {
         if self.notices.last().is_some_and(|last| last == message) {
             return;
@@ -2917,9 +4030,17 @@ impl AppShell {
                     truncate(&self.form.continue_feedback.replace('\n', " ⏎ "), 72)
                 }
             }
+            FormField::ReviewIssue => {
+                if self.form.review_issue.trim().is_empty() {
+                    "—".to_string()
+                } else {
+                    truncate(&self.form.review_issue.replace('\n', " ⏎ "), 72)
+                }
+            }
             FormField::ContinueMode => {
                 continue_mode_user_label(self.form.continue_mode).to_string()
             }
+            FormField::FromPlanSession => empty_to_dash(&self.form.from_plan_session_id),
             FormField::ThinkingMode => format!(
                 "{} / {}",
                 thinking_mode_user_title(self.form.thinking_mode),
@@ -2947,17 +4068,36 @@ impl AppShell {
             FormField::ConfigPath => self.form.config_path.clone(),
             FormField::Task => self.form.task.clone(),
             FormField::ContinueFeedback => self.form.continue_feedback.clone(),
+            FormField::ReviewIssue => self
+                .manual_review
+                .as_ref()
+                .and_then(|review| review.selected_file())
+                .and_then(|item| item.issue_summary.clone())
+                .unwrap_or_else(|| self.form.review_issue.clone()),
+            FormField::FromPlanSession => self.form.from_plan_session_id.clone(),
             FormField::Workers => self.form.workers.clone(),
             FormField::MaxRetries => self.form.max_retries.clone(),
             FormField::Model => self.form.model.clone(),
             FormField::ResumeSession => self.form.resume_session_id.clone(),
             _ => return,
         };
+        let history_entries = if field == FormField::Task {
+            recent_task_history(&self.project)
+        } else {
+            Vec::new()
+        };
+        let history_index = if field == FormField::Task {
+            history_entries.iter().position(|item| item == &current)
+        } else {
+            None
+        };
         self.edit_state = Some(EditState {
             field,
             cursor: current.chars().count(),
             buffer: current,
             preferred_column: None,
+            history_entries,
+            history_index,
         });
     }
 
@@ -2972,11 +4112,38 @@ impl AppShell {
             FormField::ContinueFeedback => {
                 self.form.continue_feedback = edit.buffer.trim().to_string()
             }
+            FormField::ReviewIssue => {
+                self.form.review_issue = edit.buffer.trim().to_string();
+                if let Some(review) = &mut self.manual_review
+                    && let Some(file) = review.selected_file_mut()
+                {
+                    file.issue_summary = if self.form.review_issue.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.form.review_issue.clone())
+                    };
+                    review.state.selected_file = Some(file.path.clone());
+                    persist_manual_review_state(
+                        &self.project.target_dir,
+                        &review.session_id,
+                        review.state.clone(),
+                    )?;
+                }
+            }
+            FormField::FromPlanSession => {
+                self.form.from_plan_session_id = edit.buffer.trim().to_string();
+                if !self.form.from_plan_session_id.is_empty() {
+                    self.form.resume_session_id.clear();
+                }
+            }
             FormField::Workers => self.form.workers = edit.buffer.trim().to_string(),
             FormField::MaxRetries => self.form.max_retries = edit.buffer.trim().to_string(),
             FormField::Model => self.form.model = edit.buffer.trim().to_string(),
             FormField::ResumeSession => {
-                self.form.resume_session_id = edit.buffer.trim().to_string()
+                self.form.resume_session_id = edit.buffer.trim().to_string();
+                if !self.form.resume_session_id.is_empty() {
+                    self.form.from_plan_session_id.clear();
+                }
             }
             _ => {}
         }
@@ -3009,11 +4176,15 @@ impl AppShell {
             ShellAction::ContinueSelected => {
                 self.navigate_to(Route::History);
                 self.history_focus = HistoryFocus::Actions;
-                self.history_action_index = HistoryAction::all()
-                    .iter()
-                    .position(|item| *item == HistoryAction::Continue)
-                    .unwrap_or(0);
+                self.history_action_index =
+                    available_history_actions(self.selected_session.as_ref())
+                        .iter()
+                        .position(|item| *item == HistoryAction::Continue)
+                        .unwrap_or(0);
                 "反馈已保存。已准备好“继续优化”，按 Enter 手动开始。".to_string()
+            }
+            ShellAction::ReviewFixSelected => {
+                "内容已保存。现在可以在人工审查里发起单文件返修。".to_string()
             }
             ShellAction::Doctor | ShellAction::ReplaySelected => "内容已保存。".to_string(),
         }
@@ -3026,6 +4197,12 @@ impl AppShell {
             action,
             self.selected_session.as_ref(),
         )
+    }
+
+    fn use_plan_session_for_run(&mut self, session: &SessionManifest) {
+        self.form.task = session.task.clone();
+        self.form.from_plan_session_id = session.id.clone();
+        self.form.resume_session_id.clear();
     }
 }
 
@@ -3079,6 +4256,10 @@ fn build_command_preview(
                 args.push("--preset".to_string());
                 args.push(preset.label().to_string());
             }
+            if !form.from_plan_session_id.trim().is_empty() {
+                args.push("--from-plan".to_string());
+                args.push(form.from_plan_session_id.trim().to_string());
+            }
             if form.fail_fast {
                 args.push("--fail-fast".to_string());
             }
@@ -3104,6 +4285,19 @@ fn build_command_preview(
             args.push(target_dir.display().to_string());
             args.push("--ui".to_string());
             args.push("minimal".to_string());
+        }
+        ShellAction::ReviewFixSelected => {
+            args.push("continue".to_string());
+            args.push("--session".to_string());
+            args.push(
+                selected_session
+                    .map(|session| session.id.clone())
+                    .unwrap_or_else(|| "<review-session>".to_string()),
+            );
+            args.push("--feedback".to_string());
+            args.push(form.review_issue.clone());
+            args.push("--mode".to_string());
+            args.push("run".to_string());
         }
         ShellAction::ReplaySelected => {
             args.push("replay".to_string());
@@ -3146,6 +4340,9 @@ fn prepare_runtime_state(
         ShellAction::ContinueSelected => {
             selected_session.map(|session| RuntimeViewState::new(&session.id, &session.task))
         }
+        ShellAction::ReviewFixSelected => selected_session.map(|session| {
+            RuntimeViewState::new(&session.id, &format!("人工审查返修 {}", session.task))
+        }),
         ShellAction::ReplaySelected => {
             selected_session.map(|session| RuntimeViewState::new(&session.id, &session.task))
         }
@@ -3180,6 +4377,7 @@ fn spawn_embedded_action(
                 run_continue_embedded(&target_dir, &form, selected_session, tx.clone(), stop_rx)
                     .await
             }
+            ShellAction::ReviewFixSelected => Ok((CommandState::Failed, None)),
             ShellAction::ReplaySelected => {
                 let session_id = selected_session.as_ref().map(|session| session.id.as_str());
                 replay_session_embedded(&target_dir, session_id, runtime_tx(&tx), stop_rx)
@@ -3196,6 +4394,43 @@ fn spawn_embedded_action(
                     })
             }
         };
+
+        match outcome {
+            Ok((state, manifest)) => {
+                let _ = tx.send(RunnerEvent::Finished {
+                    state,
+                    manifest: Box::new(manifest),
+                });
+            }
+            Err(error) => {
+                let _ = tx.send(RunnerEvent::Line(format!("执行失败：{error:#}")));
+                let _ = tx.send(RunnerEvent::Finished {
+                    state: CommandState::Failed,
+                    manifest: Box::new(None),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_review_fix_action(
+    target_dir: PathBuf,
+    parent_session: SessionManifest,
+    target_file: String,
+    issue_summary: String,
+    tx: mpsc::UnboundedSender<RunnerEvent>,
+    stop_rx: Option<watch::Receiver<bool>>,
+) {
+    tokio::spawn(async move {
+        let outcome = run_review_fix_embedded(
+            &target_dir,
+            &parent_session,
+            &target_file,
+            &issue_summary,
+            tx.clone(),
+            stop_rx,
+        )
+        .await;
 
         match outcome {
             Ok((state, manifest)) => {
@@ -3305,6 +4540,33 @@ async fn run_continue_embedded(
     }
 }
 
+async fn run_review_fix_embedded(
+    target_dir: &Path,
+    parent_session: &SessionManifest,
+    target_file: &str,
+    issue_summary: &str,
+    tx: mpsc::UnboundedSender<RunnerEvent>,
+    stop_rx: Option<watch::Receiver<bool>>,
+) -> Result<(CommandState, Option<SessionManifest>)> {
+    let (config, roles) = build_review_fix_config(
+        target_dir,
+        parent_session,
+        target_file,
+        issue_summary,
+        UiMode::Minimal,
+    )?;
+    let EmbeddedRunOutcome { manifest, stopped } =
+        run_session_embedded(config, roles, runtime_tx(&tx), stop_rx).await?;
+    Ok((
+        if stopped {
+            CommandState::Stopped
+        } else {
+            CommandState::Succeeded
+        },
+        Some(manifest),
+    ))
+}
+
 fn build_plan_args(target_dir: &Path, form: &FormState) -> PlanArgs {
     PlanArgs {
         shared: SharedTaskArgs {
@@ -3344,6 +4606,7 @@ fn build_run_args(target_dir: &Path, form: &FormState) -> RunArgs {
         preset: form.preset.map(|preset| match preset {
             SessionPreset::FeatureDemo => crate::cli::PresetArg::FeatureDemo,
         }),
+        from_plan: empty_as_none(&form.from_plan_session_id),
         resume: empty_as_none(&form.resume_session_id),
         apply_mode: Some(match form.apply_mode {
             ApplyMode::AutoSafe => ApplyModeArg::AutoSafe,
@@ -3462,12 +4725,26 @@ fn load_session_summaries(target_dir: &Path) -> Result<Vec<SessionSummary>> {
         .filter_map(|path| {
             let manifest_path = path.join("manifest.json");
             let raw = fs::read_to_string(&manifest_path).ok()?;
-            let manifest = serde_json::from_str::<SessionManifest>(&raw).ok()?;
+            let preview_manifest = serde_json::from_str::<SessionManifest>(&raw).ok()?;
+            let manifest = load_session(target_dir, Some(&preview_manifest.id)).ok()?;
+            let summary = manifest
+                .final_summary
+                .as_ref()
+                .map(|item| item.overview.clone())
+                .or_else(|| manifest.plan_todo.as_ref().map(|item| item.summary.clone()))
+                .unwrap_or_else(|| "这次还没有摘要".to_string());
             Some(SessionSummary {
                 id: manifest.id.clone(),
                 created_at: format_beijing(manifest.created_at, "%m-%d %H:%M"),
                 task: manifest.task.clone(),
-                status: manifest.status.label().to_string(),
+                stage_label: manifest.status.label().to_string(),
+                summary,
+                mode_label: if manifest.is_plan_session() {
+                    "方案".to_string()
+                } else {
+                    "执行".to_string()
+                },
+                continuable: manifest.continuable(),
             })
         })
         .collect::<Vec<_>>();
@@ -3543,6 +4820,18 @@ fn build_action_summary(
         ShellAction::Run => {
             if form.task.trim().is_empty() {
                 "请先输入提示词，然后再开始执行".to_string()
+            } else if !form.resume_session_id.trim().is_empty() {
+                format!(
+                    "恢复运行 session `{}`，继续处理“{}”",
+                    truncate(&form.resume_session_id, 18),
+                    summarize_task(&form.task)
+                )
+            } else if !form.from_plan_session_id.trim().is_empty() {
+                format!(
+                    "基于 plan session `{}` 执行“{}”",
+                    truncate(&form.from_plan_session_id, 18),
+                    summarize_task(&form.task)
+                )
             } else {
                 format!(
                     "直接开始处理“{}”，默认使用 {}",
@@ -3552,21 +4841,31 @@ fn build_action_summary(
             }
         }
         ShellAction::ContinueSelected => {
+            let action_title = if selected_session.is_some_and(|session| session.is_plan_session())
+            {
+                "继续改方案"
+            } else {
+                "继续优化"
+            };
             if selected_session.is_none() {
-                "请先在历史页选中一个已完成 session，再继续优化".to_string()
+                format!("请先在历史页选中一个已完成 session，再{action_title}")
             } else if form.continue_feedback.trim().is_empty() {
-                "直接基于当前 session 继续优化；如果有额外反馈，也可以先补充。".to_string()
+                format!("直接基于当前 session {action_title}；如果有额外反馈，也可以先补充。")
             } else {
                 format!(
-                    "基于 {} 继续优化（{}）：{}",
+                    "基于 {} {}（{}）：{}",
                     selected_session
                         .map(|session| truncate(&session.id, 18))
                         .unwrap_or_else(|| "当前会话".to_string()),
+                    action_title,
                     continue_mode_user_title(form.continue_mode),
                     truncate(&form.continue_feedback, 40)
                 )
             }
         }
+        ShellAction::ReviewFixSelected => selected_session
+            .map(|session| format!("基于 `{}` 启动当前人工审查文件的返修子会话", session.id))
+            .unwrap_or_else(|| "基于当前审查文件启动返修子会话".to_string()),
         ShellAction::ReplaySelected => format!(
             "回看 {} 的关键过程和结果",
             selected_session
@@ -3576,13 +4875,88 @@ fn build_action_summary(
     }
 }
 
+fn recent_task_history(project: &ProjectContext) -> Vec<String> {
+    let mut seen = BTreeMap::<String, ()>::new();
+    let mut items = Vec::new();
+    for session in &project.sessions {
+        let task = session.task.trim();
+        if task.is_empty() || seen.contains_key(task) {
+            continue;
+        }
+        seen.insert(task.to_string(), ());
+        items.push(task.to_string());
+    }
+    items
+}
+
+fn recent_task_history_lines(edit: &EditState) -> Vec<Line<'static>> {
+    edit.history_entries
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, item)| {
+            let prefix = if edit.history_index == Some(index) {
+                ">"
+            } else {
+                "-"
+            };
+            Line::from(format!("{prefix} {}", truncate(item, 72)))
+        })
+        .collect()
+}
+
+fn available_history_actions(selected_session: Option<&SessionManifest>) -> Vec<HistoryAction> {
+    let Some(session) = selected_session else {
+        return vec![HistoryAction::CleanAll, HistoryAction::BackToStart];
+    };
+
+    let mut actions = Vec::new();
+    if session.is_plan_session() {
+        actions.push(HistoryAction::ExecutePlan);
+    }
+    if can_deliver_accepted_files(session) {
+        actions.push(HistoryAction::DeliverAccepted);
+    }
+    if can_open_manual_review(session) {
+        actions.push(HistoryAction::ManualReview);
+    }
+    actions.push(HistoryAction::Continue);
+    actions.push(HistoryAction::EditFeedback);
+    actions.push(HistoryAction::ContinueMode);
+    actions.push(HistoryAction::Replay);
+    actions.push(HistoryAction::Detail);
+    if session.is_run_session() {
+        actions.push(HistoryAction::ResetSelected);
+    }
+    actions.push(HistoryAction::CleanSelected);
+    actions.push(HistoryAction::CleanAll);
+    actions.push(HistoryAction::BackToStart);
+    actions
+}
+
+fn run_source_user_hint(form: &FormState) -> String {
+    if !form.resume_session_id.trim().is_empty() {
+        format!(
+            "当前会恢复运行 session `{}`，不会走新规划。",
+            truncate(&form.resume_session_id, 18)
+        )
+    } else if !form.from_plan_session_id.trim().is_empty() {
+        format!(
+            "当前会基于 plan session `{}` 执行，不会静默改用其他方案。",
+            truncate(&form.from_plan_session_id, 18)
+        )
+    } else {
+        "当前会发起一次全新执行；如需承接方案，请显式指定 plan session。".to_string()
+    }
+}
+
 fn action_supports_stop(
     action: ShellAction,
     form: &FormState,
     selected_session: Option<&SessionManifest>,
 ) -> bool {
     match action {
-        ShellAction::Run | ShellAction::ReplaySelected => true,
+        ShellAction::Run | ShellAction::ReviewFixSelected | ShellAction::ReplaySelected => true,
         ShellAction::ContinueSelected => selected_session
             .map(|session| continue_mode_runs(form.continue_mode, session))
             .unwrap_or(false),
@@ -3594,11 +4968,7 @@ fn continue_mode_runs(mode: ContinueModeArg, session: &SessionManifest) -> bool 
     match mode {
         ContinueModeArg::Plan => false,
         ContinueModeArg::Run => true,
-        ContinueModeArg::Auto => {
-            !(session.worker_results.is_empty()
-                && session.apply_result.is_none()
-                && session.final_summary.is_none())
-        }
+        ContinueModeArg::Auto => session.is_run_session(),
     }
 }
 
@@ -3610,6 +4980,8 @@ fn initial_command_output(
     let mut lines = vec![
         format!("准备动作：{}", preview.summary),
         format!("目标仓库：{display_target}"),
+        "系统工件会优先保留在 .codex-forge/；用户导出件会在完成收敛后写到目标仓库根目录。"
+            .to_string(),
         format!("命令预览：{}", truncate(&preview.commandline, 120)),
         "内嵌执行已启动，等待实时事件…".to_string(),
     ];
@@ -3623,6 +4995,7 @@ fn edit_mode_summary(field: FormField) -> &'static str {
     match field {
         FormField::Task => "支持多行输入，可直接保存或保存后定位到方案/执行动作。",
         FormField::ContinueFeedback => "支持多行输入，可直接保存或保存后定位到“继续优化”。",
+        FormField::ReviewIssue => "支持多行输入，用来约束当前文件的返修目标。",
         _ => "单行编辑；改完可直接保存或退出。",
     }
 }
@@ -3634,12 +5007,19 @@ fn edit_shortcuts_lines(field: FormField) -> Vec<Line<'static>> {
             Line::from("退出：Esc"),
             Line::from("换行：Enter"),
             Line::from("保存并定位：Ctrl+P 方案 / Ctrl+R 执行"),
+            Line::from("历史提示词：Ctrl+J 下一条 / Ctrl+K 上一条"),
         ],
         FormField::ContinueFeedback => vec![
             Line::from("保存：Ctrl+S"),
             Line::from("退出：Esc"),
             Line::from("换行：Enter"),
             Line::from("保存并定位：Ctrl+R 继续优化"),
+        ],
+        FormField::ReviewIssue => vec![
+            Line::from("保存：Ctrl+S"),
+            Line::from("退出：Esc"),
+            Line::from("换行：Enter"),
+            Line::from("返修前建议先把问题写清楚"),
         ],
         _ => vec![
             Line::from("保存：Enter"),
@@ -3656,6 +5036,7 @@ fn history_detail_shortcuts_lines() -> Vec<Line<'static>> {
         Line::from("切页：Tab / ←→ / [ ]"),
         Line::from("滚动：↑↓ / j k"),
         Line::from("翻页：PgUp / PgDn / Home / End"),
+        Line::from("左侧看用户摘要，右侧看技术细节"),
     ]
 }
 
@@ -3695,6 +5076,7 @@ fn saved_field_notice(field: FormField) -> String {
     match field {
         FormField::Task => "内容已保存。现在请手动选择“先看方案”或“开始执行”。".to_string(),
         FormField::ContinueFeedback => "反馈已保存。现在请手动执行“继续优化”。".to_string(),
+        FormField::ReviewIssue => "审查问题已保存。现在可以发起单文件返修。".to_string(),
         FormField::TargetDir | FormField::ConfigPath => {
             "内容已保存，项目上下文已刷新。".to_string()
         }
@@ -3707,6 +5089,7 @@ fn preferred_run_subview(action: ShellAction) -> RunSubview {
         ShellAction::Plan
         | ShellAction::Run
         | ShellAction::ContinueSelected
+        | ShellAction::ReviewFixSelected
         | ShellAction::ReplaySelected => RunSubview::Timeline,
         ShellAction::Doctor => RunSubview::Dashboard,
     }
@@ -3719,6 +5102,479 @@ fn optional_path(value: &str) -> Option<&Path> {
     } else {
         Some(Path::new(trimmed))
     }
+}
+
+fn existing_deliverables(session: &SessionManifest) -> Vec<PathBuf> {
+    repo_export_candidates(session)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn repo_export_candidates(session: &SessionManifest) -> Vec<PathBuf> {
+    let files = if let Some(result) = session.manual_delivery_result.as_ref() {
+        result.delivered_files.clone()
+    } else {
+        session
+            .final_summary
+            .as_ref()
+            .map(|summary| summary.accepted_files.clone())
+            .unwrap_or_default()
+    };
+    files
+        .iter()
+        .map(|path| repo_export_path(session, path))
+        .collect::<Vec<_>>()
+}
+
+fn repo_export_path(session: &SessionManifest, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        session.repo_root().join(path)
+    }
+}
+
+fn repo_export_label(session: &SessionManifest, path: &Path) -> String {
+    path.strip_prefix(session.repo_root())
+        .map(|item| item.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn append_repo_export_sections(sections: &mut Vec<String>, session: &SessionManifest) {
+    let exports = repo_export_candidates(session);
+    if exports.is_empty() {
+        sections.push(format!(
+            "===== Repo Exports =====\n\n当前会话尚未交付到目标目录。\n\n交付状态：{} / {}",
+            delivery_status_label(session),
+            delivery_status_detail(session)
+        ));
+        return;
+    }
+
+    for path in exports {
+        append_repo_export_section(
+            sections,
+            &format!("Repo Export: {}", repo_export_label(session, &path)),
+            path,
+        );
+    }
+}
+
+fn process_artifact_paths(session: &SessionManifest) -> Vec<PathBuf> {
+    let mut paths = vec![
+        session.deliverable_plan_path(),
+        session.deliverable_summary_path(),
+        session.deliverable_changes_path(),
+        session.deliverable_verify_path(),
+    ];
+    paths.extend([
+        session.summary_markdown_path.clone(),
+        session.summary_json_path.clone(),
+        session.apply_result_path.clone(),
+        session.verification_report_path.clone(),
+        session.change_trust_report_path.clone(),
+    ]);
+    if let Some(path) = &session.artifact_manifest.manual_delivery_result_path {
+        paths.push(path.clone());
+    }
+    if let Some(path) = &session.artifact_manifest.manual_review_state_path {
+        paths.push(path.clone());
+    }
+    paths.into_iter().filter(|path| path.exists()).collect()
+}
+
+fn existing_system_artifacts(session: &SessionManifest) -> Vec<PathBuf> {
+    process_artifact_paths(session)
+}
+
+fn can_deliver_accepted_files(session: &SessionManifest) -> bool {
+    session.is_run_session()
+        && !session.delivered_to_target()
+        && session
+            .apply_result
+            .as_ref()
+            .is_some_and(|result| !result.accepted_files.is_empty())
+}
+
+fn can_open_manual_review(session: &SessionManifest) -> bool {
+    session.is_run_session()
+        && (session
+            .apply_result
+            .as_ref()
+            .is_some_and(|result| !result.manual_review_files.is_empty())
+            || session
+                .manual_review_state
+                .as_ref()
+                .is_some_and(|state| !state.files.is_empty()))
+}
+
+fn load_apply_plan_for_session(session: &SessionManifest) -> Result<ApplyPlan> {
+    let raw = fs::read_to_string(&session.apply_plan_path).with_context(|| {
+        format!(
+            "读取 apply plan 失败：{}",
+            session.apply_plan_path.display()
+        )
+    })?;
+    serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "解析 apply plan 失败：{}",
+            session.apply_plan_path.display()
+        )
+    })
+}
+
+fn persist_manual_delivery_result(
+    target_dir: &Path,
+    session_id: &str,
+    result: ManualDeliveryResult,
+) -> Result<()> {
+    let mut session = load_session(target_dir, Some(session_id))?;
+    set_manual_delivery_result_for_loaded_session(&mut session, result)
+}
+
+fn persist_manual_review_state(
+    target_dir: &Path,
+    session_id: &str,
+    state: ManualReviewState,
+) -> Result<()> {
+    let mut session = load_session(target_dir, Some(session_id))?;
+    set_manual_review_state_for_loaded_session(&mut session, state)
+}
+
+fn load_or_initialize_manual_review_state(
+    target_dir: &Path,
+    session: &SessionManifest,
+) -> Result<ManualReviewState> {
+    let mut state = session
+        .manual_review_state
+        .clone()
+        .unwrap_or_else(|| build_initial_manual_review_state(session));
+
+    let current_files = session
+        .apply_result
+        .as_ref()
+        .map(|result| result.manual_review_files.clone())
+        .unwrap_or_default();
+    for file in current_files {
+        if !state.files.iter().any(|item| item.path == file) {
+            state
+                .files
+                .push(build_manual_review_file_record(session, &file));
+        }
+    }
+    if state.selected_file.is_none() {
+        state.selected_file = state.files.first().map(|item| item.path.clone());
+    }
+    persist_manual_review_state(target_dir, &session.id, state.clone())?;
+    Ok(state)
+}
+
+fn build_initial_manual_review_state(session: &SessionManifest) -> ManualReviewState {
+    let files = session
+        .apply_result
+        .as_ref()
+        .map(|result| result.manual_review_files.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| build_manual_review_file_record(session, &file))
+        .collect::<Vec<_>>();
+    ManualReviewState {
+        source_session_id: session.id.clone(),
+        selected_file: files.first().map(|item| item.path.clone()),
+        files,
+    }
+}
+
+fn build_manual_review_file_record(
+    session: &SessionManifest,
+    file: &str,
+) -> ManualReviewFileRecord {
+    let source_workers = session
+        .worker_results
+        .iter()
+        .filter(|result| result.changed_files.iter().any(|item| item == file))
+        .map(|result| result.agent_id.clone())
+        .collect::<Vec<_>>();
+    ManualReviewFileRecord {
+        path: file.to_string(),
+        status: ManualReviewFileStatus::Pending,
+        source_workers,
+        issue_summary: None,
+        fix_session_ids: Vec::new(),
+        latest_fix_session_id: None,
+    }
+}
+
+fn delivery_status_label(session: &SessionManifest) -> &'static str {
+    if session.delivered_to_target() {
+        "已交付"
+    } else {
+        "未交付"
+    }
+}
+
+fn delivery_status_detail(session: &SessionManifest) -> String {
+    if let Some(result) = &session.manual_delivery_result {
+        if result.success {
+            return format!(
+                "已手动交付 {} 个 accepted_files 到目标目录。",
+                result.delivered_files.len()
+            );
+        }
+        return format!(
+            "上次手动交付失败：{}",
+            result.error.as_deref().unwrap_or("未知错误")
+        );
+    }
+
+    if let Some(apply_result) = &session.apply_result {
+        if apply_result.synced_to_target && matches!(apply_result.status, ApplyStatus::Applied) {
+            return "auto-safe 已自动同步到目标目录。".to_string();
+        }
+        let mut reasons = Vec::new();
+        if let Some(gate) = apply_result.review_gate {
+            reasons.push(format!("review gate：{}", gate.label()));
+        }
+        reasons.push(format!("apply：{}", apply_result.status.label()));
+        if let Some(bundle_dir) = &apply_result.bundle_dir {
+            reasons.push(format!("bundle：{}", bundle_dir.display()));
+        }
+        return reasons.join(" / ");
+    }
+
+    "当前没有可用交付记录。".to_string()
+}
+
+fn build_manual_review_detail_text(
+    target_dir: &Path,
+    state: &ManualReviewState,
+    file_index: usize,
+    diff_view: ManualReviewDiffView,
+) -> String {
+    let Some(file) = state.files.get(file_index) else {
+        return "当前没有可审查文件。".to_string();
+    };
+    let source_session = load_session(target_dir, Some(&state.source_session_id)).ok();
+    let latest_fix_session = file
+        .latest_fix_session_id
+        .as_deref()
+        .and_then(|session_id| load_session(target_dir, Some(session_id)).ok());
+    let issue_summary = file
+        .issue_summary
+        .clone()
+        .unwrap_or_else(|| "尚未记录审查问题。".to_string());
+
+    let mut sections = vec![format!(
+        "文件：{}\n状态：{}\n来源 worker：{}\n审查问题：{}\n返修 session：{}",
+        file.path,
+        file.status.label(),
+        if file.source_workers.is_empty() {
+            "无".to_string()
+        } else {
+            file.source_workers.join("、")
+        },
+        issue_summary,
+        file.latest_fix_session_id
+            .clone()
+            .unwrap_or_else(|| "无".to_string())
+    )];
+
+    match diff_view {
+        ManualReviewDiffView::Source => {
+            sections.push("===== 原始候选 Diff =====".to_string());
+            sections.push(
+                source_session
+                    .as_ref()
+                    .map(|session| render_file_diff_for_session(session, &file.path))
+                    .unwrap_or_else(|| "无法加载来源 session。".to_string()),
+            );
+        }
+        ManualReviewDiffView::LatestFix => {
+            sections.push("===== 返修后 Diff =====".to_string());
+            sections.push(
+                latest_fix_session
+                    .as_ref()
+                    .map(|session| render_file_diff_for_session(session, &file.path))
+                    .unwrap_or_else(|| "当前还没有返修结果。".to_string()),
+            );
+            if let Some(session) = latest_fix_session.as_ref() {
+                sections.push("===== 返修会话摘要 =====".to_string());
+                sections.push(
+                    session
+                        .final_summary
+                        .as_ref()
+                        .map(|summary| {
+                            format!(
+                                "{}\n结果：{}\nApply：{}",
+                                summary.overview,
+                                summary.result_status.label(),
+                                summary.apply_status.label()
+                            )
+                        })
+                        .unwrap_or_else(|| "返修会话还没有最终摘要。".to_string()),
+                );
+            }
+        }
+        ManualReviewDiffView::Compare => {
+            sections.push("===== 修复前 =====".to_string());
+            sections.push(
+                source_session
+                    .as_ref()
+                    .map(|session| render_file_diff_for_session(session, &file.path))
+                    .unwrap_or_else(|| "无法加载来源 session。".to_string()),
+            );
+            sections.push("===== 修复后 =====".to_string());
+            sections.push(
+                latest_fix_session
+                    .as_ref()
+                    .map(|session| render_file_diff_for_session(session, &file.path))
+                    .unwrap_or_else(|| "当前还没有返修结果。".to_string()),
+            );
+        }
+    }
+
+    sections.join("\n\n")
+}
+
+fn render_file_diff_for_session(session: &SessionManifest, file: &str) -> String {
+    let sections = session
+        .worker_results
+        .iter()
+        .filter(|result| result.changed_files.iter().any(|item| item == file))
+        .filter_map(|result| {
+            let diff_path = result.diff_path.as_ref()?;
+            let raw = fs::read_to_string(diff_path).ok()?;
+            let diff = extract_file_diff_from_patch(&raw, file)?;
+            Some(format!(
+                "### {} / {}\n{}",
+                result.agent_id, result.role, diff
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if sections.is_empty() {
+        "当前会话没有该文件的可展示 diff。".to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn extract_file_diff_from_patch(patch: &str, file: &str) -> Option<String> {
+    let markers = [
+        format!("diff --git a/{file} b/{file}"),
+        format!("diff --git \"a/{file}\" \"b/{file}\""),
+    ];
+    let start = patch
+        .lines()
+        .enumerate()
+        .find(|(_, line)| markers.iter().any(|marker| line == marker))
+        .map(|(index, _)| index)?;
+    let lines = patch.lines().collect::<Vec<_>>();
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| line.starts_with("diff --git "))
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    Some(lines[start..end].join("\n"))
+}
+
+fn collect_changed_files(manifest: &SessionManifest) -> Vec<String> {
+    let mut files = manifest
+        .worker_results
+        .iter()
+        .flat_map(|result| result.changed_files.iter().cloned())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn record_review_fix_completion(
+    target_dir: &Path,
+    parent_session_id: &str,
+    target_file: &str,
+    child_manifest: &SessionManifest,
+) -> Result<()> {
+    let mut session = load_session(target_dir, Some(parent_session_id))?;
+    let mut state = load_or_initialize_manual_review_state(target_dir, &session)?;
+    let changed_files = collect_changed_files(child_manifest);
+    let out_of_scope = changed_files
+        .iter()
+        .filter(|file| file.as_str() != target_file)
+        .cloned()
+        .collect::<Vec<_>>();
+    let touched_target = changed_files.iter().any(|file| file == target_file);
+
+    let record = state
+        .files
+        .iter_mut()
+        .find(|item| item.path == target_file)
+        .with_context(|| format!("人工审查状态里缺少文件 `{target_file}`"))?;
+    if !record
+        .fix_session_ids
+        .iter()
+        .any(|item| item == &child_manifest.id)
+    {
+        record.fix_session_ids.push(child_manifest.id.clone());
+    }
+    record.latest_fix_session_id = Some(child_manifest.id.clone());
+    record.status = if !out_of_scope.is_empty() {
+        record.issue_summary = Some(format!("返修越界，额外修改了：{}", out_of_scope.join("、")));
+        ManualReviewFileStatus::NeedsFix
+    } else if touched_target {
+        ManualReviewFileStatus::FixedPendingReview
+    } else {
+        record.issue_summary = Some("返修会话没有生成当前文件的新 diff。".to_string());
+        ManualReviewFileStatus::NeedsFix
+    };
+    state.selected_file = Some(target_file.to_string());
+    set_manual_review_state_for_loaded_session(&mut session, state)
+}
+
+async fn deliver_manual_review_approved_files(
+    target_dir: &Path,
+    review_session_id: &str,
+    state: &ManualReviewState,
+    destination: &Path,
+) -> Result<Vec<String>> {
+    let review_session = load_session(target_dir, Some(review_session_id))?;
+    let mut by_session = BTreeMap::<String, Vec<String>>::new();
+    for record in &state.files {
+        if record.status != ManualReviewFileStatus::Approved {
+            continue;
+        }
+        let source_session_id = record
+            .latest_fix_session_id
+            .clone()
+            .unwrap_or_else(|| review_session.id.clone());
+        by_session
+            .entry(source_session_id)
+            .or_default()
+            .push(record.path.clone());
+    }
+    if by_session.is_empty() {
+        anyhow::bail!("当前没有已人工通过的文件");
+    }
+
+    let clean = crate::worktree::git_is_clean(destination).await?;
+    if !clean {
+        anyhow::bail!("目标工作区存在未提交改动，拒绝执行人工审查交付");
+    }
+
+    let mut delivered = Vec::new();
+    for (session_id, files) in by_session {
+        let source_session = load_session(target_dir, Some(&session_id))?;
+        let plan = load_apply_plan_for_session(&source_session)?;
+        let applied = deliver_selected_files_from_plan(&plan, destination, &files).await?;
+        delivered.extend(applied);
+    }
+    delivered.sort();
+    delivered.dedup();
+    Ok(delivered)
 }
 
 fn bool_label(value: bool) -> String {
@@ -3807,6 +5663,7 @@ fn advanced_fields() -> &'static [FormField] {
         FormField::TargetDir,
         FormField::ConfigPath,
         FormField::ContinueMode,
+        FormField::FromPlanSession,
         FormField::ThinkingMode,
         FormField::RoleSet,
         FormField::Workers,
@@ -3826,6 +5683,15 @@ fn advanced_settings_summary(form: &FormState) -> String {
         form.role_set.clone(),
         apply_mode_user_label(form.apply_mode).to_string(),
     ];
+    if !form.from_plan_session_id.trim().is_empty() {
+        items.push(format!(
+            "执行方案 {}",
+            truncate(&form.from_plan_session_id, 18)
+        ));
+    }
+    if !form.resume_session_id.trim().is_empty() {
+        items.push(format!("恢复 {}", truncate(&form.resume_session_id, 18)));
+    }
     if !form.max_retries.trim().is_empty() {
         items.push(format!("重试 {}", form.max_retries));
     }
@@ -3850,6 +5716,7 @@ fn field_is_editable(field: FormField) -> bool {
             | FormField::ConfigPath
             | FormField::Task
             | FormField::ContinueFeedback
+            | FormField::FromPlanSession
             | FormField::Workers
             | FormField::MaxRetries
             | FormField::Model
@@ -3927,7 +5794,7 @@ fn contextual_help_lines(
         Route::History => vec![Line::from(if compact {
             "历史：←→ 切列表/下一步，↑↓ 选择，Enter 查看/执行。"
         } else {
-            "历史：←→ 切列表/下一步，↑↓ 选择，Enter 查看详情/执行动作，e 补反馈，v 详情，z 重置，x 删除，Esc 返回，Tab 进导航。"
+            "历史：←→ 切列表/下一步，↑↓ 选择，Enter 查看详情/执行动作，u 人工审查，y 交付已接收，e 补反馈，v 详情，z 重置，x 删除，Esc 返回，Tab 进导航。"
         })],
     }
 }
@@ -3957,7 +5824,7 @@ fn route_titles(width: u16) -> Vec<&'static str> {
 
 fn run_subview_titles(width: u16) -> Vec<&'static str> {
     if width < 68 {
-        vec!["态势", "过程", "摘要"]
+        vec!["总览", "执行", "交付"]
     } else {
         RunSubview::all().iter().map(|item| item.label()).collect()
     }
@@ -4198,6 +6065,24 @@ fn delete_at_cursor(edit: &mut EditState) {
     edit.preferred_column = None;
 }
 
+fn cycle_edit_history(edit: &mut EditState, forward: bool) {
+    if edit.history_entries.is_empty() {
+        return;
+    }
+    let current = edit.history_index.unwrap_or_else(|| {
+        if forward {
+            edit.history_entries.len().saturating_sub(1)
+        } else {
+            0
+        }
+    });
+    let next = cycle_index(current, edit.history_entries.len(), forward);
+    edit.history_index = Some(next);
+    edit.buffer = edit.history_entries[next].clone();
+    edit.cursor = edit.buffer.chars().count();
+    edit.preferred_column = None;
+}
+
 fn move_cursor_horizontal(edit: &mut EditState, forward: bool) {
     let total = edit.buffer.chars().count();
     if forward {
@@ -4233,12 +6118,154 @@ fn move_cursor_vertical(edit: &mut EditState, forward: bool) {
     edit.preferred_column = Some(desired_col);
 }
 
+fn build_history_detail_summary(session: &SessionManifest, tab: HistoryDetailTab) -> String {
+    match tab {
+        HistoryDetailTab::Overview => {
+            let summary = session
+                .final_summary
+                .as_ref()
+                .map(|item| item.overview.clone())
+                .or_else(|| session.plan_todo.as_ref().map(|item| item.summary.clone()))
+                .unwrap_or_else(|| "这次还没有可直接展示的摘要。".to_string());
+            format!(
+                "任务：{}\n\n状态：{}\n类型：{}\n会话：{}\n创建时间：{}\n目标仓库：{}\n目标目录交付：{} / {}\n\n摘要：{}\n\n交付物目录：{}\n系统记录目录：{}\n",
+                session.task,
+                session.status.label(),
+                session.session_kind.label(),
+                session.id,
+                format_beijing(session.created_at, "%Y-%m-%d %H:%M:%S"),
+                session.repo_root().display(),
+                delivery_status_label(session),
+                delivery_status_detail(session),
+                summary,
+                session.repo_root().display(),
+                session.session_dir.display(),
+            )
+        }
+        HistoryDetailTab::Plan => {
+            if let Some(plan) = &session.plan_todo {
+                let todo_titles = plan
+                    .todos
+                    .iter()
+                    .map(|item| format!("- {} {}", item.id, item.title))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let risks = if plan.risks.is_empty() {
+                    "- 无".to_string()
+                } else {
+                    plan.risks
+                        .iter()
+                        .map(|item| format!("- {item}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                format!(
+                    "方案摘要：{}\n\n推进策略：{}\n\n待办数量：{}\n{}\n\n主要风险：\n{}\n\n计划过程文件：{}\n",
+                    plan.summary,
+                    plan.approach,
+                    plan.todos.len(),
+                    todo_titles,
+                    risks,
+                    session.deliverable_plan_path().display(),
+                )
+            } else {
+                "当前会话没有生成方案。".to_string()
+            }
+        }
+        HistoryDetailTab::Runtime => {
+            let timeline = if session.timeline_events.is_empty() {
+                "还没有过程记录。".to_string()
+            } else {
+                session
+                    .timeline_events
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .map(|item| {
+                        format!(
+                            "- {} / {} / {}",
+                            format_beijing(item.ts, "%H:%M:%S"),
+                            item.title,
+                            item.detail
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "过程概览\n\n最近关键节点：\n{}\n\n当前状态：{}\nWorker 数量：{}\nTodo 数量：{}\n",
+                timeline,
+                session.status.label(),
+                session.worker_results.len(),
+                session.todo_states.len(),
+            )
+        }
+        HistoryDetailTab::Artifacts => {
+            let system_artifacts = existing_system_artifacts(session)
+                .into_iter()
+                .map(|path| format!("- 已生成 / {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let repo_exports = session
+                .final_summary
+                .as_ref()
+                .map(|_| repo_export_candidates(session))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| {
+                    let status = if path.exists() {
+                        "已导出"
+                    } else {
+                        "未导出"
+                    };
+                    format!("- {} / {}", status, repo_export_label(session, &path))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let final_summary = session.final_summary.as_ref();
+            format!(
+                "交付概览\n\n目标目录状态：{} / {}\n\n系统工件：\n{}\n\n用户导出件：\n{}\n\n已接收文件：{}\n人工复核：{}\n已验证能力：{}\n开放风险：{}\n",
+                delivery_status_label(session),
+                delivery_status_detail(session),
+                if system_artifacts.is_empty() {
+                    "- 尚未生成系统工件".to_string()
+                } else {
+                    system_artifacts
+                },
+                if repo_exports.is_empty() {
+                    "- 当前会话尚未交付到目标目录".to_string()
+                } else {
+                    repo_exports
+                },
+                final_summary
+                    .map(|item| item.accepted_files.len())
+                    .unwrap_or(0),
+                final_summary
+                    .map(|item| item.manual_review_files.len())
+                    .unwrap_or(0),
+                final_summary
+                    .map(|item| item.verified_capabilities.len())
+                    .unwrap_or(0),
+                final_summary.map(|item| item.open_risks.len()).unwrap_or(0),
+            )
+        }
+        HistoryDetailTab::Technical => format!(
+            "这里保留原始技术资料，方便排障和复盘。\n\nsession 目录：{}\ntimeline：{}\nartifact manifest：{}\nworker 数量：{}\n",
+            session.session_dir.display(),
+            session.timeline_path.display(),
+            session.artifact_manifest_path.display(),
+            session.worker_results.len(),
+        ),
+    }
+}
+
 fn build_history_detail_body(session: &SessionManifest, tab: HistoryDetailTab) -> String {
     let mut sections = Vec::<String>::new();
     match tab {
         HistoryDetailTab::Overview => {
             sections.push(format!(
-                "会话：{}\n任务：{}\n状态：{}\n版本：V{}\n根会话：{}\n来源会话：{}\n创建时间：{}\n目标仓库：{}\n协作模板：{}\n任务强度：{}\n结果落地：{}\n可继续反馈：{}\nSession 目录：{}",
+                "会话：{}\n任务：{}\n状态：{}\n版本：V{}\n根会话：{}\n来源会话：{}\n创建时间：{}\n目标仓库：{}\n协作模板：{}\n任务强度：{}\n结果落地：{}\n目标目录交付：{} / {}\n可继续反馈：{}\nSession 目录：{}",
                 session.id,
                 session.task,
                 session.status.label(),
@@ -4246,10 +6273,12 @@ fn build_history_detail_body(session: &SessionManifest, tab: HistoryDetailTab) -
                 session.root_session_id_ref(),
                 session.parent_session_id.as_deref().unwrap_or("无"),
                 format_beijing(session.created_at, "%Y-%m-%d %H:%M:%S"),
-                session.repo_snapshot.repo_root.display(),
+                session.repo_root().display(),
                 session.role_set,
                 thinking_mode_user_title(session.thinking_mode),
                 apply_mode_user_label(session.apply_mode),
+                delivery_status_label(session),
+                delivery_status_detail(session),
                 if session.continuable() { "是" } else { "否" },
                 session.session_dir.display()
             ));
@@ -4259,17 +6288,17 @@ fn build_history_detail_body(session: &SessionManifest, tab: HistoryDetailTab) -
             append_serialized_section(&mut sections, "Final Summary", &session.final_summary);
             append_serialized_section(&mut sections, "Doctor Report", &session.doctor_report);
             append_serialized_section(&mut sections, "Artifact Index", &session.artifact_index);
-            append_serialized_section(
-                &mut sections,
-                "Artifact Manifest",
-                &session.artifact_manifest,
-            );
         }
         HistoryDetailTab::Plan => {
             append_file_section_if_exists(
                 &mut sections,
                 "Plan Todo Markdown",
                 session.session_dir.join("commander").join("plan-todo.md"),
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Process Plan Markdown",
+                session.deliverable_plan_path(),
             );
             append_optional_file_section(
                 &mut sections,
@@ -4318,7 +6347,93 @@ fn build_history_detail_body(session: &SessionManifest, tab: HistoryDetailTab) -
             append_serialized_section(&mut sections, "Demo Summary", &session.demo_summary);
             append_serialized_section(&mut sections, "Doctor Report", &session.doctor_report);
         }
-        HistoryDetailTab::Workers => {
+        HistoryDetailTab::Artifacts => {
+            append_file_section_if_exists(
+                &mut sections,
+                "Summary Markdown",
+                &session.summary_markdown_path,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Summary JSON",
+                &session.summary_json_path,
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Apply Plan JSON",
+                session.artifact_manifest.apply_plan_path.clone(),
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Apply Result JSON",
+                &session.apply_result_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Apply Result (Manifest)",
+                &session.apply_result,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Verification Report JSON",
+                &session.verification_report_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Verification Report (Manifest)",
+                &session.verification_report,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Change Trust Report JSON",
+                &session.change_trust_report_path,
+            );
+            append_serialized_section(
+                &mut sections,
+                "Change Trust Report (Manifest)",
+                &session.change_trust_report,
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Manual Delivery Result JSON",
+                session
+                    .artifact_manifest
+                    .manual_delivery_result_path
+                    .clone(),
+            );
+            append_serialized_section(
+                &mut sections,
+                "Manual Delivery Result (Manifest)",
+                &session.manual_delivery_result,
+            );
+            append_optional_file_section(
+                &mut sections,
+                "Manual Review State JSON",
+                session.artifact_manifest.manual_review_state_path.clone(),
+            );
+            append_serialized_section(
+                &mut sections,
+                "Manual Review State (Manifest)",
+                &session.manual_review_state,
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Process Summary Markdown",
+                session.deliverable_summary_path(),
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Process Changes Markdown",
+                session.deliverable_changes_path(),
+            );
+            append_file_section_if_exists(
+                &mut sections,
+                "Process Verify Markdown",
+                session.deliverable_verify_path(),
+            );
+            append_repo_export_sections(&mut sections, session);
+        }
+        HistoryDetailTab::Technical => {
             if session.worker_results.is_empty() {
                 sections.push("当前 session 没有 worker 运行输出。".to_string());
             }
@@ -4377,52 +6492,10 @@ fn build_history_detail_body(session: &SessionManifest, tab: HistoryDetailTab) -
                     &worker.stderr_path,
                 );
             }
-        }
-        HistoryDetailTab::Artifacts => {
-            append_file_section_if_exists(
-                &mut sections,
-                "Summary Markdown",
-                &session.summary_markdown_path,
-            );
-            append_file_section_if_exists(
-                &mut sections,
-                "Summary JSON",
-                &session.summary_json_path,
-            );
-            append_optional_file_section(
-                &mut sections,
-                "Apply Plan JSON",
-                session.artifact_manifest.apply_plan_path.clone(),
-            );
-            append_file_section_if_exists(
-                &mut sections,
-                "Apply Result JSON",
-                &session.apply_result_path,
-            );
             append_serialized_section(
                 &mut sections,
-                "Apply Result (Manifest)",
-                &session.apply_result,
-            );
-            append_file_section_if_exists(
-                &mut sections,
-                "Verification Report JSON",
-                &session.verification_report_path,
-            );
-            append_serialized_section(
-                &mut sections,
-                "Verification Report (Manifest)",
-                &session.verification_report,
-            );
-            append_file_section_if_exists(
-                &mut sections,
-                "Change Trust Report JSON",
-                &session.change_trust_report_path,
-            );
-            append_serialized_section(
-                &mut sections,
-                "Change Trust Report (Manifest)",
-                &session.change_trust_report,
+                "Artifact Manifest",
+                &session.artifact_manifest,
             );
             append_file_section_if_exists(
                 &mut sections,
@@ -4476,15 +6549,33 @@ fn append_optional_file_section(sections: &mut Vec<String>, title: &str, path: O
     }
 }
 
+fn append_repo_export_section<P>(sections: &mut Vec<String>, title: &str, path: P)
+where
+    P: AsRef<Path>,
+{
+    append_file_section_with_missing_message(sections, title, path, "当前会话未导出该用户文件。");
+}
+
 fn append_file_section_if_exists<P>(sections: &mut Vec<String>, title: &str, path: P)
 where
+    P: AsRef<Path>,
+{
+    append_file_section_with_missing_message(sections, title, path, "文件不存在。");
+}
+
+fn append_file_section_with_missing_message<P>(
+    sections: &mut Vec<String>,
+    title: &str,
+    path: P,
+    missing_message: &str,
+) where
     P: AsRef<Path>,
 {
     let path = path.as_ref();
     let body = if path.exists() {
         read_text_lossy(path)
     } else {
-        "文件不存在。".to_string()
+        missing_message.to_string()
     };
     sections.push(format!(
         "===== {title} =====\n路径：{}\n\n{}",
@@ -4520,19 +6611,19 @@ fn page_text(text: &str, page: usize, lines_per_page: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveCommand, AppShell, CommandState, FormField, FormState, ProjectContext, Route,
-        RunSubview, ShellAction, action_supports_stop, build_command_preview, build_continue_args,
-        contextual_help_lines, history_back_route, next_history_return_route,
-        next_run_return_route, page_count_for_text, page_text, preferred_run_subview,
-        prepare_runtime_state, push_command_output, route_titles, run_back_route,
-        run_subview_titles, split_main_sections, wrapped_cursor_row_col,
+        ActiveCommand, AppShell, CommandState, FormField, FormState, HistoryAction, ProjectContext,
+        Route, RunSubview, SessionSummary, ShellAction, action_supports_stop,
+        build_command_preview, build_continue_args, contextual_help_lines, history_back_route,
+        next_history_return_route, next_run_return_route, page_count_for_text, page_text,
+        preferred_run_subview, prepare_runtime_state, push_command_output, route_titles,
+        run_back_route, run_subview_titles, split_main_sections, wrapped_cursor_row_col,
     };
     use crate::cli::ContinueModeArg;
     use crate::model::{
-        ApplyDecision, ApplyMode, ApplyStatus, ArtifactManifest, BaselineArtifacts, DoctorCheck,
-        DoctorReadiness, DoctorReport, FinalSummary, RepoSnapshot, ResultStatus, RuntimeEvent,
-        SessionManifest, SessionPreset, SessionStatus, ThinkingMode, TimelineEventSummary,
-        TrustLevel, UiMode,
+        ApplyDecision, ApplyMode, ApplyResult, ApplyStatus, ArtifactManifest, BaselineArtifacts,
+        DoctorCheck, DoctorReadiness, DoctorReport, FinalSummary, RepoSnapshot, ResultStatus,
+        RuntimeEvent, ScopeDrift, SessionKind, SessionManifest, SessionPreset, SessionStatus,
+        ThinkingMode, TimelineEventSummary, TrustLevel, UiMode,
     };
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4599,11 +6690,13 @@ mod tests {
             },
             selected_session: None,
             history_detail: None,
+            manual_review: None,
             confirm_dialog: None,
             runtime_state: None,
             run_subview: RunSubview::Dashboard,
             last_doctor_report: None,
             active_command: None,
+            pending_review_fix: None,
             exit_esc_armed_at: None,
             should_quit: false,
         }
@@ -4623,6 +6716,7 @@ mod tests {
             },
             created_at: Utc::now(),
             status: SessionStatus::Completed,
+            session_kind: SessionKind::Run,
             ui_mode: UiMode::Minimal,
             workers_requested: 3,
             role_set: "default".to_string(),
@@ -4636,6 +6730,7 @@ mod tests {
             config_path: None,
             preset: None,
             iteration_index: 1,
+            shared_context_version: 1,
             root_session_id: id.to_string(),
             parent_session_id: None,
             continuation_kind: None,
@@ -4653,6 +6748,11 @@ mod tests {
             change_trust_report: None,
             doctor_report: None,
             final_summary: None,
+            manual_delivery_result: None,
+            manual_review_state: None,
+            review_fix: None,
+            memory_manifest: None,
+            source_plan_session_id: None,
             reused_plan_session_id: None,
             resumed_from_session_id: None,
             artifact_index: Vec::new(),
@@ -4770,7 +6870,9 @@ mod tests {
             config_path: String::new(),
             task: "实现 v5".to_string(),
             continue_feedback: String::new(),
+            review_issue: String::new(),
             continue_mode: ContinueModeArg::Auto,
+            from_plan_session_id: String::new(),
             thinking_mode: ThinkingMode::HardThink,
             role_set: "default".to_string(),
             workers: "4".to_string(),
@@ -4849,6 +6951,21 @@ mod tests {
     }
 
     #[test]
+    fn builds_run_command_from_selected_plan_session() {
+        let form = FormState {
+            task: "实现 v5".to_string(),
+            from_plan_session_id: "plan-123".to_string(),
+            ..FormState::default()
+        };
+
+        let preview = build_command_preview(Path::new("/tmp/demo"), &form, ShellAction::Run, None);
+
+        assert!(preview.args.contains(&"--from-plan".to_string()));
+        assert!(preview.args.contains(&"plan-123".to_string()));
+        assert!(preview.summary.contains("基于 plan session"));
+    }
+
+    #[test]
     fn build_continue_args_uses_selected_continue_mode() {
         let form = FormState {
             continue_feedback: "补上执行验证".to_string(),
@@ -4862,6 +6979,191 @@ mod tests {
         assert_eq!(args.mode, ContinueModeArg::Run);
         assert_eq!(args.session, "session-2");
         assert_eq!(args.feedback, Some("补上执行验证".to_string()));
+    }
+
+    #[test]
+    fn available_history_actions_show_execute_plan_for_plan_session_only() {
+        let mut plan_session = sample_session("session-plan");
+        plan_session.session_kind = SessionKind::Plan;
+        plan_session.apply_mode = ApplyMode::None;
+        let run_session = sample_session("session-run");
+
+        let plan_actions = super::available_history_actions(Some(&plan_session));
+        let run_actions = super::available_history_actions(Some(&run_session));
+
+        assert!(plan_actions.contains(&HistoryAction::ExecutePlan));
+        assert!(!plan_actions.contains(&HistoryAction::ResetSelected));
+        assert!(!run_actions.contains(&HistoryAction::ExecutePlan));
+        assert!(run_actions.contains(&HistoryAction::ResetSelected));
+    }
+
+    #[test]
+    fn available_history_actions_show_deliver_for_undelivered_run_session() {
+        let mut run_session = sample_session("session-run");
+        run_session.apply_result = Some(ApplyResult {
+            mode: ApplyMode::AutoSafe,
+            status: ApplyStatus::Bundled,
+            integration_worktree: None,
+            applied_workers: Vec::new(),
+            rejected_workers: Vec::new(),
+            conflicts: vec!["reviewer 明确阻止自动应用".to_string()],
+            synced_to_target: false,
+            bundle_dir: Some(run_session.session_dir.join("integration").join("bundle")),
+            final_patch_path: None,
+            log_path: run_session
+                .session_dir
+                .join("integration")
+                .join("apply.log"),
+            review_gate: Some(ApplyDecision::Block),
+            trust_level: TrustLevel::Low,
+            scope_drift: ScopeDrift::Minor,
+            accepted_files: vec!["src/app_shell.rs".to_string()],
+            manual_review_files: vec!["README.md".to_string()],
+            rejected_files: Vec::new(),
+            out_of_scope_files: Vec::new(),
+            todo_commits: Vec::new(),
+            review_report: None,
+        });
+
+        let actions = super::available_history_actions(Some(&run_session));
+
+        assert!(actions.contains(&HistoryAction::DeliverAccepted));
+    }
+
+    #[test]
+    fn available_history_actions_show_manual_review_for_manual_review_files() {
+        let mut run_session = sample_session("session-run");
+        run_session.apply_result = Some(ApplyResult {
+            mode: ApplyMode::AutoSafe,
+            status: ApplyStatus::Bundled,
+            integration_worktree: None,
+            applied_workers: Vec::new(),
+            rejected_workers: Vec::new(),
+            conflicts: vec!["需要人工复核".to_string()],
+            synced_to_target: false,
+            bundle_dir: Some(run_session.session_dir.join("integration").join("bundle")),
+            final_patch_path: None,
+            log_path: run_session
+                .session_dir
+                .join("integration")
+                .join("apply.log"),
+            review_gate: Some(ApplyDecision::AllowPartial),
+            trust_level: TrustLevel::Medium,
+            scope_drift: ScopeDrift::Minor,
+            accepted_files: Vec::new(),
+            manual_review_files: vec!["README.md".to_string()],
+            rejected_files: Vec::new(),
+            out_of_scope_files: Vec::new(),
+            todo_commits: Vec::new(),
+            review_report: None,
+        });
+
+        let actions = super::available_history_actions(Some(&run_session));
+
+        assert!(actions.contains(&HistoryAction::ManualReview));
+    }
+
+    #[test]
+    fn builds_initial_manual_review_state_from_apply_result() {
+        let mut run_session = sample_session("session-run");
+        run_session.worker_results = vec![crate::model::WorkerResult {
+            agent_id: "implementer-1".to_string(),
+            role: "implementer".to_string(),
+            task_title: "实现主干".to_string(),
+            status: crate::model::WorkerStatus::Succeeded,
+            exit_code: Some(0),
+            attempts: 1,
+            diagnostic_summary: Some(String::new()),
+            summary: Some(String::new()),
+            final_message: String::new(),
+            changed_files: vec!["README.md".to_string()],
+            worktree_path: PathBuf::from("/tmp"),
+            prompt_path: PathBuf::from("/tmp/prompt"),
+            stdout_path: PathBuf::from("/tmp/stdout"),
+            stderr_path: PathBuf::from("/tmp/stderr"),
+            events_path: PathBuf::from("/tmp/events"),
+            final_output_path: PathBuf::from("/tmp/final"),
+            diff_path: None,
+            git_status_path: None,
+            handoff_path: None,
+            handoff: None,
+            error: None,
+        }];
+        run_session.apply_result = Some(ApplyResult {
+            mode: ApplyMode::AutoSafe,
+            status: ApplyStatus::Bundled,
+            integration_worktree: None,
+            applied_workers: Vec::new(),
+            rejected_workers: Vec::new(),
+            conflicts: vec!["需要人工复核".to_string()],
+            synced_to_target: false,
+            bundle_dir: None,
+            final_patch_path: None,
+            log_path: run_session
+                .session_dir
+                .join("integration")
+                .join("apply.log"),
+            review_gate: Some(ApplyDecision::AllowPartial),
+            trust_level: TrustLevel::Medium,
+            scope_drift: ScopeDrift::Minor,
+            accepted_files: Vec::new(),
+            manual_review_files: vec!["README.md".to_string()],
+            rejected_files: Vec::new(),
+            out_of_scope_files: Vec::new(),
+            todo_commits: Vec::new(),
+            review_report: None,
+        });
+
+        let state = super::build_initial_manual_review_state(&run_session);
+
+        assert_eq!(state.source_session_id, "session-run");
+        assert_eq!(state.selected_file.as_deref(), Some("README.md"));
+        assert_eq!(state.files.len(), 1);
+        assert_eq!(
+            state.files[0].source_workers,
+            vec!["implementer-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_task_history_deduplicates_current_project_sessions() {
+        let mut shell = test_shell();
+        shell.project.sessions = vec![
+            SessionSummary {
+                id: "s1".to_string(),
+                created_at: "03-01 10:00".to_string(),
+                task: "修复登录".to_string(),
+                stage_label: "已完成".to_string(),
+                summary: "done".to_string(),
+                mode_label: "运行".to_string(),
+                continuable: true,
+            },
+            SessionSummary {
+                id: "s2".to_string(),
+                created_at: "03-01 11:00".to_string(),
+                task: "修复登录".to_string(),
+                stage_label: "已完成".to_string(),
+                summary: "done".to_string(),
+                mode_label: "运行".to_string(),
+                continuable: true,
+            },
+            SessionSummary {
+                id: "s3".to_string(),
+                created_at: "03-01 12:00".to_string(),
+                task: "生成脚手架".to_string(),
+                stage_label: "已完成".to_string(),
+                summary: "done".to_string(),
+                mode_label: "运行".to_string(),
+                continuable: true,
+            },
+        ];
+
+        let history = super::recent_task_history(&shell.project);
+
+        assert_eq!(
+            history,
+            vec!["修复登录".to_string(), "生成脚手架".to_string()]
+        );
     }
 
     #[test]
@@ -4879,7 +7181,7 @@ mod tests {
     #[test]
     fn uses_compact_titles_on_narrow_terminal() {
         assert_eq!(route_titles(50), vec!["开始", "执行中", "历史结果"]);
-        assert_eq!(run_subview_titles(60), vec!["态势", "过程", "摘要"]);
+        assert_eq!(run_subview_titles(60), vec!["总览", "执行", "交付"]);
     }
 
     #[test]
@@ -5175,6 +7477,9 @@ mod tests {
     #[test]
     fn shell_action_stop_support_matches_expected_paths() {
         let default_form = FormState::default();
+        let mut plan_session = sample_session("session-plan");
+        plan_session.session_kind = SessionKind::Plan;
+        plan_session.apply_mode = ApplyMode::None;
         let mut run_session = sample_session("session-run");
         run_session.final_summary = Some(sample_final_summary("已有结果"));
 
@@ -5197,7 +7502,7 @@ mod tests {
         assert!(!action_supports_stop(
             ShellAction::ContinueSelected,
             &default_form,
-            Some(&sample_session("session-plan"))
+            Some(&plan_session)
         ));
         assert!(action_supports_stop(
             ShellAction::ContinueSelected,
@@ -5644,7 +7949,7 @@ mod tests {
         let initial = shell
             .history_detail
             .as_ref()
-            .map(|detail| detail.body.clone())
+            .map(|detail| detail.detail.clone())
             .unwrap_or_default();
         assert!(initial.contains("会话：session-1"));
 
@@ -5652,7 +7957,7 @@ mod tests {
         let switched = shell
             .history_detail
             .as_ref()
-            .map(|detail| detail.body.clone())
+            .map(|detail| detail.detail.clone())
             .unwrap_or_default();
         assert_ne!(initial, switched);
         assert!(switched.contains("Execution Graph"));
@@ -5679,7 +7984,7 @@ mod tests {
         shell.open_history_detail();
 
         if let Some(detail) = shell.history_detail.as_mut() {
-            detail.body = (0..(super::HISTORY_DETAIL_PAGE_LINES + 5))
+            detail.detail = (0..(super::HISTORY_DETAIL_PAGE_LINES + 5))
                 .map(|i| format!("line-{i}"))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -5752,6 +8057,26 @@ mod tests {
     }
 
     #[test]
+    fn run_summary_widget_lists_real_repo_exports() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut shell = test_shell();
+        let mut session = sample_session_in(temp.path(), "session-export");
+        fs::create_dir_all(temp.path().join("src")).expect("create src dir");
+        fs::write(temp.path().join("src").join("app_shell.rs"), "// exported")
+            .expect("write export");
+        session.final_summary = Some(sample_final_summary("导出摘要"));
+        shell.selected_session = Some(session);
+        shell.route = Route::Run;
+        shell.run_subview = RunSubview::Summary;
+
+        let rendered = render_shell_to_text(&shell, 120, 36);
+        let normalized = normalize_rendered_text(&rendered);
+        assert!(normalized.contains("用户导出件："), "{rendered}");
+        assert!(normalized.contains("src/app_shell.rs"), "{rendered}");
+        assert!(!normalized.contains("codex-forge-summary.md"), "{rendered}");
+    }
+
+    #[test]
     fn run_timeline_widget_shows_session_events_when_idle() {
         let mut shell = test_shell();
         let mut session = sample_session("session-2");
@@ -5769,6 +8094,64 @@ mod tests {
         assert!(normalized.contains("历史会话：session-2"), "{rendered}");
         assert!(normalized.contains("阶段切换"), "{rendered}");
         assert!(normalized.contains("进入回放"), "{rendered}");
+    }
+
+    #[test]
+    fn run_timeline_widget_shows_live_execution_stream() {
+        let mut shell = test_shell();
+        shell.runtime_state = Some(crate::ui::RuntimeViewState::new("session-live", "实时执行"));
+        shell.run_subview = RunSubview::Timeline;
+        shell.route = Route::Run;
+        if let Some(state) = shell.runtime_state.as_mut() {
+            state.apply(&RuntimeEvent::PhaseChanged {
+                phase: "规划中".to_string(),
+            });
+            state.apply(&RuntimeEvent::WorkerDispatched {
+                agent_id: "implementer-1".to_string(),
+                role: "implementer".to_string(),
+                title: "补齐执行流".to_string(),
+                worktree_path: "/tmp/demo".into(),
+            });
+            state.apply(&RuntimeEvent::WorkerOutput {
+                agent_id: "implementer-1".to_string(),
+                stream: "stdout".to_string(),
+                message: "cargo test -q".to_string(),
+            });
+        }
+
+        let rendered = render_shell_to_text(&shell, 120, 36);
+        let normalized = normalize_rendered_text(&rendered);
+        assert!(normalized.contains("执行流"), "{rendered}");
+        assert!(normalized.contains("当前焦点：implementer-1"), "{rendered}");
+        assert!(normalized.contains("cargotest-q"), "{rendered}");
+    }
+
+    #[test]
+    fn history_artifacts_prefers_system_artifacts_and_downgrades_missing_repo_exports() {
+        let temp = TempDir::new().expect("temp dir");
+        let session = sample_session_in(temp.path(), "session-artifacts");
+        fs::create_dir_all(&session.session_dir).expect("session dir");
+        fs::create_dir_all(session.apply_result_path.parent().expect("integration dir"))
+            .expect("integration dir");
+        fs::write(&session.summary_markdown_path, "# Summary\n\n系统工件").expect("summary md");
+        fs::write(&session.summary_json_path, "{\"overview\":\"系统工件\"}").expect("summary json");
+        fs::write(&session.apply_result_path, "{\"status\":\"applied\"}").expect("apply result");
+        fs::write(&session.verification_report_path, "{\"status\":\"passed\"}")
+            .expect("verification report");
+
+        let body = super::build_history_detail_body(&session, super::HistoryDetailTab::Artifacts);
+        assert!(body.contains("===== Summary Markdown ====="), "{body}");
+        assert!(
+            body.contains("===== Process Summary Markdown ====="),
+            "{body}"
+        );
+        assert!(body.contains("===== Repo Exports ====="), "{body}");
+        assert!(body.contains("当前会话尚未交付到目标目录"), "{body}");
+
+        let summary =
+            super::build_history_detail_summary(&session, super::HistoryDetailTab::Artifacts);
+        assert!(summary.contains("系统工件"), "{summary}");
+        assert!(summary.contains("用户导出件"), "{summary}");
     }
 
     #[test]
@@ -5820,7 +8203,7 @@ mod tests {
         shell.selected_session = Some(sample_session("session-1"));
         shell.open_history_detail();
         if let Some(detail) = shell.history_detail.as_mut() {
-            detail.body = "short body".to_string();
+            detail.detail = "short body".to_string();
         }
 
         let rendered = render_shell_to_text(&shell, 120, 40);
@@ -5909,7 +8292,7 @@ mod tests {
             command
                 .output
                 .iter()
-                .any(|line| line.contains("阶段切换 -> 执行中"))
+                .any(|line| line.contains("进入执行中阶段"))
         }));
         assert!(
             shell

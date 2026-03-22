@@ -5,6 +5,7 @@
 
 - 先把用户任务整理成**面向用户可读的 todo 清单**
 - 再派生内部 **ExecutionGraph**
+- 再由常驻 **Brain Agent** 统一安排调度、审批、检查、优化与测试
 - 用多个 worker 在隔离 worktree 中并行执行
 - 通过 reviewer gate 控制自动收敛风险
 - 在目标仓库按 **todo** 顺序完成验证与本地 commit
@@ -14,11 +15,12 @@
 这个项目最重要的价值，不是“多开几个窗口”，而是把以下几件事情串成一个稳定工作流：
 
 1. **规划**
-2. **并行执行**
-3. **审阅与收敛**
-4. **验证与提交**
-5. **可回放的过程留痕**
-6. **可继续反馈的迭代闭环**
+2. **Brain 指挥**
+3. **并行执行**
+4. **审阅与收敛**
+5. **验证与提交**
+6. **可回放的过程留痕**
+7. **可继续反馈的迭代闭环**
 
 对于公司内部黑客松来说，`codex-forge` 的亮点在于：它不只是一个概念 demo，而是一套已经把**协作边界、自动应用风险、验证闭环、工件沉淀**都考虑进去的多 Agent 编码指挥台。
 
@@ -81,7 +83,18 @@
 - handoff 可以独立沉淀
 - integration 阶段可以更可控地决定如何收敛
 
-### 4. reviewer gate 不是装饰，而是自动应用前的安全阀
+### 4. 常驻 Brain Agent 是控制平面，而不是单纯规则调度器
+
+当前版本不再把 commander / orchestrator 仅仅当成流程胶水，而是显式引入一个持续在线的 **Brain Agent** 视角：
+
+- 统一接管调度、审批、检查、优化和测试推进
+- 按关键路径剩余长度、下游解锁能力和角色并发上限做派发决策
+- 在 stop / fail-fast / review gate / verify 等关键时刻输出可解释决策
+- 用结构化 runtime event 记录自己的思考、决策、升级和调度快照
+
+这让系统对外展示的不再只是“多个 agent 在跑”，而是“有一个大脑在指挥一群 agent”。
+
+### 5. reviewer gate 不是装饰，而是自动应用前的安全阀
 
 很多 AI 工作流的“review”只是多跑一个模型点评一下。  
 `codex-forge` 的 reviewer 是真正参与自动收敛决策的 gate：
@@ -93,7 +106,7 @@
 只有 reviewer 明确放行，系统才进入自动应用路径。  
 这让“多 Agent 自动化”不至于失控，也让黑客松展示时的系统设计更完整：**不是只有并行执行，还有可解释的安全收口机制**。
 
-### 5. todo 级验证与本地 commit
+### 6. todo 级验证与本地 commit
 
 `run` 在 `auto-safe` 模式下，不是一次性把所有 patch 粗暴合并后结束，而是会按**用户 todo 顺序**推进：
 
@@ -104,7 +117,7 @@
 
 这让最终结果更接近真实研发流程，也让回放和复盘更有意义。
 
-### 6. 全链路可回放、可审计、可复盘
+### 7. 全链路可回放、可审计、可复盘
 
 每次 session 都会保存：
 
@@ -120,7 +133,7 @@
 
 所以 `codex-forge` 不是“跑完即失忆”的黑盒，而是一个可回放的协作系统。
 
-### 7. V6 开始支持“plan / run 之后继续反馈”
+### 8. V6 开始支持“plan / run 之后继续反馈”
 
 从 V6 开始，`codex-forge` 不再把一次 `plan` 或 `run` 当作终点，而是默认把它们视为**当前可用版本**：
 
@@ -179,6 +192,15 @@
 
 它的竞争点不只是执行能力，而是**执行组织能力**。
 
+### 1.5 不只会并行，还会把并行展示出来
+
+`Run -> 进度总览` 现在是一个真正的多 Agent 指挥台，而不是简单 worker 表格：
+
+- 顶部固定展示 Brain 当前焦点、风险级别和并行利用率
+- 中间用 Agent Matrix 实时展示所有 agent 的队列态、阻塞原因、lane 和最近变化
+- 右侧持续展示关键路径、ready/running/blocked 分布和 Gate 摘要
+- timeline / history 里也会保留 Brain 决策与调度快照，方便 replay 和演示
+
 ### 2. 不只会产出代码，还会控制集成风险
 
 许多 AI CLI 最大的问题不是“写不出代码”，而是：
@@ -222,8 +244,10 @@
 用户任务
   -> 生成用户 todo
   -> 派生 ExecutionGraph
+  -> Brain Agent 计算关键路径与 ready/blocked 队列
   -> worker worktree 并行执行
   -> 产出 patch / handoff / events
+  -> Brain Agent 持续决定重排 / 审批 / 补测 / 收口
   -> reviewer 做最终 gate
   -> integration 做 auto-safe apply 或 bundle 降级
   -> todo 级验证与本地 commit
@@ -239,7 +263,7 @@
 
 - `src/orchestrator.rs`
   - 协调整个 session 生命周期
-  - 串起 plan、run、调度、integration、summary
+  - 串起 Brain 决策、关键路径优先调度、integration、summary
 
 - `src/codex.rs`
   - 对接 `codex exec`
@@ -504,9 +528,16 @@ codex-forge
 
 执行页重点看三块：
 
-- `实时态势`：现在整体进行到哪了
+- `进度总览`：Brain、Agent Matrix、阻塞原因和并行利用率
 - `事件流`：刚刚发生了什么
-- `交付摘要`：最后结果会是什么
+- `最终交付`：最后结果会是什么
+
+重点不再只是“哪个 worker 在跑”，而是：
+
+- Brain 当前决定了什么
+- 哪些 agent 已 ready、哪些被 block、为什么 block
+- 关键路径还剩多少
+- reviewer / apply / verify 当前卡在哪
 
 如果当前任务还在跑，你也可以先切去别的页面，顶部状态会保留。
 

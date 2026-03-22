@@ -6,6 +6,7 @@ mod codex;
 mod commander;
 mod config;
 mod doctor;
+mod memory;
 mod model;
 mod orchestrator;
 mod replay;

@@ -329,6 +329,57 @@ pub async fn execute_apply_plan(
     Ok((apply_result, report, trust_report))
 }
 
+pub async fn deliver_accepted_files(
+    plan: &ApplyPlan,
+    apply_result: &ApplyResult,
+    target_dir: &Path,
+) -> Result<Vec<String>> {
+    if apply_result.accepted_files.is_empty() {
+        anyhow::bail!("当前会话没有可安全交付的 accepted_files");
+    }
+    if !git_is_clean(target_dir).await? {
+        anyhow::bail!("目标工作区存在未提交改动，拒绝执行安全交付");
+    }
+
+    let delivered =
+        deliver_selected_files_from_plan(plan, target_dir, &apply_result.accepted_files).await?;
+    if delivered.is_empty() {
+        anyhow::bail!("accepted_files 为空或没有对应可应用 patch");
+    }
+    Ok(delivered)
+}
+
+pub async fn deliver_selected_files_from_plan(
+    plan: &ApplyPlan,
+    target_dir: &Path,
+    selected_files: &[String],
+) -> Result<Vec<String>> {
+    let mut delivered = Vec::new();
+    for operation in &plan.operations {
+        let files_for_operation = operation
+            .touched_files
+            .iter()
+            .filter(|file| selected_files.contains(*file))
+            .cloned()
+            .collect::<Vec<_>>();
+        if files_for_operation.is_empty() {
+            continue;
+        }
+
+        if files_for_operation.len() == operation.touched_files.len() {
+            apply_patch_file(target_dir, &operation.patch_path).await?;
+        } else {
+            apply_patch_file_for_paths(target_dir, &operation.patch_path, &files_for_operation)
+                .await?;
+        }
+        delivered.extend(files_for_operation);
+    }
+
+    delivered.sort();
+    delivered.dedup();
+    Ok(delivered)
+}
+
 async fn apply_and_commit_todos(
     repo_root: &Path,
     plan: &ApplyPlan,

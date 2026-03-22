@@ -68,6 +68,12 @@ pub struct RunArgs {
     pub preset: Option<PresetArg>,
     #[arg(
         long,
+        help = "高级参数：基于指定 plan session 的方案直接执行；不会自动猜测最近方案",
+        conflicts_with = "resume"
+    )]
+    pub from_plan: Option<String>,
+    #[arg(
+        long,
         help = "高级参数：从指定 session 恢复运行，优先复用其执行图与已成功节点"
     )]
     pub resume: Option<String>,

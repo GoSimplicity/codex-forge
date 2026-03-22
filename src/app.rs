@@ -12,7 +12,8 @@ use crate::config::{load_project_config, validate_project_config};
 use crate::doctor::run_doctor;
 use crate::model::{
     ApplyMode, BaselineArtifacts, ContinuationConfig, ContinuationKind, FeedbackRecord,
-    SessionConfig, SessionLineageEntry, SessionManifest, SessionPreset, ThinkingMode, UiMode,
+    ReviewFixRequest, SessionConfig, SessionLineageEntry, SessionManifest, SessionPreset,
+    ThinkingMode, UiMode,
 };
 use crate::orchestrator::{plan_session, run_session};
 use crate::replay::replay_session;
@@ -30,7 +31,8 @@ pub async fn run() -> Result<()> {
         Some(Commands::Tui(args)) => run_tui(args).await?,
         Some(Commands::Run(args)) => {
             let (config, roles) = resolve_run_config(args)?;
-            let _manifest = run_session(config, roles).await?;
+            let manifest = run_session(config, roles).await?;
+            ensure_run_delivered(&manifest)?;
         }
         Some(Commands::Plan(args)) => {
             if args.config_only {
@@ -51,7 +53,8 @@ pub async fn run() -> Result<()> {
             ) {
                 let _manifest = plan_session(config, roles).await?;
             } else {
-                let _manifest = run_session(config, roles).await?;
+                let manifest = run_session(config, roles).await?;
+                ensure_run_delivered(&manifest)?;
             }
         }
         Some(Commands::Replay(args)) => run_replay(args).await?,
@@ -122,6 +125,7 @@ pub(crate) fn resolve_run_config(
         reviewer_rule_prompt: resources.rules.reviewer.clone(),
         plan_only: false,
         preset: args.preset.map(into_preset),
+        source_plan_session_id: args.from_plan,
         resume_session_id: args.resume,
         continuation: None,
     };
@@ -168,6 +172,7 @@ pub(crate) fn resolve_plan_config(
         reviewer_rule_prompt: resources.rules.reviewer.clone(),
         plan_only: true,
         preset: None,
+        source_plan_session_id: None,
         resume_session_id: None,
         continuation: None,
     };
@@ -232,6 +237,7 @@ pub(crate) fn resolve_continue_config(
             .as_ref()
             .map(|item| item.recommended_next_action.clone())
             .unwrap_or_default(),
+        review_fix: None,
     };
 
     let config = SessionConfig {
@@ -268,6 +274,100 @@ pub(crate) fn resolve_continue_config(
         reviewer_rule_prompt: resources.rules.reviewer.clone(),
         plan_only: matches!(continuation_kind, ContinuationKind::PlanRefine),
         preset: parent_manifest.preset,
+        source_plan_session_id: None,
+        resume_session_id: None,
+        continuation: Some(continuation),
+    };
+    Ok((config, roles))
+}
+
+pub(crate) fn build_review_fix_config(
+    target_dir: &std::path::Path,
+    parent_manifest: &SessionManifest,
+    target_file: &str,
+    issue_summary: &str,
+    ui_mode: UiMode,
+) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+    let loaded = load_project_config(target_dir, parent_manifest.config_path.as_deref())?;
+    let resources = load_resource_catalog(target_dir)?;
+    let role_set = parent_manifest.role_set.clone();
+    let roles = resolve_role_set(&resources, &role_set)?;
+    if roles.is_empty() {
+        bail!("角色集合为空，无法继续迭代");
+    }
+
+    let mut feedback_history = parent_manifest.feedback_history.clone();
+    feedback_history.push(build_feedback_record(
+        issue_summary,
+        Some(format!("人工审查返修 {}", target_file)),
+    ));
+
+    let continuation = ContinuationConfig {
+        parent_session_id: parent_manifest.id.clone(),
+        root_session_id: parent_manifest.root_session_id_ref().to_string(),
+        iteration_index: parent_manifest.iteration_index_value() + 1,
+        kind: ContinuationKind::RunRefine,
+        title: Some(format!("人工审查返修 {}", target_file)),
+        feedback: issue_summary.to_string(),
+        feedback_history,
+        baseline_artifacts: baseline_artifacts_from_manifest(parent_manifest),
+        parent_lineage: if parent_manifest.lineage.is_empty() {
+            vec![SessionLineageEntry {
+                session_id: parent_manifest.id.clone(),
+                iteration_index: parent_manifest.iteration_index_value(),
+                continuation_kind: parent_manifest.continuation_kind,
+                status: parent_manifest.status,
+                created_at: parent_manifest.created_at,
+            }]
+        } else {
+            parent_manifest.lineage.clone()
+        },
+        parent_task: parent_manifest.task.clone(),
+        parent_plan_summary: parent_manifest
+            .plan_todo
+            .as_ref()
+            .map(|item| item.summary.clone()),
+        parent_summary_overview: parent_manifest
+            .final_summary
+            .as_ref()
+            .map(|item| item.overview.clone()),
+        parent_recommended_next_action: parent_manifest
+            .final_summary
+            .as_ref()
+            .map(|item| item.recommended_next_action.clone())
+            .unwrap_or_default(),
+        review_fix: Some(ReviewFixRequest {
+            target_file: target_file.to_string(),
+            issue_summary: issue_summary.to_string(),
+        }),
+    };
+
+    let config = SessionConfig {
+        task: format!("修复人工审查文件 `{}`：{}", target_file, issue_summary),
+        workers: parent_manifest.workers_requested.max(1),
+        role_set,
+        model: parent_manifest
+            .model
+            .clone()
+            .or(loaded.settings.model.clone()),
+        thinking_mode: parent_manifest.thinking_mode,
+        ui_mode,
+        target_dir: target_dir.to_path_buf(),
+        cleanup_success: false,
+        apply_mode: ApplyMode::None,
+        max_retries: parent_manifest.max_retries.max(1),
+        fail_fast: parent_manifest.fail_fast,
+        verification_commands: if parent_manifest.verification_commands.is_empty() {
+            loaded.settings.verification_commands.clone()
+        } else {
+            parent_manifest.verification_commands.clone()
+        },
+        config_path: loaded.path.or(parent_manifest.config_path.clone()),
+        global_rule_prompt: resources.rules.global.clone(),
+        reviewer_rule_prompt: resources.rules.reviewer.clone(),
+        plan_only: false,
+        preset: parent_manifest.preset,
+        source_plan_session_id: None,
         resume_session_id: None,
         continuation: Some(continuation),
     };
@@ -455,6 +555,37 @@ fn validated_task_input(task: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn ensure_run_delivered(manifest: &SessionManifest) -> Result<()> {
+    if manifest.delivered_to_target() {
+        return Ok(());
+    }
+
+    let apply_result = manifest.apply_result.as_ref();
+    let review_gate = apply_result
+        .and_then(|item| item.review_gate)
+        .map(|item| item.label().to_string())
+        .unwrap_or_else(|| "无".to_string());
+    let apply_status = apply_result
+        .map(|item| item.status.label().to_string())
+        .unwrap_or_else(|| "无".to_string());
+    let bundle_path = apply_result
+        .and_then(|item| item.bundle_dir.as_ref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "无".to_string());
+    let accepted_files = apply_result
+        .map(|item| item.accepted_files.len())
+        .unwrap_or(0);
+
+    bail!(
+        "代码未交付到目标目录：{}\nreview gate：{}\napply 状态：{}\nbundle 路径：{}\naccepted_files：{}\n历史页可执行“交付已接收”把安全文件落地。",
+        manifest.repo_root().display(),
+        review_gate,
+        apply_status,
+        bundle_path,
+        accepted_files
+    )
+}
+
 fn into_ui_mode(mode: UiModeArg) -> UiMode {
     match mode {
         UiModeArg::Rich => UiMode::Rich,
@@ -478,10 +609,7 @@ fn resolve_continuation_kind(
         ContinueModeArg::Plan => ContinuationKind::PlanRefine,
         ContinueModeArg::Run => ContinuationKind::RunRefine,
         ContinueModeArg::Auto => {
-            if parent_manifest.worker_results.is_empty()
-                && parent_manifest.apply_result.is_none()
-                && parent_manifest.final_summary.is_none()
-            {
+            if parent_manifest.is_plan_session() {
                 ContinuationKind::PlanRefine
             } else {
                 ContinuationKind::RunRefine

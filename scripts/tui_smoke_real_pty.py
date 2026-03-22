@@ -396,25 +396,19 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
         )
 
         mark = session.mark()
-        session.send("\x1b", pause=0.15)
+        session.send("\x1b[C")
         session.wait_for(
-            "从历史页回到执行页",
-            ["先看方案/成功", "已返回执行页"],
-            timeout=8,
+            "切到历史动作区",
+            ["下一步", "执行此方案"],
+            timeout=5,
             since=mark,
         )
-
         mark = session.mark()
-        session.send("\x1b", pause=0.15)
-        session.wait_for("从执行页回到开始页", ["任务输入", "主操作"], timeout=8, since=mark)
-
-        mark = session.mark()
-        session.send("\x1b[B")
         session.send("\r")
-        session.wait_for("进入 Run", ["开始执行/运行中"], timeout=5, since=mark)
+        session.wait_for("执行此方案并进入 Run", ["开始执行/运行中"], timeout=5, since=mark)
         session.wait_for(
             "Run 完成并进入历史页",
-            ["开始执行 已结束：成功", "历史会话", "当前会话"],
+            ["历史会话", "当前会话", "目标目录状态"],
             timeout=25,
             since=mark,
         )
