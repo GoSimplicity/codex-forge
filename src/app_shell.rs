@@ -22,11 +22,11 @@ use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::build_review_fix_config;
-use crate::app::{resolve_continue_config, resolve_plan_config, resolve_run_config};
+use crate::app::{resolve_continue_config, resolve_run_config};
 use crate::apply::{deliver_accepted_files, deliver_selected_files_from_plan};
 use crate::cli::{
-    ApplyModeArg, ContinueArgs, ContinueModeArg, PlanArgs, RunArgs, SharedTaskArgs,
-    ThinkingModeArg, UiModeArg,
+    ApplyModeArg, ContinueArgs, ContinueModeArg, RunArgs, SharedTaskArgs, ThinkingModeArg,
+    UiModeArg,
 };
 use crate::config::{LoadedProjectConfig, load_project_config};
 use crate::doctor::run_doctor;
@@ -35,7 +35,7 @@ use crate::model::{
     ManualReviewFileStatus, ManualReviewState, RuntimeEvent, SessionManifest, SessionPreset,
     ThinkingMode, UiMode,
 };
-use crate::orchestrator::{EmbeddedRunOutcome, plan_session_embedded, run_session_embedded};
+use crate::orchestrator::{EmbeddedRunOutcome, run_session_embedded};
 use crate::replay::replay_session_embedded;
 use crate::resources::{ResourceCatalog, load_resource_catalog};
 use crate::session::{
@@ -125,7 +125,6 @@ impl FormField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellAction {
     Doctor,
-    Plan,
     Run,
     ContinueSelected,
     ReviewFixSelected,
@@ -136,8 +135,7 @@ impl ShellAction {
     fn label(self) -> &'static str {
         match self {
             Self::Doctor => "检查环境",
-            Self::Plan => "先看方案",
-            Self::Run => "开始执行",
+            Self::Run => "开始运行",
             Self::ContinueSelected => "继续优化",
             Self::ReviewFixSelected => "修复当前文件",
             Self::ReplaySelected => "回放过程",
@@ -145,7 +143,7 @@ impl ShellAction {
     }
 
     fn requires_task(self) -> bool {
-        matches!(self, Self::Plan | Self::Run)
+        matches!(self, Self::Run)
     }
 }
 
@@ -253,22 +251,18 @@ enum RunFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartAction {
     Doctor,
-    Plan,
     Run,
     ToggleSettings,
 }
 
 impl StartAction {
-    fn all() -> [Self; 4] {
-        [Self::Doctor, Self::Plan, Self::Run, Self::ToggleSettings]
+    fn all() -> [Self; 3] {
+        [Self::Doctor, Self::Run, Self::ToggleSettings]
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryAction {
-    ExecutePlan,
-    DeliverAccepted,
-    ManualReview,
     Continue,
     EditFeedback,
     ContinueMode,
@@ -681,7 +675,8 @@ impl AppShell {
             edit_state: None,
             history_index: 0,
             notices: vec![
-                "默认主路径：先写任务，再用方向键和 Enter 选择“先看方案”或“开始执行”。".to_string(),
+                "默认主路径：先写任务，再直接开始运行；系统会先规划，再自动执行并落地到目标目录。"
+                    .to_string(),
                 "历史页右侧会直接列出“继续优化 / 回放 / 查看详情 / 清理”等动作。".to_string(),
             ],
             form,
@@ -1069,7 +1064,7 @@ impl AppShell {
                 Span::raw("")
             } else {
                 Span::styled(
-                    "下一步：右侧选“先看方案”或“开始执行”。",
+                    "下一步：右侧直接选“开始运行”；系统会先规划，再自动执行。",
                     Style::default().fg(Color::LightGreen),
                 )
             }),
@@ -1123,10 +1118,6 @@ impl AppShell {
                 let style = if selected {
                     Style::default()
                         .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else if matches!(*action, StartAction::Plan) {
-                    Style::default()
-                        .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -1741,15 +1732,7 @@ impl AppShell {
 
     fn history_right_widget(&self) -> Paragraph<'_> {
         let lines = if let Some(session) = &self.selected_session {
-            let next_step = if can_open_manual_review(session) {
-                "下一步：右侧优先可选“人工审查”，逐文件处理 manual_review_files。"
-            } else if can_deliver_accepted_files(session) {
-                "下一步：右侧优先可选“交付已接收”，把 accepted_files 安全落地到目标目录。"
-            } else if session.is_plan_session() {
-                "下一步：右侧可选“执行此方案”“继续改方案”“回放过程”或“查看详情”。"
-            } else {
-                "下一步：右侧选“继续优化”“回放过程”或“查看详情”。"
-            };
+            let next_step = "下一步：右侧选“继续优化”“回放过程”或“查看详情”。";
             let mut lines = vec![
                 Line::from(format!("当前会话：{}", truncate(&session.task, 80))),
                 Line::from(format!("状态：{}", session.status.label())),
@@ -2446,11 +2429,7 @@ impl AppShell {
     fn start_action_line(&self, action: StartAction) -> (&'static str, String) {
         match action {
             StartAction::Doctor => ("检查环境", "先排掉明显问题。".to_string()),
-            StartAction::Plan => (
-                "先看方案",
-                "推荐主路径：先拆清楚，再决定要不要跑。".to_string(),
-            ),
-            StartAction::Run => ("开始执行", run_source_user_hint(&self.form)),
+            StartAction::Run => ("开始运行", run_source_user_hint(&self.form)),
             StartAction::ToggleSettings => (
                 if self.advanced_settings_open {
                     "收起设置"
@@ -2468,29 +2447,10 @@ impl AppShell {
 
     fn history_action_line(&self, action: HistoryAction) -> (&'static str, String) {
         match action {
-            HistoryAction::ExecutePlan => (
-                "执行此方案",
-                "显式绑定当前 plan session，再进入 run。".to_string(),
+            HistoryAction::Continue => (
+                "继续优化",
+                "基于这一轮补充反馈，重新规划后继续执行。".to_string(),
             ),
-            HistoryAction::DeliverAccepted => (
-                "交付已接收",
-                "仅把 accepted_files 安全落地到目标目录。".to_string(),
-            ),
-            HistoryAction::ManualReview => (
-                "人工审查",
-                "逐文件审查 manual_review_files，并可发起单文件返修。".to_string(),
-            ),
-            HistoryAction::Continue => {
-                if self
-                    .selected_session
-                    .as_ref()
-                    .is_some_and(|session| session.is_plan_session())
-                {
-                    ("继续改方案", "基于这一轮继续打磨方案。".to_string())
-                } else {
-                    ("继续优化", "基于这一轮继续打磨。".to_string())
-                }
-            }
             HistoryAction::EditFeedback => (
                 "补充反馈",
                 if self.form.continue_feedback.trim().is_empty() {
@@ -2596,7 +2556,6 @@ impl AppShell {
             StartFocus::TaskInput => self.start_editing(FormField::Task),
             StartFocus::Actions => match self.current_start_action() {
                 StartAction::Doctor => self.start_action(ShellAction::Doctor).await?,
-                StartAction::Plan => self.start_action(ShellAction::Plan).await?,
                 StartAction::Run => self.start_action(ShellAction::Run).await?,
                 StartAction::ToggleSettings => self.toggle_advanced_settings(),
             },
@@ -2616,14 +2575,6 @@ impl AppShell {
         match self.history_focus {
             HistoryFocus::Sessions => self.open_history_detail(),
             HistoryFocus::Actions => match self.current_history_action() {
-                HistoryAction::ExecutePlan => {
-                    if let Some(session) = self.selected_session.clone() {
-                        self.use_plan_session_for_run(&session);
-                        self.start_action(ShellAction::Run).await?;
-                    }
-                }
-                HistoryAction::DeliverAccepted => self.deliver_selected_session_accepted().await?,
-                HistoryAction::ManualReview => self.open_manual_review_popup()?,
                 HistoryAction::Continue => self.start_action(ShellAction::ContinueSelected).await?,
                 HistoryAction::EditFeedback => self.start_editing(FormField::ContinueFeedback),
                 HistoryAction::ContinueMode => {
@@ -2755,17 +2706,8 @@ impl AppShell {
             KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::Doctor).await?
             }
-            KeyCode::Char('p') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_action(ShellAction::Plan).await?
-            }
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::Run).await?
-            }
-            KeyCode::Char('y') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.deliver_selected_session_accepted().await?
-            }
-            KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_manual_review_popup()?
             }
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_action(ShellAction::ContinueSelected).await?
@@ -2923,13 +2865,6 @@ impl AppShell {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     commit = true;
                     saved_field = Some(edit.field);
-                }
-                KeyCode::Char('p')
-                    if multiline && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    commit = true;
-                    saved_field = Some(edit.field);
-                    focus_after_commit = Some(ShellAction::Plan);
                 }
                 KeyCode::Char('r')
                     if multiline && key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -3291,7 +3226,7 @@ impl AppShell {
         self.navigate_to(Route::Start);
         self.advanced_settings_open = false;
         self.start_editing(FormField::Task);
-        self.push_notice("请先输入提示词，再生成方案或开始执行。");
+        self.push_notice("请先输入提示词，再开始运行。");
         false
     }
 
@@ -3409,10 +3344,7 @@ impl AppShell {
                 self.history_index = 0;
                 self.open_history_selection()?;
                 if matches!(state, CommandState::Succeeded)
-                    && matches!(
-                        action,
-                        ShellAction::Run | ShellAction::Plan | ShellAction::ContinueSelected
-                    )
+                    && matches!(action, ShellAction::Run | ShellAction::ContinueSelected)
                 {
                     self.navigate_to(Route::History);
                 } else {
@@ -4155,15 +4087,6 @@ impl AppShell {
 
     fn focus_action_after_save(&mut self, action: ShellAction) -> String {
         match action {
-            ShellAction::Plan => {
-                self.navigate_to(Route::Start);
-                self.start_focus = StartFocus::Actions;
-                self.start_action_index = StartAction::all()
-                    .iter()
-                    .position(|item| *item == StartAction::Plan)
-                    .unwrap_or(0);
-                "内容已保存。已准备好“先看方案”，按 Enter 手动开始。".to_string()
-            }
             ShellAction::Run => {
                 self.navigate_to(Route::Start);
                 self.start_focus = StartFocus::Actions;
@@ -4171,7 +4094,7 @@ impl AppShell {
                     .iter()
                     .position(|item| *item == StartAction::Run)
                     .unwrap_or(0);
-                "内容已保存。已准备好“开始执行”，按 Enter 手动开始。".to_string()
+                "内容已保存。已准备好“开始运行”，按 Enter 手动开始。".to_string()
             }
             ShellAction::ContinueSelected => {
                 self.navigate_to(Route::History);
@@ -4197,12 +4120,6 @@ impl AppShell {
             action,
             self.selected_session.as_ref(),
         )
-    }
-
-    fn use_plan_session_for_run(&mut self, session: &SessionManifest) {
-        self.form.task = session.task.clone();
-        self.form.from_plan_session_id = session.id.clone();
-        self.form.resume_session_id.clear();
     }
 }
 
@@ -4235,13 +4152,6 @@ fn build_command_preview(
             args.push("--apply-mode".to_string());
             args.push(form.apply_mode.label().to_string());
         }
-        ShellAction::Plan => {
-            args.push("plan".to_string());
-            args.push(form.task.clone());
-            append_shared_args(&mut args, target_dir, form);
-            args.push("--ui".to_string());
-            args.push("minimal".to_string());
-        }
         ShellAction::Run => {
             args.push("run".to_string());
             args.push(form.task.clone());
@@ -4255,10 +4165,6 @@ fn build_command_preview(
             if let Some(preset) = form.preset {
                 args.push("--preset".to_string());
                 args.push(preset.label().to_string());
-            }
-            if !form.from_plan_session_id.trim().is_empty() {
-                args.push("--from-plan".to_string());
-                args.push(form.from_plan_session_id.trim().to_string());
             }
             if form.fail_fast {
                 args.push("--fail-fast".to_string());
@@ -4336,7 +4242,7 @@ fn prepare_runtime_state(
 ) -> Option<RuntimeViewState> {
     match action {
         ShellAction::Doctor => None,
-        ShellAction::Plan | ShellAction::Run => Some(RuntimeViewState::new("准备中", &form.task)),
+        ShellAction::Run => Some(RuntimeViewState::new("准备中", &form.task)),
         ShellAction::ContinueSelected => {
             selected_session.map(|session| RuntimeViewState::new(&session.id, &session.task))
         }
@@ -4371,7 +4277,6 @@ fn spawn_embedded_action(
         // 具体执行仍然走现有 orchestrator / replay / doctor 逻辑，避免出现两套实现。
         let outcome = match action {
             ShellAction::Doctor => run_doctor_embedded(&target_dir, &form, tx.clone()).await,
-            ShellAction::Plan => run_plan_embedded(&target_dir, &form, tx.clone()).await,
             ShellAction::Run => run_run_embedded(&target_dir, &form, tx.clone(), stop_rx).await,
             ShellAction::ContinueSelected => {
                 run_continue_embedded(&target_dir, &form, selected_session, tx.clone(), stop_rx)
@@ -4478,17 +4383,6 @@ async fn run_doctor_embedded(
     Ok((CommandState::Succeeded, None))
 }
 
-async fn run_plan_embedded(
-    target_dir: &Path,
-    form: &FormState,
-    tx: mpsc::UnboundedSender<RunnerEvent>,
-) -> Result<(CommandState, Option<SessionManifest>)> {
-    let args = build_plan_args(target_dir, form);
-    let (config, roles) = resolve_plan_config(args)?;
-    let manifest = plan_session_embedded(config, roles, runtime_tx(&tx)).await?;
-    Ok((CommandState::Succeeded, Some(manifest)))
-}
-
 async fn run_run_embedded(
     target_dir: &Path,
     form: &FormState,
@@ -4520,24 +4414,16 @@ async fn run_continue_embedded(
 ) -> Result<(CommandState, Option<SessionManifest>)> {
     let args = build_continue_args(target_dir, form, selected_session.as_ref())?;
     let (config, roles) = resolve_continue_config(args)?;
-    if matches!(
-        config.continuation.as_ref().map(|item| item.kind),
-        Some(crate::model::ContinuationKind::PlanRefine)
-    ) {
-        let manifest = plan_session_embedded(config, roles, runtime_tx(&tx)).await?;
-        Ok((CommandState::Succeeded, Some(manifest)))
-    } else {
-        let EmbeddedRunOutcome { manifest, stopped } =
-            run_session_embedded(config, roles, runtime_tx(&tx), stop_rx).await?;
-        Ok((
-            if stopped {
-                CommandState::Stopped
-            } else {
-                CommandState::Succeeded
-            },
-            Some(manifest),
-        ))
-    }
+    let EmbeddedRunOutcome { manifest, stopped } =
+        run_session_embedded(config, roles, runtime_tx(&tx), stop_rx).await?;
+    Ok((
+        if stopped {
+            CommandState::Stopped
+        } else {
+            CommandState::Succeeded
+        },
+        Some(manifest),
+    ))
 }
 
 async fn run_review_fix_embedded(
@@ -4567,26 +4453,6 @@ async fn run_review_fix_embedded(
     ))
 }
 
-fn build_plan_args(target_dir: &Path, form: &FormState) -> PlanArgs {
-    PlanArgs {
-        shared: SharedTaskArgs {
-            task: form.task.clone(),
-            config: optional_path(&form.config_path).map(PathBuf::from),
-            workers: parse_usize(&form.workers),
-            role_set: Some(form.role_set.clone()),
-            model: empty_as_none(&form.model),
-            thinking_mode: Some(match form.thinking_mode {
-                ThinkingMode::Quick => ThinkingModeArg::Quick,
-                ThinkingMode::Balanced => ThinkingModeArg::Balanced,
-                ThinkingMode::HardThink => ThinkingModeArg::HardThink,
-            }),
-            ui: UiModeArg::Minimal,
-            target_dir: Some(target_dir.to_path_buf()),
-        },
-        config_only: false,
-    }
-}
-
 fn build_run_args(target_dir: &Path, form: &FormState) -> RunArgs {
     RunArgs {
         shared: SharedTaskArgs {
@@ -4606,7 +4472,6 @@ fn build_run_args(target_dir: &Path, form: &FormState) -> RunArgs {
         preset: form.preset.map(|preset| match preset {
             SessionPreset::FeatureDemo => crate::cli::PresetArg::FeatureDemo,
         }),
-        from_plan: empty_as_none(&form.from_plan_session_id),
         resume: empty_as_none(&form.resume_session_id),
         apply_mode: Some(match form.apply_mode {
             ApplyMode::AutoSafe => ApplyModeArg::AutoSafe,
@@ -4807,50 +4672,29 @@ fn build_action_summary(
 ) -> String {
     match action {
         ShellAction::Doctor => "检查当前仓库的环境、配置和验证条件".to_string(),
-        ShellAction::Plan => {
-            if form.task.trim().is_empty() {
-                "请先输入提示词，然后再生成方案和待办清单".to_string()
-            } else {
-                format!(
-                    "先把“{}”拆成方案和待办清单，再决定怎么执行",
-                    summarize_task(&form.task)
-                )
-            }
-        }
         ShellAction::Run => {
             if form.task.trim().is_empty() {
-                "请先输入提示词，然后再开始执行".to_string()
+                "请先输入提示词，然后再开始运行".to_string()
             } else if !form.resume_session_id.trim().is_empty() {
                 format!(
                     "恢复运行 session `{}`，继续处理“{}”",
                     truncate(&form.resume_session_id, 18),
                     summarize_task(&form.task)
                 )
-            } else if !form.from_plan_session_id.trim().is_empty() {
-                format!(
-                    "基于 plan session `{}` 执行“{}”",
-                    truncate(&form.from_plan_session_id, 18),
-                    summarize_task(&form.task)
-                )
             } else {
                 format!(
-                    "直接开始处理“{}”，默认使用 {}",
+                    "直接开始处理“{}”；系统会先规划，再自动执行并落地，默认使用 {}",
                     summarize_task(&form.task),
                     advanced_settings_summary(form)
                 )
             }
         }
         ShellAction::ContinueSelected => {
-            let action_title = if selected_session.is_some_and(|session| session.is_plan_session())
-            {
-                "继续改方案"
-            } else {
-                "继续优化"
-            };
+            let action_title = "继续优化";
             if selected_session.is_none() {
                 format!("请先在历史页选中一个已完成 session，再{action_title}")
             } else if form.continue_feedback.trim().is_empty() {
-                format!("直接基于当前 session {action_title}；如果有额外反馈，也可以先补充。")
+                format!("直接基于当前 session {action_title}；系统会先重新规划，再继续执行。")
             } else {
                 format!(
                     "基于 {} {}（{}）：{}",
@@ -4911,15 +4755,6 @@ fn available_history_actions(selected_session: Option<&SessionManifest>) -> Vec<
     };
 
     let mut actions = Vec::new();
-    if session.is_plan_session() {
-        actions.push(HistoryAction::ExecutePlan);
-    }
-    if can_deliver_accepted_files(session) {
-        actions.push(HistoryAction::DeliverAccepted);
-    }
-    if can_open_manual_review(session) {
-        actions.push(HistoryAction::ManualReview);
-    }
     actions.push(HistoryAction::Continue);
     actions.push(HistoryAction::EditFeedback);
     actions.push(HistoryAction::ContinueMode);
@@ -4940,35 +4775,27 @@ fn run_source_user_hint(form: &FormState) -> String {
             "当前会恢复运行 session `{}`，不会走新规划。",
             truncate(&form.resume_session_id, 18)
         )
-    } else if !form.from_plan_session_id.trim().is_empty() {
-        format!(
-            "当前会基于 plan session `{}` 执行，不会静默改用其他方案。",
-            truncate(&form.from_plan_session_id, 18)
-        )
     } else {
-        "当前会发起一次全新执行；如需承接方案，请显式指定 plan session。".to_string()
+        "当前会发起一次全新运行；系统会先规划，再自动执行并直接写入目标目录。".to_string()
     }
 }
 
 fn action_supports_stop(
     action: ShellAction,
-    form: &FormState,
+    _form: &FormState,
     selected_session: Option<&SessionManifest>,
 ) -> bool {
     match action {
         ShellAction::Run | ShellAction::ReviewFixSelected | ShellAction::ReplaySelected => true,
-        ShellAction::ContinueSelected => selected_session
-            .map(|session| continue_mode_runs(form.continue_mode, session))
-            .unwrap_or(false),
-        ShellAction::Doctor | ShellAction::Plan => false,
+        ShellAction::ContinueSelected => selected_session.is_some(),
+        ShellAction::Doctor => false,
     }
 }
 
-fn continue_mode_runs(mode: ContinueModeArg, session: &SessionManifest) -> bool {
+fn continue_mode_runs(mode: ContinueModeArg, _session: &SessionManifest) -> bool {
     match mode {
-        ContinueModeArg::Plan => false,
         ContinueModeArg::Run => true,
-        ContinueModeArg::Auto => session.is_run_session(),
+        ContinueModeArg::Auto => true,
     }
 }
 
@@ -5074,7 +4901,7 @@ fn build_doctor_failure_summary(report: &DoctorReport) -> String {
 
 fn saved_field_notice(field: FormField) -> String {
     match field {
-        FormField::Task => "内容已保存。现在请手动选择“先看方案”或“开始执行”。".to_string(),
+        FormField::Task => "内容已保存。现在请手动选择“开始运行”。".to_string(),
         FormField::ContinueFeedback => "反馈已保存。现在请手动执行“继续优化”。".to_string(),
         FormField::ReviewIssue => "审查问题已保存。现在可以发起单文件返修。".to_string(),
         FormField::TargetDir | FormField::ConfigPath => {
@@ -5086,8 +4913,7 @@ fn saved_field_notice(field: FormField) -> String {
 
 fn preferred_run_subview(action: ShellAction) -> RunSubview {
     match action {
-        ShellAction::Plan
-        | ShellAction::Run
+        ShellAction::Run
         | ShellAction::ContinueSelected
         | ShellAction::ReviewFixSelected
         | ShellAction::ReplaySelected => RunSubview::Timeline,
@@ -5636,16 +5462,14 @@ fn apply_mode_user_label(mode: ApplyMode) -> &'static str {
 
 fn continue_mode_user_title(mode: ContinueModeArg) -> &'static str {
     match mode {
-        ContinueModeArg::Auto => "自动判断",
-        ContinueModeArg::Plan => "只重做方案",
+        ContinueModeArg::Auto => "自动续跑",
         ContinueModeArg::Run => "直接执行",
     }
 }
 
 fn continue_mode_user_label(mode: ContinueModeArg) -> &'static str {
     match mode {
-        ContinueModeArg::Auto => "自动判断（auto）",
-        ContinueModeArg::Plan => "只重做方案（plan）",
+        ContinueModeArg::Auto => "自动续跑（auto）",
         ContinueModeArg::Run => "直接执行（run）",
     }
 }
@@ -5653,7 +5477,6 @@ fn continue_mode_user_label(mode: ContinueModeArg) -> &'static str {
 fn continue_mode_arg_value(mode: ContinueModeArg) -> &'static str {
     match mode {
         ContinueModeArg::Auto => "auto",
-        ContinueModeArg::Plan => "plan",
         ContinueModeArg::Run => "run",
     }
 }
@@ -5663,7 +5486,6 @@ fn advanced_fields() -> &'static [FormField] {
         FormField::TargetDir,
         FormField::ConfigPath,
         FormField::ContinueMode,
-        FormField::FromPlanSession,
         FormField::ThinkingMode,
         FormField::RoleSet,
         FormField::Workers,
@@ -5683,12 +5505,6 @@ fn advanced_settings_summary(form: &FormState) -> String {
         form.role_set.clone(),
         apply_mode_user_label(form.apply_mode).to_string(),
     ];
-    if !form.from_plan_session_id.trim().is_empty() {
-        items.push(format!(
-            "执行方案 {}",
-            truncate(&form.from_plan_session_id, 18)
-        ));
-    }
     if !form.resume_session_id.trim().is_empty() {
         items.push(format!("恢复 {}", truncate(&form.resume_session_id, 18)));
     }
@@ -5716,7 +5532,6 @@ fn field_is_editable(field: FormField) -> bool {
             | FormField::ConfigPath
             | FormField::Task
             | FormField::ContinueFeedback
-            | FormField::FromPlanSession
             | FormField::Workers
             | FormField::MaxRetries
             | FormField::Model
@@ -5735,11 +5550,7 @@ fn cycle_thinking_mode(current: ThinkingMode, forward: bool) -> ThinkingMode {
 }
 
 fn cycle_continue_mode(current: ContinueModeArg, forward: bool) -> ContinueModeArg {
-    let modes = [
-        ContinueModeArg::Auto,
-        ContinueModeArg::Plan,
-        ContinueModeArg::Run,
-    ];
+    let modes = [ContinueModeArg::Auto, ContinueModeArg::Run];
     let index = modes.iter().position(|item| *item == current).unwrap_or(0);
     modes[cycle_index(index, modes.len(), forward)]
 }
@@ -5794,7 +5605,7 @@ fn contextual_help_lines(
         Route::History => vec![Line::from(if compact {
             "历史：←→ 切列表/下一步，↑↓ 选择，Enter 查看/执行。"
         } else {
-            "历史：←→ 切列表/下一步，↑↓ 选择，Enter 查看详情/执行动作，u 人工审查，y 交付已接收，e 补反馈，v 详情，z 重置，x 删除，Esc 返回，Tab 进导航。"
+            "历史：←→ 切列表/下一步，↑↓ 选择，Enter 查看详情/执行动作，e 补反馈，v 详情，z 重置，x 删除，Esc 返回，Tab 进导航。"
         })],
     }
 }
@@ -6900,13 +6711,9 @@ mod tests {
     #[test]
     fn empty_task_preview_requires_prompt_first() {
         let form = FormState::default();
-
-        let plan_preview =
-            build_command_preview(Path::new("/tmp/demo"), &form, ShellAction::Plan, None);
         let run_preview =
             build_command_preview(Path::new("/tmp/demo"), &form, ShellAction::Run, None);
 
-        assert!(plan_preview.summary.contains("先输入提示词"));
         assert!(run_preview.summary.contains("先输入提示词"));
     }
 
@@ -6930,7 +6737,7 @@ mod tests {
     fn builds_continue_command_from_selected_session() {
         let form = FormState {
             continue_feedback: "把验证说明写得更清楚".to_string(),
-            continue_mode: ContinueModeArg::Plan,
+            continue_mode: ContinueModeArg::Run,
             ..FormState::default()
         };
         let session = sample_session("session-1");
@@ -6946,23 +6753,21 @@ mod tests {
         assert!(preview.args.contains(&"--feedback".to_string()));
         assert!(preview.args.contains(&"把验证说明写得更清楚".to_string()));
         assert!(preview.args.contains(&"--mode".to_string()));
-        assert!(preview.args.contains(&"plan".to_string()));
+        assert!(preview.args.contains(&"run".to_string()));
         assert!(preview.summary.contains("继续优化"));
     }
 
     #[test]
-    fn builds_run_command_from_selected_plan_session() {
+    fn builds_run_command_without_plan_selector() {
         let form = FormState {
             task: "实现 v5".to_string(),
-            from_plan_session_id: "plan-123".to_string(),
             ..FormState::default()
         };
 
         let preview = build_command_preview(Path::new("/tmp/demo"), &form, ShellAction::Run, None);
 
-        assert!(preview.args.contains(&"--from-plan".to_string()));
-        assert!(preview.args.contains(&"plan-123".to_string()));
-        assert!(preview.summary.contains("基于 plan session"));
+        assert!(!preview.args.contains(&"--from-plan".to_string()));
+        assert!(preview.summary.contains("系统会先规划，再自动执行并落地"));
     }
 
     #[test]
@@ -6982,85 +6787,24 @@ mod tests {
     }
 
     #[test]
-    fn available_history_actions_show_execute_plan_for_plan_session_only() {
-        let mut plan_session = sample_session("session-plan");
-        plan_session.session_kind = SessionKind::Plan;
-        plan_session.apply_mode = ApplyMode::None;
+    fn available_history_actions_hide_plan_and_manual_delivery_actions() {
         let run_session = sample_session("session-run");
 
-        let plan_actions = super::available_history_actions(Some(&plan_session));
         let run_actions = super::available_history_actions(Some(&run_session));
 
-        assert!(plan_actions.contains(&HistoryAction::ExecutePlan));
-        assert!(!plan_actions.contains(&HistoryAction::ResetSelected));
-        assert!(!run_actions.contains(&HistoryAction::ExecutePlan));
         assert!(run_actions.contains(&HistoryAction::ResetSelected));
-    }
-
-    #[test]
-    fn available_history_actions_show_deliver_for_undelivered_run_session() {
-        let mut run_session = sample_session("session-run");
-        run_session.apply_result = Some(ApplyResult {
-            mode: ApplyMode::AutoSafe,
-            status: ApplyStatus::Bundled,
-            integration_worktree: None,
-            applied_workers: Vec::new(),
-            rejected_workers: Vec::new(),
-            conflicts: vec!["reviewer 明确阻止自动应用".to_string()],
-            synced_to_target: false,
-            bundle_dir: Some(run_session.session_dir.join("integration").join("bundle")),
-            final_patch_path: None,
-            log_path: run_session
-                .session_dir
-                .join("integration")
-                .join("apply.log"),
-            review_gate: Some(ApplyDecision::Block),
-            trust_level: TrustLevel::Low,
-            scope_drift: ScopeDrift::Minor,
-            accepted_files: vec!["src/app_shell.rs".to_string()],
-            manual_review_files: vec!["README.md".to_string()],
-            rejected_files: Vec::new(),
-            out_of_scope_files: Vec::new(),
-            todo_commits: Vec::new(),
-            review_report: None,
-        });
-
-        let actions = super::available_history_actions(Some(&run_session));
-
-        assert!(actions.contains(&HistoryAction::DeliverAccepted));
-    }
-
-    #[test]
-    fn available_history_actions_show_manual_review_for_manual_review_files() {
-        let mut run_session = sample_session("session-run");
-        run_session.apply_result = Some(ApplyResult {
-            mode: ApplyMode::AutoSafe,
-            status: ApplyStatus::Bundled,
-            integration_worktree: None,
-            applied_workers: Vec::new(),
-            rejected_workers: Vec::new(),
-            conflicts: vec!["需要人工复核".to_string()],
-            synced_to_target: false,
-            bundle_dir: Some(run_session.session_dir.join("integration").join("bundle")),
-            final_patch_path: None,
-            log_path: run_session
-                .session_dir
-                .join("integration")
-                .join("apply.log"),
-            review_gate: Some(ApplyDecision::AllowPartial),
-            trust_level: TrustLevel::Medium,
-            scope_drift: ScopeDrift::Minor,
-            accepted_files: Vec::new(),
-            manual_review_files: vec!["README.md".to_string()],
-            rejected_files: Vec::new(),
-            out_of_scope_files: Vec::new(),
-            todo_commits: Vec::new(),
-            review_report: None,
-        });
-
-        let actions = super::available_history_actions(Some(&run_session));
-
-        assert!(actions.contains(&HistoryAction::ManualReview));
+        assert!(!run_actions.iter().any(|action| matches!(
+            action,
+            HistoryAction::Continue
+                | HistoryAction::EditFeedback
+                | HistoryAction::ContinueMode
+                | HistoryAction::Replay
+                | HistoryAction::Detail
+                | HistoryAction::ResetSelected
+                | HistoryAction::CleanSelected
+                | HistoryAction::CleanAll
+                | HistoryAction::BackToStart
+        ) == false));
     }
 
     #[test]
@@ -7477,19 +7221,11 @@ mod tests {
     #[test]
     fn shell_action_stop_support_matches_expected_paths() {
         let default_form = FormState::default();
-        let mut plan_session = sample_session("session-plan");
-        plan_session.session_kind = SessionKind::Plan;
-        plan_session.apply_mode = ApplyMode::None;
         let mut run_session = sample_session("session-run");
         run_session.final_summary = Some(sample_final_summary("已有结果"));
 
         assert!(!action_supports_stop(
             ShellAction::Doctor,
-            &default_form,
-            Some(&run_session)
-        ));
-        assert!(!action_supports_stop(
-            ShellAction::Plan,
             &default_form,
             Some(&run_session)
         ));
@@ -7499,10 +7235,10 @@ mod tests {
             &default_form,
             None
         ));
-        assert!(!action_supports_stop(
+        assert!(action_supports_stop(
             ShellAction::ContinueSelected,
             &default_form,
-            Some(&plan_session)
+            Some(&run_session)
         ));
         assert!(action_supports_stop(
             ShellAction::ContinueSelected,
@@ -7516,10 +7252,6 @@ mod tests {
         assert_eq!(
             preferred_run_subview(ShellAction::Doctor),
             RunSubview::Dashboard
-        );
-        assert_eq!(
-            preferred_run_subview(ShellAction::Plan),
-            RunSubview::Timeline
         );
         assert_eq!(
             preferred_run_subview(ShellAction::Run),
@@ -7543,7 +7275,6 @@ mod tests {
         };
 
         assert!(prepare_runtime_state(ShellAction::Doctor, &form, None).is_none());
-        assert!(prepare_runtime_state(ShellAction::Plan, &form, None).is_some());
         assert!(prepare_runtime_state(ShellAction::Run, &form, None).is_some());
         assert!(
             prepare_runtime_state(
@@ -7627,7 +7358,7 @@ mod tests {
         assert_eq!(shell.start_focus, super::StartFocus::Actions);
         assert_eq!(shell.current_start_action(), super::StartAction::Run);
         assert!(shell.notices.last().is_some_and(|message| {
-            message.contains("已准备好“开始执行”") && message.contains("手动开始")
+            message.contains("已准备好“开始运行”") && message.contains("手动开始")
         }));
     }
 
@@ -7810,10 +7541,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_without_task_reopens_task_editor_instead_of_starting() {
+    async fn run_without_task_reopens_task_editor_instead_of_starting() {
         let mut shell = test_shell();
 
-        shell.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        shell.handle_key(key(KeyCode::Char('r'))).await.unwrap();
 
         assert_eq!(shell.route, Route::Start);
         assert!(shell.active_command.is_none());

@@ -1342,22 +1342,13 @@ fn recommended_next_actions(
 ) -> Vec<String> {
     let mut actions = Vec::new();
     if !manifest.delivered_to_target() {
-        if manifest
-            .apply_result
-            .as_ref()
-            .is_some_and(|result| !result.accepted_files.is_empty())
-        {
-            actions.push(
-                "先在历史页执行“交付已接收”，把 accepted_files 安全落地到目标目录。".to_string(),
-            );
-        }
         if let Some(bundle_dir) = manifest
             .apply_result
             .as_ref()
             .and_then(|result| result.bundle_dir.as_ref())
         {
             actions.push(format!(
-                "如需人工处理其余改动，请检查 bundle：`{}`。",
+                "自动落地未完成；请先检查 bundle 或 apply 日志：`{}`。",
                 bundle_dir.display()
             ));
         }

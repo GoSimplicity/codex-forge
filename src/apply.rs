@@ -125,6 +125,7 @@ pub async fn execute_apply_plan(
         context.worker_results,
         reviewer_gate,
     );
+    let auto_apply_files = all_plan_files(&plan);
 
     fs::write(
         context.change_trust_report_path,
@@ -151,9 +152,9 @@ pub async fn execute_apply_plan(
         review_gate: reviewer_gate,
         trust_level: trust_report.trust_level,
         scope_drift: trust_report.scope_drift,
-        accepted_files: trust_report.accepted_files.clone(),
-        manual_review_files: trust_report.manual_review_files.clone(),
-        rejected_files: trust_report.rejected_files.clone(),
+        accepted_files: auto_apply_files.clone(),
+        manual_review_files: Vec::new(),
+        rejected_files: Vec::new(),
         out_of_scope_files: trust_report.out_of_scope_files.clone(),
         todo_commits: Vec::new(),
         review_report,
@@ -173,58 +174,37 @@ pub async fn execute_apply_plan(
             apply_result.bundle_dir = Some(bundle_dir);
         }
         ApplyMode::AutoSafe => {
+            if plan.operations.is_empty() || auto_apply_files.is_empty() {
+                append_log(
+                    &log_path,
+                    "没有可直接落地到目标目录的 patch，本次自动落地记为失败。",
+                )?;
+                apply_result.status = ApplyStatus::SyncFailed;
+                apply_result
+                    .conflicts
+                    .push("没有可直接落地到目标目录的 patch".to_string());
+            }
             if let Some(ApplyDecision::Block) = reviewer_gate {
-                append_log(&log_path, "reviewer 明确阻止自动应用，降级为 bundle。")?;
-                materialize_bundle(&bundle_dir, context.worker_results).await?;
-                apply_result.status = ApplyStatus::Bundled;
-                apply_result.bundle_dir = Some(bundle_dir.clone());
-            } else if !trust_report.safe_to_auto_apply {
-                append_log(&log_path, "可信度评估认为不适合自动应用，降级为 bundle。")?;
-                materialize_bundle(&bundle_dir, context.worker_results).await?;
-                apply_result.status = ApplyStatus::Bundled;
-                apply_result.bundle_dir = Some(bundle_dir.clone());
+                append_log(
+                    &log_path,
+                    "reviewer 给出阻止建议，但当前产品策略会继续自动落地并把风险记录到 summary。",
+                )?;
+            }
+            if !trust_report.safe_to_auto_apply {
+                append_log(
+                    &log_path,
+                    "可信度评估提示存在风险，但当前产品策略仍按单一路径继续自动落地。",
+                )?;
             }
 
             for operation in &plan.operations {
-                if apply_result.status == ApplyStatus::Bundled {
+                if matches!(apply_result.status, ApplyStatus::SyncFailed) {
                     break;
                 }
-
-                let accepted_for_operation = operation
-                    .touched_files
-                    .iter()
-                    .filter(|file| trust_report.accepted_files.contains(*file))
-                    .cloned()
-                    .collect::<Vec<_>>();
-
-                if accepted_for_operation.is_empty() {
-                    apply_result
-                        .rejected_workers
-                        .push(operation.agent_id.clone());
-                    append_log(
-                        &log_path,
-                        &format!("{} 没有可自动接收的文件，跳过应用。", operation.agent_id),
-                    )?;
-                    continue;
-                }
-
-                let apply_res = if accepted_for_operation.len() == operation.touched_files.len() {
+                let apply_res = if operation.touched_files.len() == operation.touched_files.len() {
                     apply_patch_file(&integration_worktree, &operation.patch_path).await
                 } else {
-                    append_log(
-                        &log_path,
-                        &format!(
-                            "{} 进入部分接收，仅应用：{}",
-                            operation.agent_id,
-                            accepted_for_operation.join("、")
-                        ),
-                    )?;
-                    apply_patch_file_for_paths(
-                        &integration_worktree,
-                        &operation.patch_path,
-                        &accepted_for_operation,
-                    )
-                    .await
+                    unreachable!()
                 };
 
                 match apply_res {
@@ -235,9 +215,9 @@ pub async fn execute_apply_plan(
                         append_log(
                             &log_path,
                             &format!(
-                                "已应用 {}，接收文件：{}",
+                                "已应用 {}，直接接收文件：{}",
                                 operation.agent_id,
-                                accepted_for_operation.join("、")
+                                operation.touched_files.join("、")
                             ),
                         )?;
                     }
@@ -250,17 +230,15 @@ pub async fn execute_apply_plan(
                             .push(format!("{} patch 应用失败：{}", operation.agent_id, error));
                         append_log(
                             &log_path,
-                            &format!("{} 应用失败，降级为 bundle：{error}", operation.agent_id),
+                            &format!("{} 应用失败，停止自动落地：{error}", operation.agent_id),
                         )?;
-                        materialize_bundle(&bundle_dir, context.worker_results).await?;
-                        apply_result.status = ApplyStatus::Bundled;
-                        apply_result.bundle_dir = Some(bundle_dir.clone());
+                        apply_result.status = ApplyStatus::SyncFailed;
                         break;
                     }
                 }
             }
 
-            if apply_result.status != ApplyStatus::Bundled {
+            if !matches!(apply_result.status, ApplyStatus::SyncFailed) {
                 let verification_root = verification_dir(context.session_dir);
                 let integration_results = run_stage_verification(
                     "integration",
@@ -280,7 +258,7 @@ pub async fn execute_apply_plan(
                         let commit_execution = apply_and_commit_todos(
                             context.repo_root,
                             &plan,
-                            &trust_report.accepted_files,
+                            &auto_apply_files,
                             context.todo_states,
                             context.verification_commands,
                             &verification_root,
@@ -327,6 +305,17 @@ pub async fn execute_apply_plan(
     persist_verification_report(&report, context.verification_report_path).await?;
     let _ = context.manager.cleanup(&integration_worktree).await;
     Ok((apply_result, report, trust_report))
+}
+
+fn all_plan_files(plan: &ApplyPlan) -> Vec<String> {
+    let mut files = plan
+        .operations
+        .iter()
+        .flat_map(|operation| operation.touched_files.iter().cloned())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
 }
 
 pub async fn deliver_accepted_files(

@@ -81,8 +81,8 @@ impl RuntimeViewState {
             brain: None,
             scheduler_snapshot: None,
             current_user_stage: "准备开始".to_string(),
-            current_user_message: "等待生成方案或开始执行。".to_string(),
-            next_user_step: "先在开始页确认任务，再选择“先看方案”或“开始执行”。".to_string(),
+            current_user_message: "等待开始运行；系统会先规划，再自动执行。".to_string(),
+            next_user_step: "先在开始页确认任务，然后直接开始运行。".to_string(),
             started_at: Instant::now(),
             commander_notes: Vec::new(),
             workers: BTreeMap::new(),
@@ -286,7 +286,7 @@ impl RuntimeViewState {
                 self.current_user_stage = "方案已完成".to_string();
                 self.current_user_message =
                     format!("已拆出 {} 个执行节点，主依赖 {} 条。", nodes, dependencies);
-                self.next_user_step = "查看方案是否合理，再决定是否开始执行。".to_string();
+                self.next_user_step = "规划完成，系统正在自动进入执行阶段。".to_string();
                 push_execution_line(
                     &mut self.execution_lines,
                     "规划",
@@ -432,7 +432,7 @@ impl RuntimeViewState {
                     worker.worktree_path = worktree_path.display().to_string();
                 }
                 self.active_worker = Some(agent_id.clone());
-                self.current_user_stage = "开始执行".to_string();
+                self.current_user_stage = "执行中".to_string();
                 self.current_user_message = format!("{} 正在处理“{}”。", role, truncate(title, 28));
                 self.next_user_step = "等待子任务推进，再看审阅与验证结果。".to_string();
                 push_execution_line(
@@ -1822,7 +1822,7 @@ fn user_next_step_from_phase(phase: &str) -> &'static str {
     } else if phase.contains("总结") {
         "等待交付摘要生成后回看结果。"
     } else {
-        "先生成方案或开始执行。"
+        "先开始运行，系统会自动先规划再执行。"
     }
 }
 
@@ -1841,7 +1841,7 @@ fn user_stage_from_todo_status(status: TodoStatus) -> &'static str {
 
 fn user_next_step_from_todo_status(status: TodoStatus) -> &'static str {
     match status {
-        TodoStatus::Pending | TodoStatus::Ready => "查看是否要开始执行。",
+        TodoStatus::Pending | TodoStatus::Ready => "等待系统自动推进到执行阶段。",
         TodoStatus::Running => "等待子任务完成，再看审阅意见。",
         TodoStatus::InReview => "等待审阅结论确认放行范围。",
         TodoStatus::Verifying => "等待验证结果确认是否可交付。",
@@ -2299,7 +2299,7 @@ mod tests {
         assert!(normalized.contains("当前阶段：方案已就绪"), "{screen}");
         assert!(normalized.contains("todo-1"), "{screen}");
         assert!(
-            normalized.contains("下一步：查看是否要开始执行。"),
+            normalized.contains("下一步：等待系统自动推进到执行阶段。"),
             "{screen}"
         );
         assert!(

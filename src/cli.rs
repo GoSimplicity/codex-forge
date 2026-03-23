@@ -17,7 +17,6 @@ pub struct Cli {
 pub enum Commands {
     Tui(TuiArgs),
     Run(RunArgs),
-    Plan(PlanArgs),
     Continue(ContinueArgs),
     Replay(ReplayArgs),
     Reset(ResetArgs),
@@ -68,12 +67,6 @@ pub struct RunArgs {
     pub preset: Option<PresetArg>,
     #[arg(
         long,
-        help = "高级参数：基于指定 plan session 的方案直接执行；不会自动猜测最近方案",
-        conflicts_with = "resume"
-    )]
-    pub from_plan: Option<String>,
-    #[arg(
-        long,
         help = "高级参数：从指定 session 恢复运行，优先复用其执行图与已成功节点"
     )]
     pub resume: Option<String>,
@@ -101,14 +94,6 @@ pub struct TuiArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct PlanArgs {
-    #[command(flatten)]
-    pub shared: SharedTaskArgs,
-    #[arg(long, help = "使用指定配置文件做纯规划校验")]
-    pub config_only: bool,
-}
-
-#[derive(Debug, Clone, Args)]
 pub struct ContinueArgs {
     #[arg(long, help = "要继续迭代的 session id")]
     pub session: String,
@@ -118,7 +103,7 @@ pub struct ContinueArgs {
         long,
         value_enum,
         default_value_t = ContinueModeArg::Auto,
-        help = "继续模式：auto 会根据父 session 自动判断走 plan 还是 run"
+        help = "继续模式：auto / run 都会重新规划后继续执行"
     )]
     pub mode: ContinueModeArg,
     #[arg(long, help = "给本轮反馈补一个短标题，方便回看")]
@@ -258,7 +243,6 @@ pub enum ApplyModeArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ContinueModeArg {
     Auto,
-    Plan,
     Run,
 }
 

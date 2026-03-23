@@ -9,7 +9,7 @@
 - 用多个 worker 在隔离 worktree 中并行执行
 - 通过 reviewer gate 控制自动收敛风险
 - 在目标仓库按 **todo** 顺序完成验证与本地 commit
-- 在 plan / run 完成后继续吸收人类反馈，进入下一轮迭代
+- 在每次运行完成后继续吸收人类反馈，进入下一轮迭代
 - 为整条链路保留完整 session 工件，便于 replay、审查与复盘
 
 这个项目最重要的价值，不是“多开几个窗口”，而是把以下几件事情串成一个稳定工作流：
@@ -65,7 +65,7 @@
 
 ### 2. 用户 todo 与内部执行图分离
 
-`plan` 会先生成**面向用户**的 todo 清单，再派生**面向系统**的执行图。
+`run` 会先生成**面向用户**的 todo 清单，再派生**面向系统**的执行图，然后自动进入执行。
 
 这意味着：
 
@@ -480,7 +480,7 @@ codex-forge
 
 启动后只需要先记住三件事：
 
-- `开始`：写任务，然后选“先看方案”或“开始执行”
+- `开始`：写任务，然后直接开始运行
 - `执行中`：看当前进度、结果和下一步
 - `历史结果`：继续优化、回放过程、查看详情
 
@@ -497,8 +497,7 @@ codex-forge
 
 如果你已经想好了下一步，也可以直接：
 
-- `Ctrl+P`：保存任务并选中“先看方案”，仍需你手动按 `Enter`
-- `Ctrl+R`：保存任务并选中“开始执行”，仍需你手动按 `Enter`
+- `Ctrl+R`：保存任务并选中“开始运行”，仍需你手动按 `Enter`
 
 最常用按键：
 
@@ -515,14 +514,14 @@ codex-forge
 推荐先按 `d`。  
 它会先把环境、配置和验证命令里的明显问题排掉。
 
-### 第 3 步：先 plan，再 run
+### 第 3 步：直接运行
 
 推荐顺序：
 
-1. 先按 `p` 生成 plan
+1. 先按 `d` 做 doctor 预检
 2. 再按 `r` 启动 run
 
-这样你会先看到系统怎么拆任务，再看到它怎么真正开始做。
+系统会先自动生成方案，再自动进入执行。
 
 ### 第 4 步：在“执行”页观察实时过程
 
@@ -573,11 +572,8 @@ codex-forge continue \
 常见模式：
 
 ```bash
-# 自动判断基于上一轮继续 plan 还是继续 run
+# 自动基于上一轮重新规划后继续 run
 codex-forge continue --session <session-id> --feedback "继续优化这个结果"
-
-# 强制继续做计划收敛
-codex-forge continue --session <session-id> --mode plan --feedback "先重写方案，不急着执行"
 
 # 强制继续做执行收敛
 codex-forge continue --session <session-id> --mode run --feedback "保持主实现，再补验证和交付"
@@ -661,7 +657,7 @@ TUI 中对应热键：
 
 ### 第 6 步：运行中停止 / 取消
 
-在“开始执行”、“继续优化（run 模式）”或“回放过程”执行中，按：
+在“开始运行”、“继续优化”或“回放过程”执行中，按：
 
 ```text
 s
@@ -677,8 +673,8 @@ s
 
 注意：
 
-- 当前**安全停止**支持“开始执行”与“回放过程”
-- “检查环境”和“先看方案”目前还不支持中途停止
+- 当前**安全停止**支持“开始运行”“继续优化”和“回放过程”
+- “检查环境”目前还不支持中途停止
 
 ### 第 7 步：查看历史结果页
 
@@ -699,13 +695,7 @@ s
 
 如果你不想进入 TUI，也可以继续使用传统 CLI 子命令。
 
-### 先规划
-
-```bash
-cargo run -- plan "我现在要创建一个简单的 web 博客，给我规划" --ui minimal
-```
-
-### 再执行
+### 直接执行
 
 ```bash
 cargo run -- run "我现在要创建一个简单的 web 博客，给我规划" --workers 4 --ui rich
@@ -729,7 +719,6 @@ cargo run -- replay --ui minimal
 cargo run -- agents list
 cargo run -- doctor
 cargo run -- config validate
-cargo run -- plan "创建一个简单博客" --ui minimal
 cargo run -- run "创建一个简单博客" --workers 4 --ui rich
 cargo run -- run "创建一个简单博客" --apply-mode auto-safe --max-retries 2
 cargo run -- replay --ui minimal
@@ -779,8 +768,7 @@ python3 scripts/tui_smoke_real_pty.py --keep-temp
 1. 启动 `codex-forge`
 2. 停留在“开始”页，填写一个清晰任务
 3. 按 `d` 跑 doctor
-4. 按 `p` 让系统先生成 plan
-5. 按 `r` 启动 run
+4. 按 `r` 启动 run
 6. 在“执行中”页展示 `实时态势`
 7. 切到 `事件流`
 8. 如需演示中断能力，再按 `s` 展示可安全停止运行
@@ -792,7 +780,7 @@ python3 scripts/tui_smoke_real_pty.py --keep-temp
 
 - 任务配置
 - 预检
-- 规划
+- 自动规划
 - 调度
 - 实时 dashboard
 - timeline 回放

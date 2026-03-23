@@ -433,7 +433,7 @@ fn run_with_feature_demo_preset_persists_preset() {
 }
 
 #[test]
-fn conflict_degrades_to_bundle() {
+fn conflict_marks_auto_apply_failed() {
     let repo = make_repo("conflict");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
@@ -451,11 +451,7 @@ fn conflict_degrades_to_bundle() {
     assert_undelivered_run(&output);
 
     let manifest = load_manifest(repo.path());
-    assert_eq!(manifest["apply_result"]["status"], "bundled");
-    let bundle_dir = manifest["apply_result"]["bundle_dir"]
-        .as_str()
-        .expect("bundle dir");
-    assert!(PathBuf::from(bundle_dir).exists());
+    assert_eq!(manifest["apply_result"]["status"], "sync_failed");
 }
 
 #[test]
@@ -474,10 +470,10 @@ fn reviewer_block_stops_auto_apply() {
         ])
         .output()
         .expect("run forge");
-    assert_undelivered_run(&output);
+    assert!(output.status.success(), "{:?}", output);
 
     let manifest = load_manifest(repo.path());
-    assert_eq!(manifest["apply_result"]["status"], "bundled");
+    assert_eq!(manifest["apply_result"]["status"], "applied");
     let conflicts = manifest["apply_result"]["conflicts"]
         .as_array()
         .expect("conflicts")
@@ -487,11 +483,12 @@ fn reviewer_block_stops_auto_apply() {
     assert!(
         conflicts
             .iter()
-            .any(|item| item.contains("明确阻止自动应用"))
+            .any(|item| item.contains("明确阻止自动应用")),
+        "{conflicts:?}"
     );
 
     let file_a = fs::read_to_string(repo.path().join("file-a.txt")).expect("read file-a");
-    assert_eq!(file_a, "alpha\n");
+    assert!(file_a.contains("from implementer 1"));
 }
 
 #[test]
@@ -564,7 +561,7 @@ fn failed_worker_patch_is_excluded_from_apply_plan() {
     );
 
     let manifest = load_manifest(repo.path());
-    assert_eq!(manifest["apply_result"]["status"], "bundled");
+    assert_eq!(manifest["apply_result"]["status"], "sync_failed");
     let file_a = fs::read_to_string(repo.path().join("file-a.txt")).expect("read file-a");
     assert_eq!(file_a, "alpha\n");
 }
@@ -611,20 +608,19 @@ fn planner_title_dependencies_are_normalized() {
 }
 
 #[test]
-fn plan_config_only_skips_planner_execution() {
+fn config_validate_stays_as_non_mutating_check() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
     let output = command(bin, repo.path())
         .args([
-            "plan",
-            "只校验配置",
-            "--config-only",
+            "config",
+            "validate",
             "--target-dir",
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("run plan config-only");
+        .expect("run config validate");
     assert!(output.status.success(), "{:?}", output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -633,13 +629,13 @@ fn plan_config_only_skips_planner_execution() {
 }
 
 #[test]
-fn plan_writes_user_facing_todo_artifacts() {
+fn run_writes_user_facing_todo_artifacts() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
     let output = command(bin, repo.path())
         .args([
-            "plan",
+            "run",
             "创建一个简单博客",
             "--ui",
             "minimal",
@@ -647,11 +643,8 @@ fn plan_writes_user_facing_todo_artifacts() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("run plan");
+        .expect("run session");
     assert!(output.status.success(), "{:?}", output);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("计划清单文件"));
 
     let session_id = latest_session_id(repo.path());
     let todo_path = repo
@@ -668,23 +661,9 @@ fn plan_writes_user_facing_todo_artifacts() {
 }
 
 #[test]
-fn run_without_from_plan_does_not_reuse_latest_plan_session() {
+fn run_generates_plan_artifacts_inside_run_session() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
-
-    let plan_output = command(bin, repo.path())
-        .args([
-            "plan",
-            "创建一个简单博客",
-            "--ui",
-            "minimal",
-            "--target-dir",
-            repo.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("run plan");
-    assert!(plan_output.status.success(), "{:?}", plan_output);
-    let plan_session_id = latest_session_id(repo.path());
 
     let run_output = command(bin, repo.path())
         .args([
@@ -704,15 +683,14 @@ fn run_without_from_plan_does_not_reuse_latest_plan_session() {
     assert_eq!(manifest["reused_plan_session_id"].as_str(), None);
     assert_eq!(manifest["session_kind"], "run");
     assert_eq!(manifest["plan_todo"]["summary"], "todo summary");
-    assert_ne!(latest_session_id(repo.path()), plan_session_id);
 }
 
 #[test]
-fn run_with_explicit_from_plan_reuses_selected_plan_session() {
+fn plan_subcommand_is_rejected() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
-    let plan_output = command(bin, repo.path())
+    let output = command(bin, repo.path())
         .args([
             "plan",
             "创建一个简单博客",
@@ -722,32 +700,29 @@ fn run_with_explicit_from_plan_reuses_selected_plan_session() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("run plan");
-    assert!(plan_output.status.success(), "{:?}", plan_output);
-    let plan_session_id = latest_session_id(repo.path());
+        .expect("run removed plan");
+    assert!(!output.status.success(), "{:?}", output);
+}
 
-    let run_output = command(bin, repo.path())
+#[test]
+fn run_rejects_from_plan_flag() {
+    let repo = make_repo("success");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let output = command(bin, repo.path())
         .args([
             "run",
             "创建一个简单博客",
             "--from-plan",
-            &plan_session_id,
+            "plan-123",
             "--ui",
             "minimal",
             "--target-dir",
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("run from selected plan");
-    assert!(run_output.status.success(), "{:?}", run_output);
-
-    let manifest = load_manifest(repo.path());
-    assert_eq!(
-        manifest["source_plan_session_id"].as_str(),
-        Some(plan_session_id.as_str())
-    );
-    assert_eq!(manifest["session_kind"], "run");
-    assert_eq!(manifest["plan_todo"]["summary"], "todo summary");
+        .expect("run removed from-plan");
+    assert!(!output.status.success(), "{:?}", output);
 }
 
 #[test]
@@ -792,13 +767,13 @@ fn run_can_resume_previous_session() {
 }
 
 #[test]
-fn continue_from_plan_creates_iteration_artifacts() {
+fn continue_from_run_creates_iteration_artifacts() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
     let first = command(bin, repo.path())
         .args([
-            "plan",
+            "run",
             "创建一个简单博客",
             "--ui",
             "minimal",
@@ -806,7 +781,7 @@ fn continue_from_plan_creates_iteration_artifacts() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("first plan");
+        .expect("first run");
     assert!(first.status.success(), "{:?}", first);
     let parent_session_id = latest_session_id(repo.path());
 
@@ -823,7 +798,7 @@ fn continue_from_plan_creates_iteration_artifacts() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("continue plan");
+        .expect("continue run");
     assert!(continued.status.success(), "{:?}", continued);
 
     let manifest = load_manifest(repo.path());
@@ -835,7 +810,7 @@ fn continue_from_plan_creates_iteration_artifacts() {
         manifest["root_session_id"].as_str(),
         Some(parent_session_id.as_str())
     );
-    assert_eq!(manifest["continuation_kind"], "plan_refine");
+    assert_eq!(manifest["continuation_kind"], "run_refine");
     assert_eq!(manifest["iteration_index"], 2);
     assert_eq!(manifest["plan_todo"]["iteration_index"], 2);
     assert_eq!(
@@ -1044,7 +1019,7 @@ fn clean_session_removes_selected_history_and_rewrites_latest_pointer() {
 
     let first = command(bin, repo.path())
         .args([
-            "plan",
+            "run",
             "创建一个简单博客",
             "--ui",
             "minimal",
@@ -1052,7 +1027,7 @@ fn clean_session_removes_selected_history_and_rewrites_latest_pointer() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("first plan");
+        .expect("first run");
     assert!(first.status.success(), "{:?}", first);
     let root_session_id = latest_session_id(repo.path());
 
@@ -1062,14 +1037,14 @@ fn clean_session_removes_selected_history_and_rewrites_latest_pointer() {
             "--session",
             &root_session_id,
             "--feedback",
-            "继续细化这版方案",
+            "继续细化这版实现",
             "--ui",
             "minimal",
             "--target-dir",
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("continue plan");
+        .expect("continue run");
     assert!(second.status.success(), "{:?}", second);
     let child_session_id = latest_session_id(repo.path());
 
@@ -1274,19 +1249,6 @@ verification_commands = ["pwd >/dev/null"]
 "#,
     )
     .expect("write other config");
-
-    let first = command(bin, repo.path())
-        .args([
-            "plan",
-            "创建一个简单博客",
-            "--ui",
-            "minimal",
-            "--target-dir",
-            repo.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("first plan");
-    assert!(first.status.success(), "{:?}", first);
 
     let mut second = command(bin, repo.path());
     second.current_dir(other.path());
