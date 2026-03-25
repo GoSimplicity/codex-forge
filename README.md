@@ -63,23 +63,55 @@
 
 ```text
 src/
-  app.rs            # CLI 命令分发
-  cli.rs            # 命令定义
+  cli/
+    mod.rs          # 命令定义
+  commands/
+    entry.rs        # CLI 入口分发
+    format.rs       # CLI/TUI 共用展示格式化
+    ...             # 各子命令处理
   config.rs         # 项目配置
   codex.rs          # Codex CLI 调用封装
   model.rs          # 通用枚举和最小模型
-  tui.rs            # 新 TUI
+  tui/
+    mod.rs          # TUI 入口
+    app.rs          # 状态对象
+    input.rs        # 按键处理
+    data.rs         # 数据刷新与动作
+    render.rs       # 界面渲染
   workspace.rs      # 目标仓库定位
   harness/
     mod.rs
-    backend.rs      # backend 协议与 envelope 解析
-    runtime.rs      # thread/run 执行主循环
+    backend/
+      mod.rs
+      prompt.rs
+      parser.rs
+    runtime/
+      mod.rs
+      chat.rs
+      engine.rs
+      subagent.rs
     sandbox.rs      # Docker 沙箱
-    store.rs        # thread/run/message/event/approval/artifact 持久化
-    tools.rs        # 内置工具执行
+    store/
+      mod.rs
+      threads.rs
+      runs.rs
+      artifacts.rs
+      jsonl.rs
+      ids.rs
+    tools/
+      mod.rs
+      catalog.rs
+      executor.rs
+      fs_tools.rs
+      search.rs
+      shell.rs
     types.rs        # 领域模型
 tests/
-  cli_harness_integration.rs
+  support/
+    mod.rs
+  thread_run_flow.rs
+  approval_and_artifact.rs
+  config_and_alias.rs
 ```
 
 运行时持久化目录：
@@ -255,9 +287,10 @@ cargo test -- --nocapture
 
 关键测试文件：
 
-- [tests/cli_harness_integration.rs](/Users/wangzijian/RustProject/codex-forge/tests/cli_harness_integration.rs)
-- [src/harness/store.rs](/Users/wangzijian/RustProject/codex-forge/src/harness/store.rs)
-- [src/harness/backend.rs](/Users/wangzijian/RustProject/codex-forge/src/harness/backend.rs)
+- [tests/thread_run_flow.rs](/Users/wangzijian/RustProject/codex-forge/tests/thread_run_flow.rs)
+- [tests/approval_and_artifact.rs](/Users/wangzijian/RustProject/codex-forge/tests/approval_and_artifact.rs)
+- [src/harness/store/mod.rs](/Users/wangzijian/RustProject/codex-forge/src/harness/store/mod.rs)
+- [src/harness/backend/mod.rs](/Users/wangzijian/RustProject/codex-forge/src/harness/backend/mod.rs)
 
 ## 说明
 

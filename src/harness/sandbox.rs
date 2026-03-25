@@ -42,8 +42,9 @@ impl DockerSandboxProvider {
         let workspace_root = run.run_dir.join("sandbox").join("workspace");
         let repo_workdir = workspace_root.join("repo");
         if repo_workdir.exists() {
-            fs::remove_dir_all(&repo_workdir)
-                .with_context(|| format!("清理旧 sandbox 工作区失败：{}", repo_workdir.display()))?;
+            fs::remove_dir_all(&repo_workdir).with_context(|| {
+                format!("清理旧 sandbox 工作区失败：{}", repo_workdir.display())
+            })?;
         }
         fs::create_dir_all(&workspace_root)
             .with_context(|| format!("创建 sandbox 工作区失败：{}", workspace_root.display()))?;

@@ -85,8 +85,8 @@ pub fn load_project_config(repo_root: &Path) -> Result<LoadedProjectConfig> {
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
-    let value: ProjectConfig = toml::from_str(&raw)
-        .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
+    let value: ProjectConfig =
+        toml::from_str(&raw).with_context(|| format!("解析配置文件失败：{}", path.display()))?;
     Ok(LoadedProjectConfig { path, value })
 }
 
@@ -95,7 +95,8 @@ pub fn init_default_config(repo_root: &Path) -> Result<PathBuf> {
     if path.exists() {
         return Ok(path);
     }
-    let content = toml::to_string_pretty(&ProjectConfig::default()).context("序列化默认配置失败")?;
+    let content =
+        toml::to_string_pretty(&ProjectConfig::default()).context("序列化默认配置失败")?;
     fs::write(&path, content).with_context(|| format!("写入默认配置失败：{}", path.display()))?;
     Ok(path)
 }
