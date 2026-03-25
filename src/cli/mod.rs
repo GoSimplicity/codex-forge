@@ -94,6 +94,10 @@ pub struct RunArgs {
 pub enum RunCommands {
     List(RunListArgs),
     Show(RunShowArgs),
+    Resume(RunResumeArgs),
+    Cancel(RunCancelArgs),
+    RetryNode(RunRetryNodeArgs),
+    Node(RunNodeShowArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -110,6 +114,50 @@ pub struct RunShowArgs {
     pub thread: String,
     #[arg(help = "run id")]
     pub run_id: String,
+    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunResumeArgs {
+    #[arg(long, help = "所属 thread id")]
+    pub thread: String,
+    #[arg(help = "run id")]
+    pub run_id: String,
+    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunCancelArgs {
+    #[arg(long, help = "所属 thread id")]
+    pub thread: String,
+    #[arg(help = "run id")]
+    pub run_id: String,
+    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunRetryNodeArgs {
+    #[arg(long, help = "所属 thread id")]
+    pub thread: String,
+    #[arg(long, help = "所属 run id")]
+    pub run: String,
+    #[arg(help = "task node id")]
+    pub task_node_id: String,
+    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunNodeShowArgs {
+    #[arg(long, help = "所属 thread id")]
+    pub thread: String,
+    #[arg(long, help = "所属 run id")]
+    pub run: String,
+    #[arg(help = "task node id")]
+    pub task_node_id: String,
     #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
     pub target_dir: Option<PathBuf>,
 }

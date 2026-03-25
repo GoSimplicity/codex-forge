@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::model::ThinkingMode;
 
@@ -15,11 +15,13 @@ pub fn ensure_codex_available() -> Result<String> {
     Ok(path.display().to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_text_once(
     prompt: &str,
     cwd: &Path,
     model: Option<&str>,
     thinking_mode: ThinkingMode,
+    timeout_secs: u64,
     output_path: &Path,
     log_path: &Path,
     max_retries: usize,
@@ -28,7 +30,17 @@ pub async fn run_text_once(
     let mut last_error = None;
 
     for attempt in 1..=attempts {
-        match run_text_attempt(prompt, cwd, model, thinking_mode, output_path, log_path).await {
+        match run_text_attempt(
+            prompt,
+            cwd,
+            model,
+            thinking_mode,
+            timeout_secs,
+            output_path,
+            log_path,
+        )
+        .await
+        {
             Ok(content) => return Ok(content),
             Err(error) => {
                 append_text(
@@ -52,6 +64,7 @@ async fn run_text_attempt(
     cwd: &Path,
     model: Option<&str>,
     thinking_mode: ThinkingMode,
+    timeout_secs: u64,
     output_path: &Path,
     log_path: &Path,
 ) -> Result<String> {
@@ -78,9 +91,9 @@ async fn run_text_attempt(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = command
-        .output()
+    let output = timeout(Duration::from_secs(timeout_secs.max(1)), command.output())
         .await
+        .map_err(|_| anyhow!("Codex 文本调用超时（>{timeout_secs}s）"))?
         .context("执行 codex exec 文本调用失败")?;
 
     let mut combined = Vec::new();

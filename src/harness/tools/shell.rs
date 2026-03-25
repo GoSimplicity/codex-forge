@@ -14,15 +14,27 @@ pub(super) fn execute_run_shell(
     run: &HarnessRunManifest,
     sandbox: &SandboxState,
     call: &ToolCallRequest,
+    task_node_id: Option<&str>,
+    subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let command = required_string_alias(&call.arguments, &["command", "cmd"])?;
     let provider = DockerSandboxProvider {
         image: sandbox.image.clone(),
     };
     let result = provider.exec_shell(sandbox, &command)?;
-    shell_result_to_artifacts(store, thread, run, "run-shell", command, result)
+    shell_result_to_artifacts(
+        store,
+        thread,
+        run,
+        "run-shell",
+        command,
+        result,
+        task_node_id,
+        subagent_id,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shell_result_to_artifacts(
     store: &HarnessStore,
     thread: &HarnessThreadManifest,
@@ -30,6 +42,8 @@ fn shell_result_to_artifacts(
     label: &str,
     command: String,
     result: ShellExecResult,
+    task_node_id: Option<&str>,
+    subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let combined = format!(
         "$ {command}\n[exit={:?}]\nstdout:\n{}\nstderr:\n{}",
@@ -42,6 +56,8 @@ fn shell_result_to_artifacts(
         label,
         ArtifactKind::SandboxLog,
         &combined,
+        task_node_id,
+        subagent_id,
     )?;
     Ok(ToolExecutionResult {
         message: if result.success {

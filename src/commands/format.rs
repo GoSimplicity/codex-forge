@@ -56,7 +56,30 @@ pub fn describe_event(event: &HarnessEvent) -> String {
             status,
             ..
         } => format!("子代理 `{subagent_id}` 已结束：{}", status_label(*status)),
+        HarnessEvent::TaskGraphCreated {
+            graph_id, strategy, ..
+        } => format!("创建任务图 `{graph_id}`：{:?}", strategy),
+        HarnessEvent::TaskNodeReady {
+            task_node_id, kind, ..
+        } => format!("节点 `{task_node_id}` 已就绪：{:?}", kind),
+        HarnessEvent::TaskNodeStarted {
+            task_node_id, kind, ..
+        } => format!("节点 `{task_node_id}` 开始执行：{:?}", kind),
+        HarnessEvent::TaskNodeCompleted {
+            task_node_id,
+            status,
+            ..
+        } => format!("节点 `{task_node_id}` 已结束：{:?}", status),
+        HarnessEvent::TaskNodeFailed {
+            task_node_id,
+            error,
+            ..
+        } => format!("节点 `{task_node_id}` 失败：{error}"),
+        HarnessEvent::TaskNodeRetried { task_node_id, .. } => {
+            format!("节点 `{task_node_id}` 已重试")
+        }
         HarnessEvent::RunCompleted { run_id, .. } => format!("run `{run_id}` 已完成"),
+        HarnessEvent::RunCancelled { run_id, .. } => format!("run `{run_id}` 已取消"),
         HarnessEvent::RunFailed { run_id, error, .. } => {
             format!("run `{run_id}` 失败：{error}")
         }
@@ -110,6 +133,12 @@ pub fn artifact_kind_label(kind: ArtifactKind) -> &'static str {
         ArtifactKind::ToolResult => "tool_result",
         ArtifactKind::SandboxLog => "sandbox_log",
         ArtifactKind::SandboxSnapshot => "sandbox_snapshot",
+        ArtifactKind::MemorySnapshot => "memory_snapshot",
+        ArtifactKind::PlanSnapshot => "plan_snapshot",
+        ArtifactKind::ContractSnapshot => "contract_snapshot",
+        ArtifactKind::ProgressSnapshot => "progress_snapshot",
+        ArtifactKind::EvaluationSnapshot => "evaluation_snapshot",
+        ArtifactKind::SessionBootstrap => "session_bootstrap",
     }
 }
 

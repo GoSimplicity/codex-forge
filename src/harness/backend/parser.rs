@@ -23,6 +23,10 @@ pub fn parse_turn_envelope(raw: &str) -> Result<TurnEnvelope> {
         tool_calls: Vec::new(),
         subagent_calls: Vec::new(),
         final_response: true,
+        state_update: None,
+        selected_feature_id: None,
+        evaluation: None,
+        needs_handoff: false,
     })
 }
 

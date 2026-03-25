@@ -48,7 +48,15 @@ fn run_show(args: ArtifactShowArgs) -> Result<()> {
     println!("path: {}", artifact.path.display());
     if matches!(
         artifact.kind,
-        ArtifactKind::Text | ArtifactKind::ToolResult | ArtifactKind::SandboxLog
+        ArtifactKind::Text
+            | ArtifactKind::ToolResult
+            | ArtifactKind::SandboxLog
+            | ArtifactKind::MemorySnapshot
+            | ArtifactKind::PlanSnapshot
+            | ArtifactKind::ContractSnapshot
+            | ArtifactKind::ProgressSnapshot
+            | ArtifactKind::EvaluationSnapshot
+            | ArtifactKind::SessionBootstrap
     ) {
         println!();
         println!("{}", std::fs::read_to_string(&artifact.path)?);

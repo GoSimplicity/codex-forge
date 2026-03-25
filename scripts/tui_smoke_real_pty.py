@@ -358,84 +358,27 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
 
     try:
         start_mark = session.mark()
-        session.wait_for("启动首页", ["任务输入", "主操作"], timeout=15, since=start_mark)
+        session.wait_for("启动首页", ["Codex Forge", "Composer"], timeout=15, since=start_mark)
 
         mark = session.mark()
-        session.send("\r")
-        session.wait_for("打开任务编辑", ["编辑字段：任务描述"], timeout=5, since=mark)
-
-        session.send("真实 PTY smoke 脚本")
-        mark = session.mark()
-        session.send("\x13", pause=0.15)
-        session.wait_for("保存任务", ["内容已保存"], timeout=5, since=mark)
+        session.send("n", pause=0.15)
+        session.wait_for("创建 thread", ["已创建 thread"], timeout=5, since=mark)
 
         mark = session.mark()
-        session.send("\x1b[C")
-        session.send("\r")
-        session.wait_for("进入 Doctor", ["检查环境/运行中"], timeout=5, since=mark)
-        session.wait_for("Doctor 完成", ["检查环境 已结束：成功"], timeout=20, since=mark)
+        session.send("i", pause=0.15)
+        session.wait_for("进入输入模式", ["Enter 发送", "Esc 返回"], timeout=5, since=mark)
+
+        session.send("真实 PTY smoke")
 
         mark = session.mark()
         session.send("\x1b", pause=0.15)
-        session.wait_for(
-            "Doctor 后返回开始页",
-            ["任务输入", "最近检查：绿色"],
-            timeout=8,
-            since=mark,
-        )
-
-        mark = session.mark()
-        session.send("\x1b[B")
-        session.send("\r")
-        session.wait_for("进入 Plan", ["先看方案/运行中"], timeout=5, since=mark)
-        session.wait_for(
-            "Plan 完成并进入历史页",
-            ["先看方案 已结束：成功", "历史会话", "当前会话"],
-            timeout=20,
-            since=mark,
-        )
-
-        mark = session.mark()
-        session.send("\x1b[C")
-        session.wait_for(
-            "切到历史动作区",
-            ["下一步", "执行此方案"],
-            timeout=5,
-            since=mark,
-        )
-        mark = session.mark()
-        session.send("\r")
-        session.wait_for("执行此方案并进入 Run", ["执行此方案/运行中"], timeout=5, since=mark)
-        session.wait_for(
-            "Run 完成并进入历史页",
-            ["历史会话", "当前会话", "目标目录状态"],
-            timeout=25,
-            since=mark,
-        )
-
-        mark = session.mark()
-        session.send("\x1b[C")
-        session.send("\x1b[B")
-        session.send("\x1b[B")
-        session.send("\x1b[B")
-        session.send("\r")
-        session.wait_for("进入 Replay", ["回放过程/运行中"], timeout=5, since=mark)
-        session.wait_for("Replay 完成", ["回放过程 已结束：成功"], timeout=10, since=mark)
-
-        mark = session.mark()
-        session.send("\x1b", pause=0.15)
-        session.wait_for(
-            "Replay 后回到历史页",
-            ["历史会话", "当前会话"],
-            timeout=8,
-            since=mark,
-        )
+        session.wait_for("退出输入模式", ["返回浏览模式"], timeout=5, since=mark)
 
         session.send("q", pause=0.1)
         exit_code = session.wait_for_exit(timeout=5)
         if exit_code != 0:
             raise SmokeFailure(f"TUI 退出码异常：{exit_code}")
-        log("[ok] 真实 PTY smoke 全链路通过")
+        log("[ok] 真实 PTY smoke 通过")
     except Exception:
         session.terminate()
         raise
@@ -443,7 +386,7 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="用真实 PTY 自动复走 codex-forge TUI 的 Start → Doctor → Plan → Run → History → Replay smoke。"
+        description="用真实 PTY 验证 codex-forge TUI 的启动、创建 thread、进入输入态和退出。"
     )
     parser.add_argument("--bin", help="显式指定 codex-forge 二进制路径；默认会先 cargo build")
     parser.add_argument(

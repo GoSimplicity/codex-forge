@@ -1,7 +1,7 @@
 # codex-forge
 
 `codex-forge` 现在是一个 **Rust 编写的本地 Codex harness 产品**。  
-它已经彻底切到新的 `thread / message / run / event` 架构，并以 **Docker run 级沙箱**、**结构化 backend 协议**、**approval**、**artifact**、**sub-agent**、**全新 CLI/TUI** 为核心能力。
+当前主路径已经演进为 long-running harness：保留 `thread / message / run / event` 外壳，同时在运行时内核中引入 **execution contract / progress ledger / evaluator gating / session bootstrap**，并以 **Docker run 级沙箱**、**结构化 backend 协议**、**approval**、**artifact**、**CLI/TUI** 为核心能力。
 
 当前仓库不再保留旧 `orchestrator / session / plan-run-continue / Brain Agent` 的兼容实现。
 
@@ -15,7 +15,9 @@
   -> run
   -> Docker 沙箱
   -> backend turn
-  -> tool calls / approvals / sub-agents
+  -> planner / generator / evaluator
+  -> tool calls / approvals
+  -> contract / progress / evaluation / bootstrap
   -> artifacts / replay events
   -> 最终回复
 ```
@@ -34,6 +36,14 @@
   - 工具结果、日志、文件产物
 - `replay`
   - 基于事件流的回放
+- `execution contract`
+  - 面向长期任务的结构化执行契约
+- `progress ledger`
+  - 记录已完成 feature、当前 feature、决策与下一步
+- `evaluation`
+  - evaluator 对单个 feature 的通过/失败结论
+- `session bootstrap`
+  - 供下一次 run 接手的最小上下文摘要
 
 ## 已实现能力
 
@@ -53,11 +63,14 @@
   - `search_files`
   - `run_shell`
   - `write_file`
+  - `read_contract` / `write_contract`
+  - `read_progress` / `update_progress`
+  - `record_evaluation`
+  - `create_session_bootstrap`
 - 基础 sub-agent 调度：
-  - `explorer`
-  - `implementer`
-  - `reviewer`
-  - `tester`
+  - `planner`
+  - `generator`
+  - `evaluator`
 
 ## 目录结构
 
@@ -127,6 +140,9 @@ tests/
       resolved.jsonl
     artifacts/
       index.jsonl
+    contract.json
+    progress.json
+    session-bootstrap.md
     runs/{run_id}/
       run.json
       events.jsonl
@@ -134,8 +150,10 @@ tests/
       approvals.jsonl
       artifacts.jsonl
       subagents.jsonl
+      evaluations.jsonl
       assistant.md
       codex.log
+      session-bootstrap.md
       sandbox/
         workspace/
 ```
@@ -153,8 +171,11 @@ codex-forge config validate
 默认 `codex-forge.toml` 包含：
 
 - backend 默认 model
+- backend 单次 turn 超时
 - Docker 镜像
 - runtime 最大 turn 次数
+- feature 重试上限
+- evaluator 最大轮次
 
 ### Thread
 
@@ -298,9 +319,17 @@ backend 现在不再返回自由文本，而是优先返回结构化 JSON envelo
     { "name": "read_file", "arguments": { "path": "README.md" } }
   ],
   "subagent_calls": [
-    { "kind": "explorer", "task": "分析当前模块" }
+    { "kind": "planner", "task": "分析当前模块" }
   ],
-  "final_response": false
+  "final_response": false,
+  "selected_feature_id": "feature-1",
+  "evaluation": {
+    "passed": true,
+    "reason": "当前 feature 已满足 done_when",
+    "follow_up_actions": [],
+    "retryable": false,
+    "feature_id": "feature-1"
+  }
 }
 ```
 
@@ -326,6 +355,8 @@ cargo test -- --nocapture
 - config 命令
 - backend envelope 解析
 - store roundtrip
+- contract / progress / evaluation roundtrip
+- 工具参数兼容与文件截断行为
 
 关键测试文件：
 

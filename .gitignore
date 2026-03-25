@@ -1,2 +1,4 @@
 /target
 /.codex-forge
+__pycache__/
+*.pyc

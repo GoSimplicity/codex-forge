@@ -18,7 +18,7 @@ pub async fn run() -> Result<()> {
         Some(Commands::Tui(args)) => run_tui(args).await?,
         Some(Commands::Thread(args)) => commands::thread::run(args)?,
         Some(Commands::Chat(args)) => chat::run(args).await?,
-        Some(Commands::Run(args)) => commands::runs::run(args)?,
+        Some(Commands::Run(args)) => commands::runs::run(args).await?,
         Some(Commands::Replay(args)) => commands::replay::run(args)?,
         Some(Commands::Approval(args)) => approval::run(args).await?,
         Some(Commands::Artifact(args)) => artifact::run(args)?,

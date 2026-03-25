@@ -7,7 +7,7 @@ pub(crate) enum FocusMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetailTab {
     Messages,
-    Runs,
+    Node,
     Approvals,
     Artifacts,
     Events,
@@ -17,7 +17,7 @@ impl DetailTab {
     pub(crate) fn all() -> [Self; 5] {
         [
             Self::Messages,
-            Self::Runs,
+            Self::Node,
             Self::Approvals,
             Self::Artifacts,
             Self::Events,
@@ -27,7 +27,7 @@ impl DetailTab {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Messages => "消息",
-            Self::Runs => "运行",
+            Self::Node => "节点",
             Self::Approvals => "审批",
             Self::Artifacts => "产物",
             Self::Events => "事件",
@@ -36,8 +36,8 @@ impl DetailTab {
 
     pub(crate) fn next(self) -> Self {
         match self {
-            Self::Messages => Self::Runs,
-            Self::Runs => Self::Approvals,
+            Self::Messages => Self::Node,
+            Self::Node => Self::Approvals,
             Self::Approvals => Self::Artifacts,
             Self::Artifacts => Self::Events,
             Self::Events => Self::Messages,
@@ -47,7 +47,7 @@ impl DetailTab {
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Messages => 0,
-            Self::Runs => 1,
+            Self::Node => 1,
             Self::Approvals => 2,
             Self::Artifacts => 3,
             Self::Events => 4,

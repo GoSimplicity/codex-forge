@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::cli::{ThreadArgs, ThreadCommands, ThreadListArgs, ThreadNewArgs, ThreadShowArgs};
 use crate::commands::format::{first_line, role_label, status_label};
-use crate::harness::HarnessStore;
+use crate::harness::{HarnessStore, MemoryLayer};
 use crate::workspace::resolve_target_dir;
 
 pub fn run(args: ThreadArgs) -> Result<()> {
@@ -53,6 +53,8 @@ fn run_show(args: ThreadShowArgs) -> Result<()> {
     let runs = store.list_runs(&args.thread_id)?;
     let approvals = store.list_pending_approvals(Some(&args.thread_id))?;
     let artifacts = store.list_artifacts(Some(&args.thread_id), None)?;
+    let working_memory = store.load_memory(&args.thread_id, MemoryLayer::Working)?;
+    let project_memory = store.load_memory(&args.thread_id, MemoryLayer::Project)?;
 
     println!("id: {}", thread.id);
     println!("title: {}", thread.title);
@@ -61,6 +63,8 @@ fn run_show(args: ThreadShowArgs) -> Result<()> {
     println!("runs: {}", thread.run_count);
     println!("pending approvals: {}", approvals.len());
     println!("artifacts: {}", artifacts.len());
+    println!("working memory: {}", working_memory.entries.len());
+    println!("project memory: {}", project_memory.entries.len());
     println!();
     println!("最近消息：");
     for message in messages.iter().rev().take(10).rev() {
@@ -79,6 +83,16 @@ fn run_show(args: ThreadShowArgs) -> Result<()> {
             status_label(run.status),
             run.summary.as_deref().unwrap_or("无摘要")
         );
+    }
+    println!();
+    println!("working memory：");
+    for entry in working_memory.entries.iter().rev().take(6).rev() {
+        println!("- {}", entry.content);
+    }
+    println!();
+    println!("project memory：");
+    for entry in project_memory.entries.iter().rev().take(6).rev() {
+        println!("- {}", entry.content);
     }
     Ok(())
 }

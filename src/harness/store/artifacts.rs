@@ -10,10 +10,13 @@ use super::ids::make_id;
 use super::jsonl::{append_jsonl, read_jsonl};
 
 impl HarnessStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn append_artifact(
         &self,
         thread_id: &str,
         run_id: &str,
+        task_node_id: Option<String>,
+        subagent_id: Option<String>,
         label: String,
         kind: ArtifactKind,
         path: PathBuf,
@@ -24,6 +27,8 @@ impl HarnessStore {
             id: make_id("artifact"),
             thread_id: thread_id.to_string(),
             run_id: run_id.to_string(),
+            task_node_id,
+            subagent_id,
             label,
             kind,
             path,

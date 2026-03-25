@@ -1,6 +1,7 @@
 mod catalog;
 mod executor;
 mod fs_tools;
+mod meta;
 mod search;
 mod shell;
 

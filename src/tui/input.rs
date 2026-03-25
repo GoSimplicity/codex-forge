@@ -17,6 +17,10 @@ impl TuiApp {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('j') | KeyCode::Down => self.select_next()?,
             KeyCode::Char('k') | KeyCode::Up => self.select_prev()?,
+            KeyCode::Char('h') => self.select_prev_run()?,
+            KeyCode::Char('l') => self.select_next_run()?,
+            KeyCode::Char('J') => self.select_next_task_node()?,
+            KeyCode::Char('K') => self.select_prev_task_node()?,
             KeyCode::Tab => self.detail_tab = self.detail_tab.next(),
             KeyCode::Char('i') => {
                 self.focus = FocusMode::Compose;
@@ -36,6 +40,9 @@ impl TuiApp {
             }
             KeyCode::Char('a') => self.approve_first_pending().await?,
             KeyCode::Char('x') => self.deny_first_pending().await?,
+            KeyCode::Char('s') => self.resume_selected_run().await?,
+            KeyCode::Char('c') => self.cancel_selected_run()?,
+            KeyCode::Char('R') => self.retry_selected_task_node().await?,
             KeyCode::Char('r') => {
                 self.refresh()?;
                 self.status = "已刷新".to_string();

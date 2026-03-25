@@ -25,6 +25,9 @@ impl HarnessStore {
         let approvals_dir = thread_dir.join("approvals");
         let artifacts_dir = thread_dir.join("artifacts");
         let memory_dir = thread_dir.join("memory");
+        let contract_path = thread_dir.join("contract.json");
+        let progress_path = thread_dir.join("progress.json");
+        let bootstrap_path = thread_dir.join("session-bootstrap.md");
         let messages_path = thread_dir.join("messages.jsonl");
         fs::create_dir_all(&runs_dir)
             .with_context(|| format!("创建 thread 目录失败：{}", thread_dir.display()))?;
@@ -58,6 +61,9 @@ impl HarnessStore {
             approvals_dir,
             artifacts_dir,
             memory_dir,
+            contract_path,
+            progress_path,
+            bootstrap_path,
         };
         self.persist_thread(&manifest)?;
         Ok(manifest)
@@ -84,9 +90,18 @@ impl HarnessStore {
                 Ok(raw) => raw,
                 Err(_) => continue,
             };
-            let Ok(manifest) = serde_json::from_str::<HarnessThreadManifest>(&raw) else {
+            let Ok(mut manifest) = serde_json::from_str::<HarnessThreadManifest>(&raw) else {
                 continue;
             };
+            if manifest.contract_path.as_os_str().is_empty() {
+                manifest.contract_path = manifest.thread_dir.join("contract.json");
+            }
+            if manifest.progress_path.as_os_str().is_empty() {
+                manifest.progress_path = manifest.thread_dir.join("progress.json");
+            }
+            if manifest.bootstrap_path.as_os_str().is_empty() {
+                manifest.bootstrap_path = manifest.thread_dir.join("session-bootstrap.md");
+            }
             threads.push(manifest);
         }
 
@@ -98,8 +113,18 @@ impl HarnessStore {
         let path = self.thread_manifest_path(thread_id);
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("读取 thread manifest 失败：{}", path.display()))?;
-        serde_json::from_str(&raw)
-            .with_context(|| format!("解析 thread manifest 失败：{}", path.display()))
+        let mut thread: HarnessThreadManifest = serde_json::from_str(&raw)
+            .with_context(|| format!("解析 thread manifest 失败：{}", path.display()))?;
+        if thread.contract_path.as_os_str().is_empty() {
+            thread.contract_path = thread.thread_dir.join("contract.json");
+        }
+        if thread.progress_path.as_os_str().is_empty() {
+            thread.progress_path = thread.thread_dir.join("progress.json");
+        }
+        if thread.bootstrap_path.as_os_str().is_empty() {
+            thread.bootstrap_path = thread.thread_dir.join("session-bootstrap.md");
+        }
+        Ok(thread)
     }
 
     pub fn append_message(

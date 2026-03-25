@@ -5,13 +5,15 @@ use anyhow::Result;
 use crate::config::ProjectConfig;
 use crate::model::ThinkingMode;
 
-use super::engine::{execute_and_record_tool, run_execution};
+use super::engine::{
+    cancel_run, execute_and_record_tool, reset_task_node_for_retry, run_execution,
+};
 use crate::harness::sandbox::DockerSandboxProvider;
 use crate::harness::store::HarnessStore;
 use crate::harness::tools::{mark_tool_approved, mark_tool_resolution};
 use crate::harness::types::{
     ApprovalStatus, ChatRunOutcome, HarnessEvent, HarnessMessageRole, HarnessRunManifest,
-    HarnessRunStatus, ToolCallStatus,
+    HarnessRunStatus, TaskNodeStatus, ToolCallStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,13 @@ pub async fn resolve_approval_and_resume(
             format!("工具 `{}` 未执行：用户拒绝审批。", tool.name),
             Some(run.id.clone()),
         )?;
+        if let Some(task_node_id) = approval.task_node_id.as_deref()
+            && let Ok(mut node) = store.load_task_node(&run, task_node_id)
+        {
+            node.status = TaskNodeStatus::Skipped;
+            node.output_summary = Some("审批被拒绝，节点已跳过".to_string());
+            store.update_task_node(&run, &node)?;
+        }
         run.status = HarnessRunStatus::Completed;
         run.summary = Some("审批被拒绝，run 已结束".to_string());
         if let Some(sandbox) = &run.sandbox {
@@ -112,7 +121,62 @@ pub async fn resolve_approval_and_resume(
 
     let thread = store.load_thread(thread_id)?;
     execute_and_record_tool(&store, &thread, &mut run, &approval.tool_call, &tool)?;
+    if let Some(task_node_id) = approval.task_node_id.as_deref()
+        && let Ok(mut node) = store.load_task_node(&run, task_node_id)
+    {
+        node.status = TaskNodeStatus::Ready;
+        node.output_summary = Some(format!("审批 `{}` 已通过，继续执行", approval.id));
+        store.update_task_node(&run, &node)?;
+        run.active_task_node_id = Some(node.id);
+    }
+    run.status = HarnessRunStatus::Running;
+    run.blocked_reason = None;
+    store.update_run(thread_id, &run)?;
 
+    run_execution(repo_root, config, &store, &mut run).await?;
+    Ok(run)
+}
+
+pub async fn resume_run(
+    repo_root: &Path,
+    config: &ProjectConfig,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<HarnessRunManifest> {
+    let store = HarnessStore::new(repo_root);
+    let mut run = store.load_run(thread_id, run_id)?;
+    run.status = HarnessRunStatus::Running;
+    run.blocked_reason = None;
+    store.update_run(thread_id, &run)?;
+    run_execution(repo_root, config, &store, &mut run).await?;
+    Ok(run)
+}
+
+pub fn cancel_active_run(
+    repo_root: &Path,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<HarnessRunManifest> {
+    let store = HarnessStore::new(repo_root);
+    let mut run = store.load_run(thread_id, run_id)?;
+    cancel_run(&store, &mut run)?;
+    Ok(run)
+}
+
+pub async fn retry_task_node_and_resume(
+    repo_root: &Path,
+    config: &ProjectConfig,
+    thread_id: &str,
+    run_id: &str,
+    task_node_id: &str,
+) -> Result<HarnessRunManifest> {
+    let store = HarnessStore::new(repo_root);
+    let mut run = store.load_run(thread_id, run_id)?;
+    reset_task_node_for_retry(&store, &run, task_node_id)?;
+    run.active_task_node_id = Some(task_node_id.to_string());
+    run.status = HarnessRunStatus::Running;
+    run.blocked_reason = None;
+    store.update_run(thread_id, &run)?;
     run_execution(repo_root, config, &store, &mut run).await?;
     Ok(run)
 }

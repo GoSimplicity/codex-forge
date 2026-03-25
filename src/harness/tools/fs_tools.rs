@@ -1,6 +1,8 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use crate::harness::store::HarnessStore;
 use crate::harness::types::{
@@ -14,17 +16,29 @@ pub(super) fn execute_list_tree(
     thread: &HarnessThreadManifest,
     run: &HarnessRunManifest,
     sandbox: &SandboxState,
+    call: &ToolCallRequest,
+    task_node_id: Option<&str>,
+    subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
-    let mut entries = walkdir::WalkDir::new(&sandbox.repo_workdir)
-        .max_depth(3)
+    let root = resolve_root(
+        &sandbox.repo_workdir,
+        call.arguments.get("path").and_then(Value::as_str),
+    );
+    let max_depth = call
+        .arguments
+        .get("max_depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(3) as usize;
+    let mut entries = walkdir::WalkDir::new(&root)
+        .max_depth(max_depth)
         .into_iter()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path() != sandbox.repo_workdir)
+        .filter(|entry| entry.path() != root)
         .take(80)
         .map(|entry| {
             entry
                 .path()
-                .strip_prefix(&sandbox.repo_workdir)
+                .strip_prefix(&root)
                 .unwrap_or(entry.path())
                 .display()
                 .to_string()
@@ -32,8 +46,16 @@ pub(super) fn execute_list_tree(
         .collect::<Vec<_>>();
     entries.sort();
     let text = entries.join("\n");
-    let artifact =
-        materialize_text_artifact(store, thread, run, "tree", ArtifactKind::ToolResult, &text)?;
+    let artifact = materialize_text_artifact(
+        store,
+        thread,
+        run,
+        "tree",
+        ArtifactKind::ToolResult,
+        &text,
+        task_node_id,
+        subagent_id,
+    )?;
     Ok(ToolExecutionResult {
         message: format!("list_tree 结果：\n{}", text),
         artifacts: vec![artifact],
@@ -46,11 +68,17 @@ pub(super) fn execute_read_file(
     run: &HarnessRunManifest,
     sandbox: &SandboxState,
     call: &ToolCallRequest,
+    task_node_id: Option<&str>,
+    subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let path = required_string_alias(&call.arguments, &["path"])?;
     let target = sandbox.repo_workdir.join(&path);
     let content = fs::read_to_string(&target)
         .with_context(|| format!("读取文件失败：{}", target.display()))?;
+    let content = truncate_utf8_on_char_boundary(
+        content,
+        call.arguments.get("max_bytes").and_then(Value::as_u64),
+    );
     let artifact = materialize_text_artifact(
         store,
         thread,
@@ -58,6 +86,8 @@ pub(super) fn execute_read_file(
         "read-file",
         ArtifactKind::ToolResult,
         &content,
+        task_node_id,
+        subagent_id,
     )?;
     Ok(ToolExecutionResult {
         message: format!("read_file `{path}` 成功：\n{}", content),
@@ -71,6 +101,8 @@ pub(super) fn execute_write_file(
     run: &HarnessRunManifest,
     sandbox: &SandboxState,
     call: &ToolCallRequest,
+    task_node_id: Option<&str>,
+    subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let path = required_string_alias(&call.arguments, &["path"])?
         .trim()
@@ -85,6 +117,8 @@ pub(super) fn execute_write_file(
     let artifact = store.append_artifact(
         &thread.id,
         &run.id,
+        task_node_id.map(ToOwned::to_owned),
+        subagent_id.map(ToOwned::to_owned),
         format!("write-file:{path}"),
         ArtifactKind::File,
         target,
@@ -93,4 +127,120 @@ pub(super) fn execute_write_file(
         message: format!("write_file `{path}` 成功"),
         artifacts: vec![artifact],
     })
+}
+
+fn resolve_root(repo_workdir: &Path, relative: Option<&str>) -> PathBuf {
+    relative
+        .map(|path| repo_workdir.join(path))
+        .unwrap_or_else(|| repo_workdir.to_path_buf())
+}
+
+fn truncate_utf8_on_char_boundary(content: String, max_bytes: Option<u64>) -> String {
+    let Some(max_bytes) = max_bytes else {
+        return content;
+    };
+    let max_bytes = max_bytes as usize;
+    if content.len() <= max_bytes {
+        return content;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use crate::harness::store::HarnessStore;
+    use crate::harness::types::{SandboxState, ToolCallRequest};
+    use crate::model::ThinkingMode;
+
+    use super::{execute_list_tree, execute_read_file};
+
+    fn setup() -> (
+        TempDir,
+        HarnessStore,
+        crate::harness::HarnessThreadManifest,
+        crate::harness::HarnessRunManifest,
+        SandboxState,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(dir.path());
+        let thread = store.create_thread(Some("文件工具")).expect("thread");
+        let run = store
+            .create_run(
+                &thread.id,
+                Some("gpt-5".to_string()),
+                ThinkingMode::Balanced,
+            )
+            .expect("run");
+        let repo_workdir = run.run_dir.join("sandbox").join("repo");
+        fs::create_dir_all(repo_workdir.join("nested")).expect("mkdir");
+        let sandbox = SandboxState {
+            provider: "test".to_string(),
+            image: "test-image".to_string(),
+            container_name: "test-box".to_string(),
+            workspace_root: run.run_dir.join("sandbox"),
+            repo_workdir,
+            active: true,
+        };
+        (dir, store, thread, run, sandbox)
+    }
+
+    #[test]
+    fn read_file_honors_max_bytes() {
+        let (_dir, store, thread, run, sandbox) = setup();
+        fs::write(
+            sandbox.repo_workdir.join("README.md"),
+            "你好，codex-forge\n",
+        )
+        .expect("write");
+        let result = execute_read_file(
+            &store,
+            &thread,
+            &run,
+            &sandbox,
+            &ToolCallRequest {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "README.md",
+                    "max_bytes": 4
+                }),
+            },
+            None,
+            None,
+        )
+        .expect("read");
+        assert!(result.message.contains("你"));
+        assert!(!result.message.contains("forg"));
+    }
+
+    #[test]
+    fn list_tree_honors_path_and_depth() {
+        let (_dir, store, thread, run, sandbox) = setup();
+        fs::write(sandbox.repo_workdir.join("nested").join("demo.txt"), "ok\n").expect("write");
+        let result = execute_list_tree(
+            &store,
+            &thread,
+            &run,
+            &sandbox,
+            &ToolCallRequest {
+                name: "list_tree".to_string(),
+                arguments: serde_json::json!({
+                    "path": "nested",
+                    "max_depth": 2
+                }),
+            },
+            None,
+            None,
+        )
+        .expect("list");
+        assert!(result.message.contains("demo.txt"));
+        assert!(!result.message.contains("nested/demo.txt"));
+    }
 }

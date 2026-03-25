@@ -1,7 +1,9 @@
 mod artifacts;
 mod ids;
 mod jsonl;
+mod memory;
 mod runs;
+mod state;
 mod threads;
 
 use std::path::{Path, PathBuf};
@@ -41,7 +43,10 @@ impl HarnessStore {
 mod tests {
     use tempfile::TempDir;
 
-    use crate::harness::types::{ApprovalStatus, HarnessMessageRole, ToolCallRequest};
+    use crate::harness::types::{
+        AcceptanceCriterion, ApprovalStatus, EvaluationDecision, ExecutionContract, FeatureSlice,
+        FeatureSliceStatus, HarnessMessageRole, MemoryLayer, ProgressLedger, ToolCallRequest,
+    };
     use crate::model::ThinkingMode;
 
     use super::HarnessStore;
@@ -75,6 +80,8 @@ mod tests {
                     name: "write_file".to_string(),
                     arguments: serde_json::json!({"path":"a.txt","content":"hi"}),
                 },
+                None,
+                None,
             )
             .expect("append tool");
         let approval = store
@@ -98,5 +105,109 @@ mod tests {
             .resolve_approval(&thread.id, &approval.id, ApprovalStatus::Approved)
             .expect("resolve");
         assert_eq!(resolved.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn memory_roundtrip_works() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(dir.path());
+        let thread = store.create_thread(Some("记忆")).expect("thread");
+        store
+            .append_memory_entry(
+                &thread.id,
+                MemoryLayer::Working,
+                "实现路径是 run -> task graph".to_string(),
+                "test".to_string(),
+                None,
+                None,
+            )
+            .expect("append working");
+        store
+            .append_memory_entry(
+                &thread.id,
+                MemoryLayer::Project,
+                "项目默认使用中文".to_string(),
+                "test".to_string(),
+                None,
+                None,
+            )
+            .expect("append project");
+        let working = store
+            .load_memory(&thread.id, MemoryLayer::Working)
+            .expect("load working");
+        let project = store
+            .load_memory(&thread.id, MemoryLayer::Project)
+            .expect("load project");
+        assert_eq!(working.entries.len(), 1);
+        assert_eq!(project.entries.len(), 1);
+    }
+
+    #[test]
+    fn contract_progress_and_evaluation_roundtrip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(dir.path());
+        let thread = store.create_thread(Some("长任务")).expect("thread");
+        let run = store
+            .create_run(&thread.id, None, ThinkingMode::Balanced)
+            .expect("run");
+
+        let contract = ExecutionContract {
+            goal: "实现长期 harness".to_string(),
+            non_goals: vec!["不重写 CLI".to_string()],
+            constraints: vec!["保持兼容".to_string()],
+            ordered_features: vec![FeatureSlice {
+                id: "feature-1".to_string(),
+                title: "引入 contract".to_string(),
+                intent: "持久化执行契约".to_string(),
+                scope_paths: vec!["src/harness".to_string()],
+                done_when: vec![AcceptanceCriterion {
+                    id: "acc-1".to_string(),
+                    description: "contract 已落盘".to_string(),
+                }],
+                status: FeatureSliceStatus::Pending,
+            }],
+            global_acceptance: vec![],
+            delivery_notes: vec![],
+            updated_at: chrono::Utc::now(),
+        };
+        store
+            .save_execution_contract(&thread.id, &contract)
+            .expect("save contract");
+        let loaded_contract = store
+            .load_execution_contract(&thread.id)
+            .expect("load contract");
+        assert_eq!(loaded_contract.goal, contract.goal);
+
+        let progress = ProgressLedger {
+            goal: contract.goal.clone(),
+            completed_features: vec![],
+            current_feature: Some("feature-1".to_string()),
+            known_failures: vec![],
+            decisions: vec!["先做持久化".to_string()],
+            open_questions: vec![],
+            next_step: Some("执行 feature-1".to_string()),
+            updated_at: chrono::Utc::now(),
+        };
+        store
+            .save_progress_ledger(&thread.id, &progress)
+            .expect("save progress");
+        let loaded_progress = store
+            .load_progress_ledger(&thread.id)
+            .expect("load progress");
+        assert_eq!(loaded_progress.current_feature, progress.current_feature);
+
+        let decision = EvaluationDecision {
+            passed: true,
+            reason: "验证通过".to_string(),
+            follow_up_actions: vec![],
+            retryable: false,
+            feature_id: Some("feature-1".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        store
+            .append_evaluation(&run, &decision)
+            .expect("append evaluation");
+        let evaluations = store.list_evaluations(&run).expect("list evaluations");
+        assert_eq!(evaluations.len(), 1);
     }
 }

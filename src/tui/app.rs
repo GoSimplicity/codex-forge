@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::config::{ProjectConfig, load_project_config};
 use crate::harness::{
     ApprovalRecord, ArtifactRecord, HarnessEventRecord, HarnessMessage, HarnessRunManifest,
-    HarnessStore, HarnessThreadManifest,
+    HarnessStore, HarnessThreadManifest, MemoryEntry, TaskNodeRecord,
 };
 
 use super::tabs::{DetailTab, FocusMode};
@@ -16,11 +16,16 @@ pub(crate) struct TuiApp {
     pub(crate) config: ProjectConfig,
     pub(crate) threads: Vec<HarnessThreadManifest>,
     pub(crate) selected_thread_id: Option<String>,
+    pub(crate) selected_run_id: Option<String>,
+    pub(crate) selected_task_node_id: Option<String>,
     pub(crate) messages: Vec<HarnessMessage>,
     pub(crate) runs: Vec<HarnessRunManifest>,
+    pub(crate) task_nodes: Vec<TaskNodeRecord>,
     pub(crate) events: Vec<HarnessEventRecord>,
     pub(crate) approvals: Vec<ApprovalRecord>,
     pub(crate) artifacts: Vec<ArtifactRecord>,
+    pub(crate) working_memory: Vec<MemoryEntry>,
+    pub(crate) project_memory: Vec<MemoryEntry>,
     pub(crate) detail_tab: DetailTab,
     pub(crate) focus: FocusMode,
     pub(crate) composer: String,
@@ -36,16 +41,21 @@ impl TuiApp {
             config,
             threads: Vec::new(),
             selected_thread_id,
+            selected_run_id: None,
+            selected_task_node_id: None,
             messages: Vec::new(),
             runs: Vec::new(),
+            task_nodes: Vec::new(),
             events: Vec::new(),
             approvals: Vec::new(),
             artifacts: Vec::new(),
+            working_memory: Vec::new(),
+            project_memory: Vec::new(),
             detail_tab: DetailTab::Messages,
             focus: FocusMode::Browse,
             composer: String::new(),
             status:
-                "i 输入，Enter 发送，a 通过审批，x 拒绝审批，n 新建 thread，Tab 切换视图，q 退出"
+                "j/k thread | h/l run | J/K node | i 输入 | a/x 审批 | s 恢复 | c 取消 | R 重试节点 | q 退出"
                     .to_string(),
         })
     }

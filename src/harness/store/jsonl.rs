@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::harness::types::{ApprovalRecord, SubagentRecord, ToolCallRecord};
+use crate::harness::types::{ApprovalRecord, SubagentRecord, TaskNodeRecord, ToolCallRecord};
 
 pub(super) fn append_jsonl<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     ensure_parent(path)?;
@@ -81,6 +81,12 @@ impl RecordId for ApprovalRecord {
 }
 
 impl RecordId for SubagentRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl RecordId for TaskNodeRecord {
     fn record_id(&self) -> &str {
         &self.id
     }

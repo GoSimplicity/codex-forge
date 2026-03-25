@@ -11,7 +11,7 @@ pub fn render_lead_turn_prompt(request: &BackendTurnRequest<'_>) -> String {
     rendered.push_str("你只能返回一个 JSON 对象，不要输出 Markdown，不要输出额外说明。\n");
     rendered.push_str("JSON 结构必须是：\n");
     rendered.push_str(
-        r#"{"assistant_message":"给用户或工具前的说明","tool_calls":[{"name":"tool_name","arguments":{}}],"subagent_calls":[{"kind":"explorer|implementer|reviewer|tester","task":"..."}],"final_response":false}"#,
+        r#"{"assistant_message":"给用户或工具前的说明","tool_calls":[{"name":"tool_name","arguments":{}}],"subagent_calls":[{"kind":"planner|generator|evaluator","task":"..."}],"final_response":false,"selected_feature_id":"feature-1","evaluation":{"passed":true,"reason":"...","follow_up_actions":[],"retryable":false,"feature_id":"feature-1","created_at":"2026-01-01T00:00:00Z"},"needs_handoff":false}"#,
     );
     rendered.push('\n');
     rendered.push_str("规则：\n");
@@ -20,17 +20,48 @@ pub fn render_lead_turn_prompt(request: &BackendTurnRequest<'_>) -> String {
     rendered.push_str("- 高风险工具会被要求审批，你不需要自己模拟审批结果。\n");
     rendered.push_str("- subagent_calls 只在确实需要分工时使用；避免无限派生。\n");
     rendered.push_str("- 不要返回未知工具名。\n");
+    rendered.push_str("- 优先复用 memory 和 skills，再决定是否读更多上下文。\n");
+    rendered.push_str(
+        "- 如果你是 evaluator 语义，优先返回 evaluation 字段；assistant_message 只写结论摘要。\n",
+    );
     rendered.push_str(
         "- run_shell 参数优先使用 {\"command\":\"...\"}；兼容 cmd，但优先输出 command。\n",
     );
+    rendered.push_str("- list_tree 参数可选 path、max_depth。\n");
     rendered.push_str("- read_file 参数至少包含 path，可选 max_bytes。\n");
+    rendered.push_str(
+        "- search_files 参数使用 pattern；兼容 query/q/keyword，可选 path、max_results。\n",
+    );
     rendered.push_str("- write_file 参数使用 path 与 content。\n\n");
+    rendered.push_str(
+        "- apply_patch 优先使用 {\"path\":\"...\",\"search\":\"...\",\"replace\":\"...\"}。\n",
+    );
+    rendered.push_str("- write_contract 参数使用 content(JSON 字符串) 或 contract(object)。\n");
+    rendered.push_str("- update_progress 参数使用 progress(object)。\n");
+    rendered.push_str("- record_evaluation 参数使用 evaluation(object)。\n");
+    rendered.push_str("- remember_memory 参数使用 layer=working|project, content, source。\n");
+    rendered.push_str("- read_skill 参数使用 name。\n\n");
     rendered.push_str(&format!("线程标题：{}\n", request.thread.title));
     rendered.push_str(&format!(
         "仓库根目录：{}\n",
         request.thread.repo_root.display()
     ));
     rendered.push_str(&format!("补充约束：{}\n", request.system_hint));
+    if !request.memory_context.trim().is_empty() {
+        rendered.push_str("\nMemory：\n");
+        rendered.push_str(request.memory_context);
+        rendered.push('\n');
+    }
+    if !request.skills_context.trim().is_empty() {
+        rendered.push_str("\nSkills：\n");
+        rendered.push_str(request.skills_context);
+        rendered.push('\n');
+    }
+    if !request.session_context.trim().is_empty() {
+        rendered.push_str("\nLong-Running Context：\n");
+        rendered.push_str(request.session_context);
+        rendered.push('\n');
+    }
     rendered.push_str("\n可用工具：\n");
     for tool in request.tools {
         rendered.push_str(&format!(

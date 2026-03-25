@@ -6,6 +6,7 @@ use chrono::Utc;
 use crate::harness::types::{
     AgentBackendKind, ApprovalRecord, ApprovalStatus, HarnessEvent, HarnessEventRecord,
     HarnessRunManifest, HarnessRunStatus, HarnessThreadManifest, SubagentKind, SubagentRecord,
+    TaskGraphManifest, TaskGraphStrategy, TaskNodeKind, TaskNodeRecord, TaskNodeStatus,
     ToolCallRecord, ToolCallRequest, ToolCallStatus,
 };
 use crate::model::ThinkingMode;
@@ -39,6 +40,7 @@ impl HarnessStore {
             turn_count: 0,
             summary: None,
             last_error: None,
+            blocked_reason: None,
             run_dir: run_dir.clone(),
             events_path: run_dir.join("events.jsonl"),
             output_path: run_dir.join("assistant.md"),
@@ -47,6 +49,11 @@ impl HarnessStore {
             approvals_path: run_dir.join("approvals.jsonl"),
             artifacts_path: run_dir.join("artifacts.jsonl"),
             subagents_path: run_dir.join("subagents.jsonl"),
+            task_graph_path: run_dir.join("task-graph.json"),
+            task_nodes_path: run_dir.join("task-nodes.jsonl"),
+            evaluation_log_path: run_dir.join("evaluations.jsonl"),
+            bootstrap_path: run_dir.join("session-bootstrap.md"),
+            active_task_node_id: None,
             sandbox: None,
         };
         self.persist_run(thread_id, &run)?;
@@ -73,8 +80,15 @@ impl HarnessStore {
         let path = self.run_manifest_path(thread_id, run_id);
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("读取 run manifest 失败：{}", path.display()))?;
-        serde_json::from_str(&raw)
-            .with_context(|| format!("解析 run manifest 失败：{}", path.display()))
+        let mut run: HarnessRunManifest = serde_json::from_str(&raw)
+            .with_context(|| format!("解析 run manifest 失败：{}", path.display()))?;
+        if run.evaluation_log_path.as_os_str().is_empty() {
+            run.evaluation_log_path = run.run_dir.join("evaluations.jsonl");
+        }
+        if run.bootstrap_path.as_os_str().is_empty() {
+            run.bootstrap_path = run.run_dir.join("session-bootstrap.md");
+        }
+        Ok(run)
     }
 
     pub fn list_runs(&self, thread_id: &str) -> Result<Vec<HarnessRunManifest>> {
@@ -99,9 +113,15 @@ impl HarnessStore {
                 Ok(raw) => raw,
                 Err(_) => continue,
             };
-            let Ok(manifest) = serde_json::from_str::<HarnessRunManifest>(&raw) else {
+            let Ok(mut manifest) = serde_json::from_str::<HarnessRunManifest>(&raw) else {
                 continue;
             };
+            if manifest.evaluation_log_path.as_os_str().is_empty() {
+                manifest.evaluation_log_path = manifest.run_dir.join("evaluations.jsonl");
+            }
+            if manifest.bootstrap_path.as_os_str().is_empty() {
+                manifest.bootstrap_path = manifest.run_dir.join("session-bootstrap.md");
+            }
             runs.push(manifest);
         }
         runs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
@@ -135,6 +155,8 @@ impl HarnessStore {
         &self,
         run: &HarnessRunManifest,
         call: &ToolCallRequest,
+        task_node_id: Option<String>,
+        subagent_id: Option<String>,
     ) -> Result<ToolCallRecord> {
         let record = ToolCallRecord {
             id: make_id("tool"),
@@ -142,6 +164,8 @@ impl HarnessStore {
             run_id: run.id.clone(),
             name: call.name.clone(),
             arguments: call.arguments.clone(),
+            task_node_id,
+            subagent_id,
             status: ToolCallStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -180,6 +204,7 @@ impl HarnessStore {
             thread_id: run.thread_id.clone(),
             run_id: run.id.clone(),
             tool_call_id: tool.id.clone(),
+            task_node_id: tool.task_node_id.clone(),
             tool_name: tool.name.clone(),
             reason,
             status: ApprovalStatus::Pending,
@@ -240,16 +265,28 @@ impl HarnessStore {
         run: &HarnessRunManifest,
         kind: SubagentKind,
         task: String,
+        task_node_id: Option<String>,
+        model: Option<String>,
+        thinking_mode: ThinkingMode,
     ) -> Result<SubagentRecord> {
+        let id = make_id("subagent");
+        let subagent_dir = run.run_dir.join("subagents");
+        fs::create_dir_all(&subagent_dir)
+            .with_context(|| format!("创建 subagent 目录失败：{}", subagent_dir.display()))?;
         let record = SubagentRecord {
-            id: make_id("subagent"),
+            id: id.clone(),
             thread_id: run.thread_id.clone(),
             run_id: run.id.clone(),
+            task_node_id,
             kind,
             task,
+            model,
+            thinking_mode,
             status: HarnessRunStatus::Running,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            output_path: subagent_dir.join(format!("{id}.md")),
+            log_path: subagent_dir.join(format!("{id}.log")),
             summary: None,
             error: None,
         };
@@ -265,6 +302,104 @@ impl HarnessStore {
 
     pub fn list_subagents(&self, run: &HarnessRunManifest) -> Result<Vec<SubagentRecord>> {
         read_jsonl(&run.subagents_path)
+    }
+
+    pub fn create_task_graph(
+        &self,
+        run: &HarnessRunManifest,
+        goal: String,
+        strategy: TaskGraphStrategy,
+        success_criteria: Vec<String>,
+    ) -> Result<TaskGraphManifest> {
+        let graph = TaskGraphManifest {
+            id: make_id("graph"),
+            thread_id: run.thread_id.clone(),
+            run_id: run.id.clone(),
+            goal,
+            strategy,
+            success_criteria,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        fs::write(
+            &run.task_graph_path,
+            serde_json::to_vec_pretty(&graph).context("序列化 task graph 失败")?,
+        )
+        .with_context(|| format!("写入 task graph 失败：{}", run.task_graph_path.display()))?;
+        Ok(graph)
+    }
+
+    pub fn load_task_graph(&self, run: &HarnessRunManifest) -> Result<TaskGraphManifest> {
+        let raw = fs::read_to_string(&run.task_graph_path)
+            .with_context(|| format!("读取 task graph 失败：{}", run.task_graph_path.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("解析 task graph 失败：{}", run.task_graph_path.display()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_task_node(
+        &self,
+        run: &HarnessRunManifest,
+        graph: &TaskGraphManifest,
+        kind: TaskNodeKind,
+        title: String,
+        instructions: String,
+        depends_on: Vec<String>,
+        position: usize,
+        status: TaskNodeStatus,
+    ) -> Result<TaskNodeRecord> {
+        let record = TaskNodeRecord {
+            id: make_id("task"),
+            graph_id: graph.id.clone(),
+            thread_id: run.thread_id.clone(),
+            run_id: run.id.clone(),
+            kind,
+            title,
+            instructions,
+            depends_on,
+            position,
+            status,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            output_summary: None,
+            error: None,
+            last_subagent_id: None,
+            attempt_count: 0,
+            feature_id: None,
+        };
+        append_jsonl(&run.task_nodes_path, &record)?;
+        Ok(record)
+    }
+
+    pub fn list_task_nodes(&self, run: &HarnessRunManifest) -> Result<Vec<TaskNodeRecord>> {
+        let mut nodes: Vec<TaskNodeRecord> = read_jsonl(&run.task_nodes_path)?;
+        nodes.sort_by(|left, right| {
+            left.position
+                .cmp(&right.position)
+                .then(left.created_at.cmp(&right.created_at))
+        });
+        Ok(nodes)
+    }
+
+    pub fn load_task_node(
+        &self,
+        run: &HarnessRunManifest,
+        task_node_id: &str,
+    ) -> Result<TaskNodeRecord> {
+        self.list_task_nodes(run)?
+            .into_iter()
+            .find(|node| node.id == task_node_id)
+            .ok_or_else(|| anyhow::anyhow!("未找到 task node：{task_node_id}"))
+    }
+
+    pub fn update_task_node(&self, run: &HarnessRunManifest, node: &TaskNodeRecord) -> Result<()> {
+        let mut updated = node.clone();
+        updated.updated_at = Utc::now();
+        rewrite_jsonl(&run.task_nodes_path, |items: &mut Vec<TaskNodeRecord>| {
+            replace_by_id(items, &updated.id, updated.clone())
+        })
     }
 
     fn persist_run(&self, thread_id: &str, run: &HarnessRunManifest) -> Result<()> {

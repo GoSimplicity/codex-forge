@@ -32,6 +32,18 @@ fn run_validate(args: ConfigTargetArgs) -> Result<()> {
     if loaded.value.runtime.max_turns == 0 {
         bail!("runtime.max_turns 必须大于 0");
     }
+    if loaded.value.runtime.max_feature_retries == 0 {
+        bail!("runtime.max_feature_retries 必须大于 0");
+    }
+    if loaded.value.runtime.max_evaluator_loops == 0 {
+        bail!("runtime.max_evaluator_loops 必须大于 0");
+    }
+    if loaded.value.runtime.bootstrap_message_limit == 0 {
+        bail!("runtime.bootstrap_message_limit 必须大于 0");
+    }
+    if loaded.value.backend.turn_timeout_secs == 0 {
+        bail!("backend.turn_timeout_secs 必须大于 0");
+    }
     if loaded.value.sandbox.docker_image.trim().is_empty() {
         bail!("sandbox.docker_image 不能为空");
     }
