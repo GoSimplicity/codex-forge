@@ -39,7 +39,10 @@ pub async fn run_doctor(
     ));
     checks.push(check_verification_commands(&project_config.settings.verification_commands).await);
 
-    if matches!(effective_apply_mode, ApplyMode::AutoSafe) {
+    if matches!(
+        effective_apply_mode,
+        ApplyMode::AutoSafe | ApplyMode::InPlace
+    ) {
         if let Some(repo) = &repo {
             let clean = git_is_clean(&repo.repo_root).await?;
             checks.push(DoctorCheck {
@@ -50,16 +53,28 @@ pub async fn run_doctor(
                     CheckStatus::Failed
                 },
                 detail: if clean {
-                    "目标工作区干净，适合自动应用。".to_string()
+                    if matches!(effective_apply_mode, ApplyMode::InPlace) {
+                        "目标工作区干净，适合直接写入目标目录。".to_string()
+                    } else {
+                        "目标工作区干净，适合自动应用。".to_string()
+                    }
                 } else {
-                    "目标工作区存在未提交改动，auto-safe 同步前建议先清理。".to_string()
+                    if matches!(effective_apply_mode, ApplyMode::InPlace) {
+                        "目标工作区存在未提交改动，直接写入前必须先提交或 stash。".to_string()
+                    } else {
+                        "目标工作区存在未提交改动，auto-safe 同步前建议先清理。".to_string()
+                    }
                 },
             });
         } else {
             checks.push(DoctorCheck {
                 name: "目标工作区状态".to_string(),
                 status: CheckStatus::Skipped,
-                detail: "非 Git 目录将先自动初始化仓库，然后再进入 auto-safe 流程。".to_string(),
+                detail: if matches!(effective_apply_mode, ApplyMode::InPlace) {
+                    "非 Git 目录将先自动初始化仓库，然后再进入直接写入流程。".to_string()
+                } else {
+                    "非 Git 目录将先自动初始化仓库，然后再进入 auto-safe 流程。".to_string()
+                },
             });
         }
     }

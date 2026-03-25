@@ -485,7 +485,7 @@ codex-forge
 - `历史结果`：继续优化、回放过程、查看详情
 
 默认先不要碰高级设置。  
-先把主路径走通，再回来看低频选项。
+先把主路径走通，再回来看这些低频但关键的运行参数。
 
 ### 第 1 步：在“开始”页输入任务
 
@@ -507,7 +507,7 @@ codex-forge
 - `Enter`：执行当前高亮动作
 - `Esc`：返回上一级；在首页顶层连续按两次会弹出退出确认
 - `Ctrl+C`：直接退出 TUI
-- `a`：打开或收起“更多设置”
+- `a`：打开或收起“高级设置”
 
 ### 第 2 步：先做 doctor 预检
 
@@ -720,7 +720,7 @@ cargo run -- agents list
 cargo run -- doctor
 cargo run -- config validate
 cargo run -- run "创建一个简单博客" --workers 4 --ui rich
-cargo run -- run "创建一个简单博客" --apply-mode auto-safe --max-retries 2
+cargo run -- run "创建一个简单博客" --apply-mode in-place --max-retries 2
 cargo run -- replay --ui minimal
 cargo run -- clean --session <session-id>
 cargo run -- clean --all
@@ -754,7 +754,7 @@ python3 scripts/tui_smoke_real_pty.py --keep-temp
 - `--workers <n>`：并发 worker 数量
 - `--role-set <name>`：角色集合标识，默认 `default`
 - `--model <name>`：统一指定 Codex model
-- `--apply-mode auto-safe|bundle|none`：控制是否自动收敛并落地
+- `--apply-mode in-place|auto-safe|bundle|none`：控制结果如何写入目标目录
 - `--max-retries <n>`：worker / structured Codex 调用最大重试次数
 - `--fail-fast`：节点失败后尽快停止调度
 - `--ui rich|minimal`：终端展示模式
@@ -857,7 +857,7 @@ python3 scripts/tui_smoke_real_pty.py --keep-temp
 [defaults]
 workers = 4
 role_set = "default"
-apply_mode = "auto-safe"
+apply_mode = "in-place"
 max_retries = 2
 verification_commands = [
   "cargo fmt --check",
@@ -879,7 +879,9 @@ cargo test
 ## 当前限制 / 边界
 
 - 当前仍然是本地单机 CLI，不做远程分布式 worker
+- 默认 `in-place` 会直接写入目标目录；如果目标工作区不干净，会直接拒绝运行
 - `auto-safe` 不会强制解决真实冲突；一旦 patch 无法应用，会自动降级为 `bundle`
+- 当自动流程没有写入目标目录但存在 accepted_files 时，可在历史页使用“手动写入”按钮
 - 资源体系支持项目级覆盖与用户级覆盖，但默认以仓库内通用资源包为基础
 - integration / final 验证命令依赖本地环境；如外部工具缺失，可先用 `doctor` 预检
 - 当前 reviewer gate 仍然只做 apply 前决策，不负责自动返工闭环

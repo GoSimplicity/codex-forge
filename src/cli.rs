@@ -16,6 +16,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     Tui(TuiArgs),
+    Plan(PlanArgs),
     Run(RunArgs),
     Continue(ContinueArgs),
     Replay(ReplayArgs),
@@ -56,6 +57,12 @@ pub struct SharedTaskArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct PlanArgs {
+    #[command(flatten)]
+    pub shared: SharedTaskArgs,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct RunArgs {
     #[command(flatten)]
     pub shared: SharedTaskArgs,
@@ -72,8 +79,13 @@ pub struct RunArgs {
     pub resume: Option<String>,
     #[arg(
         long,
+        help = "高级参数：直接复用指定 plan session 的 todo 与执行图继续执行"
+    )]
+    pub from_plan: Option<String>,
+    #[arg(
+        long,
         value_enum,
-        help = "高级参数：结果应用模式：auto-safe、bundle、none"
+        help = "高级参数：结果应用模式：in-place、auto-safe、bundle、none"
     )]
     pub apply_mode: Option<ApplyModeArg>,
     #[arg(long, help = "高级参数：worker 最大重试次数")]
@@ -234,6 +246,8 @@ pub enum ThinkingModeArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ApplyModeArg {
+    #[value(name = "in-place")]
+    InPlace,
     #[value(name = "auto-safe")]
     AutoSafe,
     Bundle,

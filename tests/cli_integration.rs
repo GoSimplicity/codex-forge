@@ -686,7 +686,7 @@ fn run_generates_plan_artifacts_inside_run_session() {
 }
 
 #[test]
-fn plan_subcommand_is_rejected() {
+fn plan_subcommand_creates_plan_session() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
@@ -700,12 +700,21 @@ fn plan_subcommand_is_rejected() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("run removed plan");
-    assert!(!output.status.success(), "{:?}", output);
+        .expect("run plan");
+    assert!(output.status.success(), "{:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("方案已生成"), "{stdout}");
+    assert!(stdout.contains("执行此方案"), "{stdout}");
+
+    let manifest = load_manifest(repo.path());
+    assert_eq!(manifest["session_kind"], "plan");
+    assert_eq!(manifest["status"], "completed");
+    assert_eq!(manifest["plan_todo"]["summary"], "todo summary");
 }
 
 #[test]
-fn run_rejects_from_plan_flag() {
+fn run_rejects_invalid_from_plan_session() {
     let repo = make_repo("success");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
@@ -721,7 +730,7 @@ fn run_rejects_from_plan_flag() {
             repo.path().to_str().unwrap(),
         ])
         .output()
-        .expect("run removed from-plan");
+        .expect("run with invalid from-plan");
     assert!(!output.status.success(), "{:?}", output);
 }
 

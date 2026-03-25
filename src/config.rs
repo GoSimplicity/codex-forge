@@ -55,6 +55,7 @@ struct RawDefaults {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ApplyModeSerde {
+    InPlace,
     AutoSafe,
     Bundle,
     None,
@@ -63,6 +64,7 @@ enum ApplyModeSerde {
 impl From<ApplyModeSerde> for ApplyMode {
     fn from(value: ApplyModeSerde) -> Self {
         match value {
+            ApplyModeSerde::InPlace => ApplyMode::InPlace,
             ApplyModeSerde::AutoSafe => ApplyMode::AutoSafe,
             ApplyModeSerde::Bundle => ApplyMode::Bundle,
             ApplyModeSerde::None => ApplyMode::None,
@@ -118,7 +120,7 @@ impl Default for ProjectSettings {
             model: None,
             thinking_mode: ThinkingMode::Balanced,
             workers: 4,
-            apply_mode: ApplyMode::AutoSafe,
+            apply_mode: ApplyMode::InPlace,
             max_retries: 2,
             fail_fast: false,
             cleanup_success: false,
@@ -182,7 +184,7 @@ mod tests {
         assert!(loaded.path.is_none());
         assert_eq!(loaded.settings.workers, 4);
         assert_eq!(loaded.settings.role_set, "default");
-        assert_eq!(loaded.settings.apply_mode.label(), "auto-safe");
+        assert_eq!(loaded.settings.apply_mode.label(), "in-place");
     }
 
     #[test]

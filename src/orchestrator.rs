@@ -24,208 +24,6 @@ use crate::ui::UiController;
 use crate::workspace::{cleanup_empty_dirs, prepare_target_dir};
 use crate::worktree::{WorktreeManager, git_is_clean, materialize_dependency_patches};
 
-/// 传统 CLI `plan` 入口，直接返回最终 manifest。
-pub async fn plan_session(
-    config: SessionConfig,
-    roles: Vec<RoleConfig>,
-) -> Result<SessionManifest> {
-    plan_session_inner(config, roles, None).await
-}
-
-pub async fn plan_session_embedded(
-    config: SessionConfig,
-    roles: Vec<RoleConfig>,
-    event_tx: UnboundedSender<RuntimeEvent>,
-) -> Result<SessionManifest> {
-    plan_session_inner(config, roles, Some(event_tx)).await
-}
-
-async fn plan_session_inner(
-    config: SessionConfig,
-    roles: Vec<RoleConfig>,
-    event_tx: Option<UnboundedSender<RuntimeEvent>>,
-) -> Result<SessionManifest> {
-    let prep = prepare_target_dir(&config.target_dir).await?;
-    let repo_snapshot = discover_repo(&config.target_dir)?;
-    let mut session = SessionContext::init(&config, repo_snapshot)?;
-    let mut ui = if event_tx.is_some() {
-        UiController::silent(&session.manifest.id, &session.manifest.task)
-    } else {
-        UiController::new(&session.manifest.id, &session.manifest.task, config.ui_mode)?
-    };
-
-    session.set_status(SessionStatus::Planning)?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::PhaseChanged {
-            phase: "规划中".to_string(),
-        },
-    )?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::CommanderNote {
-            message: format!(
-                "开始生成用户规划清单与 commander 执行图。工作目录：{}；git 初始化：{}；本地身份补齐：{}。",
-                prep.target_dir.display(),
-                if prep.git_initialized { "是" } else { "否" },
-                if prep.local_identity_configured {
-                    "是"
-                } else {
-                    "否"
-                }
-            ),
-        },
-    )?;
-    if let Some(continuation) = &config.continuation {
-        record_event(
-            &mut session,
-            &mut ui,
-            event_tx.as_ref(),
-            RuntimeEvent::CommanderNote {
-                message: format!(
-                    "基于 session `{}` 进入 V{} 迭代，反馈摘要：{}",
-                    continuation.parent_session_id,
-                    continuation.iteration_index,
-                    continuation.latest_feedback_summary()
-                ),
-            },
-        )?;
-    }
-
-    let commander_memory = memory::build_commander_memory_context(
-        &session.manifest.repo_snapshot.repo_root,
-        Some(&session.manifest.id),
-        config.continuation.as_ref(),
-    )?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::CommanderNote {
-            message: format!(
-                "已加载共享记忆摘要：历史 session {} 个，记忆条目 {} 条。",
-                commander_memory.sessions, commander_memory.entries
-            ),
-        },
-    )?;
-
-    let plan_todo = build_plan_todo(
-        &config,
-        &session.manifest.repo_snapshot,
-        &session.commander_dir(),
-        Some(&commander_memory.prompt_block),
-    )
-    .await?;
-    session.set_plan_todo(plan_todo.clone())?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::PhaseChanged {
-            phase: "规划清单已生成".to_string(),
-        },
-    )?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::CommanderNote {
-            message: format!("计划清单已生成，共 {} 项 todo。", plan_todo.todos.len()),
-        },
-    )?;
-    for todo in &plan_todo.todos {
-        record_event(
-            &mut session,
-            &mut ui,
-            event_tx.as_ref(),
-            RuntimeEvent::TodoStateChanged {
-                todo_id: todo.id.clone(),
-                title: todo.title.clone(),
-                status: TodoStatus::Pending,
-                message: "规划完成，等待调度".to_string(),
-                commit_hash: None,
-            },
-        )?;
-    }
-
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::PhaseChanged {
-            phase: "生成执行图".to_string(),
-        },
-    )?;
-    let graph = build_plan(
-        &config,
-        &session.manifest.repo_snapshot,
-        &roles,
-        &session.commander_dir(),
-        Some(&plan_todo),
-        Some(&commander_memory.prompt_block),
-    )
-    .await?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::GraphReady {
-            nodes: graph.nodes.len(),
-            dependencies: graph.dependency_count(),
-        },
-    )?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::CommanderNote {
-            message: format!(
-                "执行图已生成：{} 个节点，{} 条依赖，已可进入执行阶段。",
-                graph.nodes.len(),
-                graph.dependency_count()
-            ),
-        },
-    )?;
-    let contract = derive_execution_contract(&config, &graph);
-    session.set_execution_contract(contract)?;
-    session.set_graph(graph)?;
-    session.set_status(SessionStatus::Completed)?;
-    record_event(
-        &mut session,
-        &mut ui,
-        event_tx.as_ref(),
-        RuntimeEvent::PhaseChanged {
-            phase: "规划完成".to_string(),
-        },
-    )?;
-    ui.finish()?;
-    let _ = cleanup_empty_dirs(
-        &session
-            .manifest
-            .repo_snapshot
-            .repo_root
-            .join(".codex-forge"),
-    );
-
-    if event_tx.is_none() {
-        println!("计划已生成：`{}`", session.manifest.id);
-        println!(
-            "计划清单文件：`{}`",
-            session.plan_todo_json_path().display()
-        );
-        println!("执行图文件：`{}`", session.manifest.graph_path.display());
-        println!(
-            "继续反馈：`codex-forge continue --session {} --feedback \"...\"`",
-            session.manifest.id
-        );
-    }
-    Ok(session.manifest)
-}
-
 pub async fn run_session(config: SessionConfig, roles: Vec<RoleConfig>) -> Result<SessionManifest> {
     Ok(run_session_inner(config, roles, None, None).await?.manifest)
 }
@@ -251,10 +49,22 @@ async fn run_session_inner(
 ) -> Result<EmbeddedRunOutcome> {
     let prep = prepare_target_dir(&config.target_dir).await?;
     let codex_path = ensure_codex_available()?;
-    if matches!(config.apply_mode, crate::model::ApplyMode::AutoSafe) {
+    if !config.plan_only
+        && matches!(
+            config.apply_mode,
+            crate::model::ApplyMode::AutoSafe | crate::model::ApplyMode::InPlace
+        )
+    {
         let repo_snapshot = discover_repo(&config.target_dir)?;
         if !git_is_clean(&repo_snapshot.repo_root).await? {
-            anyhow::bail!("目标工作区存在未提交改动，auto-safe 模式拒绝运行");
+            anyhow::bail!(
+                "目标工作区存在未提交改动，{} 模式拒绝运行",
+                if matches!(config.apply_mode, crate::model::ApplyMode::InPlace) {
+                    "in-place"
+                } else {
+                    "auto-safe"
+                }
+            );
         }
     }
 
@@ -456,6 +266,55 @@ async fn run_session_inner(
         )?;
     }
     session.set_graph(graph.clone())?;
+
+    if config.plan_only {
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::PhaseChanged {
+                phase: "方案已完成".to_string(),
+            },
+        )?;
+        record_event(
+            &mut session,
+            &mut ui,
+            event_tx.as_ref(),
+            RuntimeEvent::CommanderNote {
+                message: "方案会话已完成；可在历史页查看详情，或直接执行此方案。".to_string(),
+            },
+        )?;
+        session.set_status(SessionStatus::Completed)?;
+        ui.finish()?;
+        let _ = cleanup_empty_dirs(
+            &session
+                .manifest
+                .repo_snapshot
+                .repo_root
+                .join(".codex-forge"),
+        );
+        if event_tx.is_none() {
+            println!("方案已生成：`{}`", session.manifest.id);
+            println!(
+                "计划清单文件：`{}`",
+                session.plan_todo_json_path().display()
+            );
+            println!("执行图文件：`{}`", session.manifest.graph_path.display());
+            println!(
+                "执行此方案：`codex-forge run --from-plan {} \"{}\"`",
+                session.manifest.id, session.manifest.task
+            );
+            println!(
+                "继续反馈：`codex-forge continue --session {} --feedback \"...\"`",
+                session.manifest.id
+            );
+        }
+        return Ok(EmbeddedRunOutcome {
+            manifest: session.manifest,
+            stopped: false,
+        });
+    }
+
     session.set_status(SessionStatus::Running)?;
 
     let manager = WorktreeManager::new(
@@ -787,7 +646,8 @@ async fn run_session_inner(
             .map(|item| item.status)
         {
             Some(crate::model::ApplyStatus::Applied) => TodoStatus::Applied,
-            Some(crate::model::ApplyStatus::VerificationFailed) => TodoStatus::Failed,
+            Some(crate::model::ApplyStatus::VerificationFailed)
+            | Some(crate::model::ApplyStatus::WrittenNeedsFix) => TodoStatus::Failed,
             Some(crate::model::ApplyStatus::Bundled)
             | Some(crate::model::ApplyStatus::Skipped)
             | Some(crate::model::ApplyStatus::SyncFailed)
@@ -902,10 +762,13 @@ async fn run_session_inner(
 
     finished.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
     if event_tx.is_none() {
-        if session.manifest.delivered_to_target() {
-            println!("运行完成并已交付：`{}`", session.manifest.id);
+        if session.manifest.wrote_to_target() {
+            println!("运行完成，代码已写入目标目录：`{}`", session.manifest.id);
         } else {
-            println!("运行结束但未交付到目标目录：`{}`", session.manifest.id);
+            println!(
+                "运行结束，但本轮尚未写入目标目录：`{}`",
+                session.manifest.id
+            );
             if let Some(apply_result) = session.manifest.apply_result.as_ref() {
                 if let Some(bundle_dir) = &apply_result.bundle_dir {
                     println!("bundle 目录：`{}`", bundle_dir.display());
@@ -1372,11 +1235,19 @@ async fn schedule_graph(
             }
 
             let model = inputs.config.model.clone();
+            let thinking_mode = inputs.config.thinking_mode;
             let tx_clone = tx.clone();
             let agent_id = node.id.clone();
             let worker_stop_rx = inputs.stop_rx.clone();
             let handle = tokio::spawn(async move {
-                run_worker(launch_spec, model.as_deref(), tx_clone, worker_stop_rx).await
+                run_worker(
+                    launch_spec,
+                    model.as_deref(),
+                    thinking_mode,
+                    tx_clone,
+                    worker_stop_rx,
+                )
+                .await
             });
             handles.insert(agent_id.clone(), handle);
             pending.remove(&agent_id);

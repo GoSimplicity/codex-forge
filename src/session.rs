@@ -1278,7 +1278,7 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
 - 结果：{}\n\
 - reviewer gate：{}\n\
 - apply：{}\n\
-- 目标目录交付：{}\n\
+- 目标目录状态：{}\n\
 - 可信度：{}\n\n\
 ## 执行图\n\n`{}`\n\n\
 ## Worker 结果\n\n{}\n\n\
@@ -1316,10 +1316,10 @@ fn render_summary_markdown(manifest: &SessionManifest, summary: &FinalSummary) -
             .map(|item| item.label().to_string())
             .unwrap_or_else(|| "无".to_string()),
         summary.apply_status.label(),
-        if manifest.delivered_to_target() {
-            "已交付"
+        if manifest.wrote_to_target() {
+            "已写入"
         } else {
-            "未交付"
+            "未写入"
         },
         summary.trust_level.label(),
         manifest.graph_path.display(),
@@ -1453,17 +1453,17 @@ fn render_user_summary_deliverable(manifest: &SessionManifest, summary: &FinalSu
     let risks = render_bullets(&summary.open_risks);
 
     format!(
-        "# Codex Forge 最终交付\n\n\
+        "# Codex Forge 最终结果\n\n\
 - 目标仓库：`{}`\n\
 - 会话：`{}`\n\
 - 系统记录目录：`{}`\n\
-- 你直接看的交付物目录：`{}`\n\n\
+- 你直接看的目标目录：`{}`\n\n\
 ## 任务\n\n{}\n\n\
 ## 结果结论\n\n{}\n\n\
 - 结果：{}\n\
 - 审阅结论：{}\n\
 - 应用状态：{}\n\
-- 目标目录交付：{}\n\
+- 目标目录状态：{}\n\
 - 可信度：{}\n\n\
 ## 本轮完成内容\n\n{}\n\n\
 ## 下一步建议\n\n{}\n\n\
@@ -1480,10 +1480,10 @@ fn render_user_summary_deliverable(manifest: &SessionManifest, summary: &FinalSu
             .map(|item| item.label().to_string())
             .unwrap_or_else(|| "无".to_string()),
         summary.apply_status.label(),
-        if manifest.delivered_to_target() {
-            "已交付"
+        if manifest.wrote_to_target() {
+            "已写入"
         } else {
-            "未交付"
+            "未写入"
         },
         summary.trust_level.label(),
         completed,
@@ -1519,10 +1519,14 @@ fn render_user_changes_deliverable(manifest: &SessionManifest, summary: &FinalSu
                     .join("\n")
             };
             format!(
-                "## 应用结果\n\n- 模式：{}\n- 状态：{}\n- 已同步到目标仓库：{}\n\n## Todo 提交记录\n\n{}\n",
+                "## 应用结果\n\n- 模式：{}\n- 状态：{}\n- 已写入目标目录：{}\n\n## Todo 提交记录\n\n{}\n",
                 result.mode.label(),
                 result.status.label(),
-                if result.synced_to_target { "是" } else { "否" },
+                if result.wrote_to_target || result.synced_to_target {
+                    "是"
+                } else {
+                    "否"
+                },
                 commits
             )
         })

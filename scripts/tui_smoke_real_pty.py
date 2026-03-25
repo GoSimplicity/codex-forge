@@ -405,7 +405,7 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
         )
         mark = session.mark()
         session.send("\r")
-        session.wait_for("执行此方案并进入 Run", ["开始执行/运行中"], timeout=5, since=mark)
+        session.wait_for("执行此方案并进入 Run", ["执行此方案/运行中"], timeout=5, since=mark)
         session.wait_for(
             "Run 完成并进入历史页",
             ["历史会话", "当前会话", "目标目录状态"],
@@ -420,7 +420,7 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
         session.send("\x1b[B")
         session.send("\r")
         session.wait_for("进入 Replay", ["回放过程/运行中"], timeout=5, since=mark)
-        session.pump(5.0)
+        session.wait_for("Replay 完成", ["回放过程 已结束：成功"], timeout=10, since=mark)
 
         mark = session.mark()
         session.send("\x1b", pause=0.15)

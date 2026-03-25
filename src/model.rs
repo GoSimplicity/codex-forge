@@ -38,6 +38,14 @@ impl ThinkingMode {
         }
     }
 
+    pub fn codex_reasoning_effort(self) -> &'static str {
+        match self {
+            Self::Quick => "low",
+            Self::Balanced => "medium",
+            Self::HardThink => "high",
+        }
+    }
+
     #[allow(dead_code)]
     pub fn description(self) -> &'static str {
         match self {
@@ -57,6 +65,7 @@ impl Display for ThinkingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyMode {
+    InPlace,
     AutoSafe,
     Bundle,
     None,
@@ -65,6 +74,7 @@ pub enum ApplyMode {
 impl ApplyMode {
     pub fn label(self) -> &'static str {
         match self {
+            Self::InPlace => "in-place",
             Self::AutoSafe => "auto-safe",
             Self::Bundle => "bundle",
             Self::None => "none",
@@ -164,6 +174,7 @@ impl Display for WorkerStatus {
 pub enum ApplyStatus {
     Skipped,
     Applied,
+    WrittenNeedsFix,
     Bundled,
     VerificationFailed,
     SyncFailed,
@@ -174,6 +185,7 @@ impl ApplyStatus {
         match self {
             Self::Skipped => "跳过应用",
             Self::Applied => "已应用",
+            Self::WrittenNeedsFix => "已写入目标目录，仍需修复",
             Self::Bundled => "已降级为 bundle",
             Self::VerificationFailed => "集成验证失败",
             Self::SyncFailed => "同步目标工作区失败",
@@ -1007,6 +1019,8 @@ pub struct ApplyResult {
     pub applied_workers: Vec<String>,
     pub rejected_workers: Vec<String>,
     pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub wrote_to_target: bool,
     pub synced_to_target: bool,
     pub bundle_dir: Option<PathBuf>,
     pub final_patch_path: Option<PathBuf>,
@@ -1593,12 +1607,13 @@ impl SessionManifest {
             .join("manual-review-state.json")
     }
 
-    pub fn delivered_to_target(&self) -> bool {
+    pub fn wrote_to_target(&self) -> bool {
         self.manual_delivery_result
             .as_ref()
             .is_some_and(|result| result.success)
             || self.apply_result.as_ref().is_some_and(|result| {
-                result.synced_to_target && matches!(result.status, ApplyStatus::Applied)
+                result.wrote_to_target
+                    || (result.synced_to_target && matches!(result.status, ApplyStatus::Applied))
             })
     }
 }

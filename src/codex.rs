@@ -27,6 +27,7 @@ pub async fn run_json_once(
     prompt: &str,
     cwd: &Path,
     model: Option<&str>,
+    thinking_mode: crate::model::ThinkingMode,
     output_path: &Path,
     log_path: &Path,
     max_retries: usize,
@@ -36,7 +37,7 @@ pub async fn run_json_once(
     let mut last_error = None;
 
     for attempt in 1..=attempts {
-        match run_json_attempt(prompt, cwd, model, output_path, log_path).await {
+        match run_json_attempt(prompt, cwd, model, thinking_mode, output_path, log_path).await {
             Ok(content) => return Ok(content),
             Err(error) => {
                 let retryable = classify_retryable(error.to_string().as_str());
@@ -60,11 +61,12 @@ async fn run_json_attempt(
     prompt: &str,
     cwd: &Path,
     model: Option<&str>,
+    thinking_mode: crate::model::ThinkingMode,
     output_path: &Path,
     log_path: &Path,
 ) -> Result<String> {
     let mut command = Command::new("codex");
-    configure_codex_command(&mut command);
+    configure_codex_command(&mut command, thinking_mode);
     command
         .arg("exec")
         .arg("--skip-git-repo-check")
@@ -195,6 +197,7 @@ fn extract_balanced_json_object(text: &str) -> Option<String> {
 pub async fn run_worker(
     spec: WorkerLaunchSpec,
     model: Option<&str>,
+    thinking_mode: crate::model::ThinkingMode,
     tx: mpsc::Sender<RuntimeEvent>,
     stop_rx: Option<watch::Receiver<bool>>,
 ) -> Result<WorkerResult> {
@@ -212,7 +215,15 @@ pub async fn run_worker(
     let stop_rx = stop_rx;
 
     for attempt in 1..=attempts {
-        let result = run_worker_attempt(&spec, model, tx.clone(), attempt, stop_rx.clone()).await?;
+        let result = run_worker_attempt(
+            &spec,
+            model,
+            thinking_mode,
+            tx.clone(),
+            attempt,
+            stop_rx.clone(),
+        )
+        .await?;
         let retryable = result.status == WorkerStatus::Failed
             && result
                 .error
@@ -256,6 +267,7 @@ pub async fn run_worker(
 async fn run_worker_attempt(
     spec: &WorkerLaunchSpec,
     model: Option<&str>,
+    thinking_mode: crate::model::ThinkingMode,
     tx: mpsc::Sender<RuntimeEvent>,
     attempt: usize,
     mut stop_rx: Option<watch::Receiver<bool>>,
@@ -265,7 +277,7 @@ async fn run_worker_attempt(
     }
 
     let mut command = Command::new("codex");
-    configure_codex_command(&mut command);
+    configure_codex_command(&mut command, thinking_mode);
     command
         .arg("exec")
         .arg("--json")
@@ -989,9 +1001,17 @@ fn build_diagnostic_summary(
     })
 }
 
-fn configure_codex_command(command: &mut Command) {
+fn configure_codex_command(command: &mut Command, thinking_mode: crate::model::ThinkingMode) {
     // 在允许外网的真实运行环境中，禁用 SDK telemetry 可减少无关初始化噪音。
     command.env("OTEL_SDK_DISABLED", "true");
+    command.arg("-c").arg(codex_reasoning_config(thinking_mode));
+}
+
+fn codex_reasoning_config(thinking_mode: crate::model::ThinkingMode) -> String {
+    format!(
+        "model_reasoning_effort=\"{}\"",
+        thinking_mode.codex_reasoning_effort()
+    )
 }
 
 fn format_codex_failure(prefix: &str, stderr: &str) -> String {
@@ -1071,10 +1091,10 @@ fn backoff_for(attempt: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_retryable, codex_environment_hint, compact_json, extract_json_document,
-        extract_summary_section, parse_event_line, parse_handoff,
+        classify_retryable, codex_environment_hint, codex_reasoning_config, compact_json,
+        extract_json_document, extract_summary_section, parse_event_line, parse_handoff,
     };
-    use crate::model::ApplyDecision;
+    use crate::model::{ApplyDecision, ThinkingMode};
     use serde_json::json;
 
     #[test]
@@ -1220,5 +1240,21 @@ mod tests {
         assert!(classify_retryable(
             "stream disconnected before completion: error sending request for url"
         ));
+    }
+
+    #[test]
+    fn thinking_mode_maps_to_codex_reasoning_effort() {
+        assert_eq!(
+            codex_reasoning_config(ThinkingMode::Quick),
+            "model_reasoning_effort=\"low\""
+        );
+        assert_eq!(
+            codex_reasoning_config(ThinkingMode::Balanced),
+            "model_reasoning_effort=\"medium\""
+        );
+        assert_eq!(
+            codex_reasoning_config(ThinkingMode::HardThink),
+            "model_reasoning_effort=\"high\""
+        );
     }
 }

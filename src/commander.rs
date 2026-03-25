@@ -150,6 +150,7 @@ pub async fn build_plan(
         &json_prompt,
         &repo.repo_root,
         config.model.as_deref(),
+        config.thinking_mode,
         &output_path,
         &log_path,
         config.max_retries,
@@ -213,6 +214,7 @@ pub async fn build_plan_todo(
         &json_prompt,
         &repo.repo_root,
         config.model.as_deref(),
+        config.thinking_mode,
         &output_path,
         &log_path,
         config.max_retries,
@@ -1175,16 +1177,17 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
         .and_then(|item| item.review_report.clone())
         .or_else(|| latest_reviewer_report(manifest));
     let open_risks = collect_open_risks(manifest);
-    let delivered_to_target = manifest.delivered_to_target();
+    let wrote_to_target = manifest.wrote_to_target();
     let result_status = if failed_workers > 0
         || matches!(
             apply_status,
             ApplyStatus::SyncFailed
                 | ApplyStatus::Bundled
+                | ApplyStatus::WrittenNeedsFix
                 | ApplyStatus::VerificationFailed
                 | ApplyStatus::Skipped
         )
-        || !delivered_to_target
+        || !wrote_to_target
     {
         ResultStatus::Failed
     } else if !manual_review_files.is_empty()
@@ -1211,10 +1214,12 @@ fn build_local_summary(manifest: &SessionManifest) -> FinalSummary {
     FinalSummary {
         overview: format!(
             "{} V{}：本次运行共调度 {} 个节点，成功 {} 个、失败 {} 个；apply 状态为 `{}`，可信度为 `{}`，范围漂移为“{}”。",
-            if delivered_to_target {
-                "代码已交付到目标目录，当前可用版本为"
+            if matches!(apply_status, ApplyStatus::Applied) {
+                "代码已写入目标目录并通过验证，当前可用版本为"
+            } else if wrote_to_target {
+                "代码已写入目标目录，但当前版本仍需继续修复"
             } else {
-                "本次 session 已结束，但代码尚未交付到目标目录"
+                "本次 session 已结束，但本轮尚未写入目标目录"
             },
             manifest.iteration_index_value(),
             manifest.worker_results.len(),
@@ -1323,8 +1328,14 @@ fn collect_open_risks(manifest: &SessionManifest) -> Vec<String> {
         );
     }
 
-    if !manifest.delivered_to_target() {
-        risks.push("代码尚未交付到目标目录。".to_string());
+    if !manifest.wrote_to_target() {
+        risks.push("本轮尚未写入目标目录。".to_string());
+    } else if manifest
+        .apply_result
+        .as_ref()
+        .is_some_and(|result| matches!(result.status, ApplyStatus::WrittenNeedsFix))
+    {
+        risks.push("代码已写入目标目录，但仍有验证或提交问题待处理。".to_string());
     }
 
     risks.extend(detect_conflicts(manifest));
@@ -1341,7 +1352,7 @@ fn recommended_next_actions(
     result_status: ResultStatus,
 ) -> Vec<String> {
     let mut actions = Vec::new();
-    if !manifest.delivered_to_target() {
+    if !manifest.wrote_to_target() {
         if let Some(bundle_dir) = manifest
             .apply_result
             .as_ref()
@@ -1369,7 +1380,17 @@ fn recommended_next_actions(
             if matches!(result_status, ResultStatus::Completed) {
                 actions.push("可直接检查目标工作区 diff 并继续提交。".to_string());
             } else {
-                actions.push("先处理人工复核文件与开放风险，再决定是否重跑 run。".to_string());
+                actions.push("代码已在目标目录，可直接查看现场并继续修复。".to_string());
+            }
+        }
+        crate::model::ApplyMode::InPlace => {
+            if matches!(result_status, ResultStatus::Completed) {
+                actions.push("代码已直接写入目标目录，可继续检查 diff 或提交。".to_string());
+            } else {
+                actions.push(
+                    "代码已直接写入目标目录；请先在目标目录修复问题，再决定是否继续 run。"
+                        .to_string(),
+                );
             }
         }
         crate::model::ApplyMode::Bundle => {
@@ -1406,7 +1427,7 @@ fn build_iteration_delta_summary(manifest: &SessionManifest) -> Vec<String> {
         ));
     }
     if items.is_empty() {
-        items.push("这是根会话的首轮交付。".to_string());
+        items.push("这是根会话的首轮结果。".to_string());
     }
     items
 }

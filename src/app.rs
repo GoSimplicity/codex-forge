@@ -5,7 +5,7 @@ use clap::Parser;
 use crate::app_shell::run_app_shell;
 use crate::cli::{
     AgentCommands, AgentListArgs, ApplyModeArg, CleanArgs, Cli, Commands, ConfigCommands,
-    ConfigValidateArgs, ContinueArgs, ContinueModeArg, DoctorArgs, PresetArg, ReplayArgs,
+    ConfigValidateArgs, ContinueArgs, ContinueModeArg, DoctorArgs, PlanArgs, PresetArg, ReplayArgs,
     ResetArgs, RunArgs, ThinkingModeArg, TuiArgs, UiModeArg,
 };
 use crate::config::{load_project_config, validate_project_config};
@@ -29,6 +29,10 @@ pub async fn run() -> Result<()> {
     match cli.command {
         None => run_tui(TuiArgs { target_dir: None }).await?,
         Some(Commands::Tui(args)) => run_tui(args).await?,
+        Some(Commands::Plan(args)) => {
+            let (config, roles) = resolve_plan_config(args)?;
+            run_session(config, roles).await?;
+        }
         Some(Commands::Run(args)) => {
             let (config, roles) = resolve_run_config(args)?;
             let manifest = run_session(config, roles).await?;
@@ -59,6 +63,56 @@ async fn run_tui(args: TuiArgs) -> Result<()> {
         None => None,
     };
     run_app_shell(initial_target_dir).await
+}
+
+pub(crate) fn resolve_plan_config(
+    args: PlanArgs,
+) -> Result<(SessionConfig, Vec<crate::model::RoleConfig>)> {
+    let task = validated_task_input(&args.shared.task)?;
+    let target_dir = resolve_target_dir(args.shared.target_dir.as_deref())?.path;
+    let loaded = load_project_config(&target_dir, args.shared.config.as_deref())?;
+    let resources = load_resource_catalog(&target_dir)?;
+    let role_set = args
+        .shared
+        .role_set
+        .clone()
+        .unwrap_or_else(|| loaded.settings.role_set.clone());
+    let roles = resolve_role_set(&resources, &role_set)?;
+    if roles.is_empty() {
+        bail!("角色集合为空，无法规划");
+    }
+
+    let config = SessionConfig {
+        task,
+        workers: args
+            .shared
+            .workers
+            .unwrap_or(loaded.settings.workers)
+            .max(1),
+        role_set,
+        model: args.shared.model.or(loaded.settings.model.clone()),
+        thinking_mode: args
+            .shared
+            .thinking_mode
+            .map(into_thinking_mode)
+            .unwrap_or(loaded.settings.thinking_mode),
+        ui_mode: into_ui_mode(args.shared.ui),
+        target_dir,
+        cleanup_success: false,
+        apply_mode: ApplyMode::None,
+        max_retries: loaded.settings.max_retries,
+        fail_fast: false,
+        verification_commands: loaded.settings.verification_commands.clone(),
+        config_path: loaded.path,
+        global_rule_prompt: resources.rules.global.clone(),
+        reviewer_rule_prompt: resources.rules.reviewer.clone(),
+        plan_only: true,
+        preset: None,
+        source_plan_session_id: None,
+        resume_session_id: None,
+        continuation: None,
+    };
+    Ok((config, roles))
 }
 
 pub(crate) fn resolve_run_config(
@@ -107,7 +161,7 @@ pub(crate) fn resolve_run_config(
         reviewer_rule_prompt: resources.rules.reviewer.clone(),
         plan_only: false,
         preset: args.preset.map(into_preset),
-        source_plan_session_id: None,
+        source_plan_session_id: args.from_plan,
         resume_session_id: args.resume,
         continuation: None,
     };
@@ -486,7 +540,7 @@ fn validated_task_input(task: &str) -> Result<String> {
 }
 
 fn ensure_run_delivered(manifest: &SessionManifest) -> Result<()> {
-    if manifest.delivered_to_target() {
+    if manifest.wrote_to_target() {
         return Ok(());
     }
 
@@ -525,6 +579,7 @@ fn into_ui_mode(mode: UiModeArg) -> UiMode {
 
 fn into_apply_mode(mode: ApplyModeArg) -> ApplyMode {
     match mode {
+        ApplyModeArg::InPlace => ApplyMode::InPlace,
         ApplyModeArg::AutoSafe => ApplyMode::AutoSafe,
         ApplyModeArg::Bundle => ApplyMode::Bundle,
         ApplyModeArg::None => ApplyMode::None,

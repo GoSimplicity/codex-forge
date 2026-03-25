@@ -946,11 +946,14 @@ pub fn render_runtime_dashboard(
             )),
             Line::from(summary.overview.clone()),
             Line::from(format!(
-                "目标目录交付：{}",
-                if matches!(summary.apply_status, crate::model::ApplyStatus::Applied) {
-                    "已交付".to_string()
+                "目标目录状态：{}",
+                if matches!(
+                    summary.apply_status,
+                    crate::model::ApplyStatus::Applied | crate::model::ApplyStatus::WrittenNeedsFix
+                ) {
+                    "已写入".to_string()
                 } else {
-                    "未交付".to_string()
+                    "未写入".to_string()
                 }
             )),
             Line::from(format!(

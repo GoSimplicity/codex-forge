@@ -42,6 +42,7 @@ struct TodoBatch {
 struct TodoCommitExecution {
     records: Vec<TodoCommitRecord>,
     verification_results: Vec<VerificationCommandResult>,
+    wrote_to_target: bool,
     final_ok: bool,
     error: Option<String>,
 }
@@ -145,6 +146,7 @@ pub async fn execute_apply_plan(
         applied_workers: Vec::new(),
         rejected_workers: Vec::new(),
         conflicts: trust_report.blocking_reasons.clone(),
+        wrote_to_target: false,
         synced_to_target: false,
         bundle_dir: None,
         final_patch_path: None,
@@ -172,6 +174,80 @@ pub async fn execute_apply_plan(
             append_log(&log_path, "apply_mode=bundle，直接输出 bundle。")?;
             apply_result.status = ApplyStatus::Bundled;
             apply_result.bundle_dir = Some(bundle_dir);
+        }
+        ApplyMode::InPlace => {
+            if plan.operations.is_empty() || auto_apply_files.is_empty() {
+                append_log(
+                    &log_path,
+                    "没有可直接写入目标目录的 patch，本次直接写入记为失败。",
+                )?;
+                apply_result.status = ApplyStatus::SyncFailed;
+                apply_result
+                    .conflicts
+                    .push("没有可直接写入目标目录的 patch".to_string());
+            }
+            if let Some(ApplyDecision::Block) = reviewer_gate {
+                append_log(
+                    &log_path,
+                    "reviewer 给出阻止建议，但当前产品策略会继续直写目标目录并记录风险。",
+                )?;
+            }
+            if !trust_report.safe_to_auto_apply {
+                append_log(
+                    &log_path,
+                    "可信度评估提示存在风险，但当前产品策略仍继续直接写入目标目录。",
+                )?;
+            }
+            if !matches!(apply_result.status, ApplyStatus::SyncFailed)
+                && !git_is_clean(context.repo_root).await?
+            {
+                append_log(&log_path, "目标工作区存在未提交改动，拒绝直接写入。")?;
+                apply_result.status = ApplyStatus::SyncFailed;
+                apply_result
+                    .conflicts
+                    .push("目标工作区不干净，拒绝直接写入".to_string());
+            }
+
+            if !matches!(apply_result.status, ApplyStatus::SyncFailed) {
+                let verification_root = verification_dir(context.session_dir);
+                let commit_execution = apply_and_commit_todos(
+                    context.repo_root,
+                    &plan,
+                    &auto_apply_files,
+                    context.todo_states,
+                    context.verification_commands,
+                    &verification_root,
+                )
+                .await?;
+                apply_result.todo_commits = commit_execution.records;
+                apply_result.wrote_to_target = commit_execution.wrote_to_target;
+                let report = build_verification_report(
+                    context.worker_results,
+                    Vec::new(),
+                    commit_execution.verification_results,
+                );
+
+                if let Some(error) = commit_execution.error {
+                    apply_result.status = if apply_result.wrote_to_target {
+                        ApplyStatus::WrittenNeedsFix
+                    } else {
+                        ApplyStatus::SyncFailed
+                    };
+                    apply_result.conflicts.push(error);
+                } else if commit_execution.final_ok {
+                    apply_result.synced_to_target = true;
+                    apply_result.status = ApplyStatus::Applied;
+                } else if apply_result.wrote_to_target {
+                    apply_result.status = ApplyStatus::WrittenNeedsFix;
+                } else {
+                    apply_result.status = ApplyStatus::VerificationFailed;
+                }
+
+                persist_apply_result(&apply_result, context.apply_result_path).await?;
+                persist_verification_report(&report, context.verification_report_path).await?;
+                let _ = context.manager.cleanup(&integration_worktree).await;
+                return Ok((apply_result, report, trust_report));
+            }
         }
         ApplyMode::AutoSafe => {
             if plan.operations.is_empty() || auto_apply_files.is_empty() {
@@ -265,14 +341,21 @@ pub async fn execute_apply_plan(
                         )
                         .await?;
                         apply_result.todo_commits = commit_execution.records;
+                        apply_result.wrote_to_target = commit_execution.wrote_to_target;
                         final_results = commit_execution.verification_results;
                         if let Some(error) = commit_execution.error {
-                            apply_result.status = ApplyStatus::SyncFailed;
+                            apply_result.status = if apply_result.wrote_to_target {
+                                ApplyStatus::WrittenNeedsFix
+                            } else {
+                                ApplyStatus::SyncFailed
+                            };
                             apply_result.conflicts.push(error);
                         } else {
                             apply_result.synced_to_target = commit_execution.final_ok;
                             apply_result.status = if commit_execution.final_ok {
                                 ApplyStatus::Applied
+                            } else if apply_result.wrote_to_target {
+                                ApplyStatus::WrittenNeedsFix
                             } else {
                                 ApplyStatus::VerificationFailed
                             };
@@ -318,26 +401,6 @@ fn all_plan_files(plan: &ApplyPlan) -> Vec<String> {
     files
 }
 
-pub async fn deliver_accepted_files(
-    plan: &ApplyPlan,
-    apply_result: &ApplyResult,
-    target_dir: &Path,
-) -> Result<Vec<String>> {
-    if apply_result.accepted_files.is_empty() {
-        anyhow::bail!("当前会话没有可安全交付的 accepted_files");
-    }
-    if !git_is_clean(target_dir).await? {
-        anyhow::bail!("目标工作区存在未提交改动，拒绝执行安全交付");
-    }
-
-    let delivered =
-        deliver_selected_files_from_plan(plan, target_dir, &apply_result.accepted_files).await?;
-    if delivered.is_empty() {
-        anyhow::bail!("accepted_files 为空或没有对应可应用 patch");
-    }
-    Ok(delivered)
-}
-
 pub async fn deliver_selected_files_from_plan(
     plan: &ApplyPlan,
     target_dir: &Path,
@@ -380,6 +443,7 @@ async fn apply_and_commit_todos(
     let batches = build_todo_batches(plan, accepted_files, todo_states);
     let mut records = Vec::new();
     let mut verification_results = Vec::new();
+    let mut wrote_to_target = false;
 
     for batch in batches {
         for index in &batch.operation_indexes {
@@ -412,10 +476,12 @@ async fn apply_and_commit_todos(
                 return Ok(TodoCommitExecution {
                     records,
                     verification_results,
+                    wrote_to_target,
                     final_ok: false,
                     error: Some(format!("todo `{}` 应用失败：{error}", batch.todo_id)),
                 });
             }
+            wrote_to_target = true;
         }
 
         let stage = format!("todo-{}", batch.todo_id);
@@ -436,6 +502,7 @@ async fn apply_and_commit_todos(
             return Ok(TodoCommitExecution {
                 records,
                 verification_results,
+                wrote_to_target,
                 final_ok: false,
                 error: None,
             });
@@ -470,6 +537,7 @@ async fn apply_and_commit_todos(
                 return Ok(TodoCommitExecution {
                     records,
                     verification_results,
+                    wrote_to_target,
                     final_ok: false,
                     error: Some(format!("todo `{}` 提交失败：{error}", batch.todo_id)),
                 });
@@ -485,6 +553,7 @@ async fn apply_and_commit_todos(
     Ok(TodoCommitExecution {
         records,
         verification_results,
+        wrote_to_target,
         final_ok,
         error: None,
     })
