@@ -1,24 +1,11 @@
 mod app;
-mod app_shell;
-mod apply;
 mod cli;
-mod codex;
-mod commander;
 mod config;
-mod doctor;
-mod memory;
+mod codex;
+mod harness;
 mod model;
-mod orchestrator;
-mod replay;
-mod repo;
-mod resources;
-mod roles;
-mod session;
-mod time;
-mod ui;
-mod verify;
+mod tui;
 mod workspace;
-mod worktree;
 
 #[tokio::main]
 async fn main() {

@@ -1,229 +1,109 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-use crate::model::{ApplyMode, ThinkingMode};
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    #[serde(default)]
+    pub backend: BackendConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+}
 
-pub const DEFAULT_RUST_VERIFICATION_COMMANDS: &[&str] = &[
-    "cargo fmt --check",
-    "cargo clippy --all-targets --all-features -- -D warnings",
-    "cargo test",
-];
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            backend: BackendConfig::default(),
+            sandbox: SandboxConfig::default(),
+            runtime: RuntimeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendConfig {
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            default_model: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default = "default_docker_image")]
+    pub docker_image: String,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            docker_image: default_docker_image(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
+    #[serde(default)]
+    pub auto_approve_readonly: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: default_max_turns(),
+            auto_approve_readonly: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LoadedProjectConfig {
-    pub path: Option<PathBuf>,
-    pub settings: ProjectSettings,
+    pub path: PathBuf,
+    pub value: ProjectConfig,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProjectSettings {
-    pub role_set: String,
-    pub model: Option<String>,
-    pub thinking_mode: ThinkingMode,
-    pub workers: usize,
-    pub apply_mode: ApplyMode,
-    pub max_retries: usize,
-    pub fail_fast: bool,
-    pub cleanup_success: bool,
-    pub verification_commands: Vec<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawProjectConfig {
-    #[serde(default)]
-    defaults: RawDefaults,
-    #[serde(default)]
-    roles: toml::value::Table,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawDefaults {
-    role_set: Option<String>,
-    model: Option<String>,
-    thinking_mode: Option<ThinkingMode>,
-    workers: Option<usize>,
-    apply_mode: Option<ApplyModeSerde>,
-    max_retries: Option<usize>,
-    fail_fast: Option<bool>,
-    cleanup_success: Option<bool>,
-    verification_commands: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum ApplyModeSerde {
-    InPlace,
-    AutoSafe,
-    Bundle,
-    None,
-}
-
-impl From<ApplyModeSerde> for ApplyMode {
-    fn from(value: ApplyModeSerde) -> Self {
-        match value {
-            ApplyModeSerde::InPlace => ApplyMode::InPlace,
-            ApplyModeSerde::AutoSafe => ApplyMode::AutoSafe,
-            ApplyModeSerde::Bundle => ApplyMode::Bundle,
-            ApplyModeSerde::None => ApplyMode::None,
-        }
+pub fn load_project_config(repo_root: &Path) -> Result<LoadedProjectConfig> {
+    let path = repo_root.join("codex-forge.toml");
+    if !path.exists() {
+        return Ok(LoadedProjectConfig {
+            path,
+            value: ProjectConfig::default(),
+        });
     }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
+    let value: ProjectConfig = toml::from_str(&raw)
+        .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
+    Ok(LoadedProjectConfig { path, value })
 }
 
-pub fn load_project_config(
-    target_dir: &Path,
-    explicit_path: Option<&Path>,
-) -> Result<LoadedProjectConfig> {
-    let config_path = match explicit_path {
-        Some(path) => Some(path.to_path_buf()),
-        None => {
-            let candidate = target_dir.join("codex-forge.toml");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        }
-    };
-
-    if let Some(path) = config_path {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
-        let raw: RawProjectConfig = toml::from_str(&content)
-            .with_context(|| format!("解析 TOML 配置失败：{}", path.display()))?;
-        let settings = validate_and_build(raw)?;
-        Ok(LoadedProjectConfig {
-            path: Some(path),
-            settings,
-        })
-    } else {
-        Ok(LoadedProjectConfig {
-            path: None,
-            settings: ProjectSettings::default(),
-        })
+pub fn init_default_config(repo_root: &Path) -> Result<PathBuf> {
+    let path = repo_root.join("codex-forge.toml");
+    if path.exists() {
+        return Ok(path);
     }
+    let content = toml::to_string_pretty(&ProjectConfig::default()).context("序列化默认配置失败")?;
+    fs::write(&path, content).with_context(|| format!("写入默认配置失败：{}", path.display()))?;
+    Ok(path)
 }
 
-pub fn validate_project_config(
-    target_dir: &Path,
-    explicit_path: Option<&Path>,
-) -> Result<LoadedProjectConfig> {
-    load_project_config(target_dir, explicit_path)
+fn default_docker_image() -> String {
+    "codex-forge-sandbox:latest".to_string()
 }
 
-impl Default for ProjectSettings {
-    fn default() -> Self {
-        Self {
-            role_set: "default".to_string(),
-            model: None,
-            thinking_mode: ThinkingMode::Balanced,
-            workers: 4,
-            apply_mode: ApplyMode::InPlace,
-            max_retries: 2,
-            fail_fast: false,
-            cleanup_success: false,
-            verification_commands: DEFAULT_RUST_VERIFICATION_COMMANDS
-                .iter()
-                .map(|item| item.to_string())
-                .collect(),
-        }
-    }
-}
-
-fn validate_and_build(raw: RawProjectConfig) -> Result<ProjectSettings> {
-    let defaults = ProjectSettings::default();
-    if !raw.roles.is_empty() {
-        bail!("v3 已不再支持 `[roles.*]` 配置，请改用 `.roles/` 目录");
-    }
-    let workers = raw.defaults.workers.unwrap_or(defaults.workers).max(1);
-    let max_retries = raw.defaults.max_retries.unwrap_or(defaults.max_retries);
-    if max_retries > 8 {
-        bail!("max_retries 过大（>{}），请使用更合理的值", 8);
-    }
-
-    let verification_commands = raw
-        .defaults
-        .verification_commands
-        .unwrap_or(defaults.verification_commands.clone());
-    if verification_commands.is_empty() {
-        bail!("verification_commands 不能为空");
-    }
-
-    Ok(ProjectSettings {
-        role_set: raw.defaults.role_set.unwrap_or(defaults.role_set),
-        model: raw.defaults.model.or(defaults.model),
-        thinking_mode: raw.defaults.thinking_mode.unwrap_or(defaults.thinking_mode),
-        workers,
-        apply_mode: raw
-            .defaults
-            .apply_mode
-            .map(ApplyMode::from)
-            .unwrap_or(defaults.apply_mode),
-        max_retries,
-        fail_fast: raw.defaults.fail_fast.unwrap_or(defaults.fail_fast),
-        cleanup_success: raw
-            .defaults
-            .cleanup_success
-            .unwrap_or(defaults.cleanup_success),
-        verification_commands,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::load_project_config;
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn loads_defaults_without_file() {
-        let dir = TempDir::new().expect("tempdir");
-        let loaded = load_project_config(dir.path(), None).expect("load config");
-        assert!(loaded.path.is_none());
-        assert_eq!(loaded.settings.workers, 4);
-        assert_eq!(loaded.settings.role_set, "default");
-        assert_eq!(loaded.settings.apply_mode.label(), "in-place");
-    }
-
-    #[test]
-    fn loads_default_values_without_role_overrides() {
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("codex-forge.toml");
-        fs::write(
-            &path,
-            r#"
-[defaults]
-workers = 2
-apply_mode = "bundle"
-max_retries = 1
-verification_commands = ["cargo test -q"]
-"#,
-        )
-        .expect("write config");
-
-        let loaded = load_project_config(dir.path(), None).expect("load config");
-        assert_eq!(loaded.settings.workers, 2);
-        assert_eq!(loaded.settings.apply_mode.label(), "bundle");
-        assert_eq!(loaded.settings.max_retries, 1);
-    }
-
-    #[test]
-    fn rejects_legacy_role_overrides() {
-        let dir = TempDir::new().expect("tempdir");
-        let path = dir.path().join("codex-forge.toml");
-        fs::write(
-            &path,
-            r#"
-[roles.reviewer]
-can_edit = false
-"#,
-        )
-        .expect("write config");
-
-        let error =
-            load_project_config(dir.path(), None).expect_err("legacy overrides should fail");
-        assert!(error.to_string().contains(".roles/"));
-    }
+fn default_max_turns() -> usize {
+    6
 }
