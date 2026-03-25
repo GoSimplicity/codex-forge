@@ -1,0 +1,5 @@
+.git
+.codex-forge
+target
+tests
+scripts/__pycache__

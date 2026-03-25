@@ -245,6 +245,48 @@ TUI 当前快捷键：
 docker_image = "codex-forge-sandbox:latest"
 ```
 
+首次在本机准备默认镜像：
+
+```bash
+./scripts/build_sandbox_image.sh
+```
+
+默认会优先尝试当前已验证可拉的国内基础镜像：
+
+```text
+swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/debian:bookworm-slim
+-> docker.m.daocloud.io/library/debian:bookworm-slim
+-> debian:bookworm-slim
+```
+
+如果你想固定使用某个基础镜像，也可以手工覆盖：
+
+```bash
+SANDBOX_BASE_IMAGE="claude-sdk:latest" ./scripts/build_sandbox_image.sh
+```
+
+如果你的机器需要固定平台，也可以显式指定：
+
+```bash
+SANDBOX_PLATFORM="linux/arm64" ./scripts/build_sandbox_image.sh
+```
+
+如果本机需要额外工具，可以在构建时附加 apt 包：
+
+```bash
+EXTRA_APT_PACKAGES="nodejs npm" ./scripts/build_sandbox_image.sh
+```
+
+默认镜像基于 `debian:bookworm-slim`，内置：
+
+- `sh` / `bash`
+- `git`
+- `ripgrep`
+- `python3`
+- `curl`
+- `jq`
+- `make`
+
 ## Backend 协议
 
 backend 现在不再返回自由文本，而是优先返回结构化 JSON envelope：
