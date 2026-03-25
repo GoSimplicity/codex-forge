@@ -1,7 +1,7 @@
-mod app;
 mod cli;
-mod config;
 mod codex;
+mod commands;
+mod config;
 mod harness;
 mod model;
 mod tui;
@@ -9,7 +9,7 @@ mod workspace;
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = app::run().await {
+    if let Err(error) = commands::run().await {
         eprintln!("❌ {error:#}");
         std::process::exit(1);
     }

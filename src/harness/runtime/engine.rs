@@ -3,118 +3,20 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::ProjectConfig;
-use crate::model::ThinkingMode;
 
-use super::backend::{AgentBackend, BackendTurnRequest, CodexBackend, built_in_tools};
-use super::sandbox::DockerSandboxProvider;
-use super::store::HarnessStore;
-use super::tools::{approval_reason, execute_tool_call, mark_tool_approved, mark_tool_resolution, tool_requires_approval};
-use super::types::{
-    ApprovalStatus, ChatRunOutcome, HarnessEvent, HarnessMessageRole, HarnessRunManifest,
-    HarnessRunStatus, HarnessThreadManifest, SubagentKind, ToolCallRequest, ToolCallStatus,
+use super::subagent::execute_subagent;
+use crate::harness::backend::{AgentBackend, BackendTurnRequest, CodexBackend, built_in_tools};
+use crate::harness::sandbox::DockerSandboxProvider;
+use crate::harness::store::HarnessStore;
+use crate::harness::tools::{
+    approval_reason, execute_tool_call, mark_tool_resolution, tool_requires_approval,
+};
+use crate::harness::types::{
+    HarnessEvent, HarnessMessageRole, HarnessRunManifest, HarnessRunStatus, HarnessThreadManifest,
+    ToolCallRecord, ToolCallRequest, ToolCallStatus,
 };
 
-#[derive(Debug, Clone)]
-pub struct ChatRequest {
-    pub thread_id: String,
-    pub message: String,
-    pub model: Option<String>,
-    pub thinking_mode: ThinkingMode,
-}
-
-pub async fn chat_once(
-    repo_root: &Path,
-    config: &ProjectConfig,
-    request: ChatRequest,
-) -> Result<ChatRunOutcome> {
-    let store = HarnessStore::new(repo_root);
-    let user_message = store.append_message(
-        &request.thread_id,
-        HarnessMessageRole::User,
-        request.message,
-        None,
-    )?;
-    let mut run = store.create_run(
-        &request.thread_id,
-        request
-            .model
-            .clone()
-            .or(config.backend.default_model.clone()),
-        request.thinking_mode,
-    )?;
-    run_execution(repo_root, config, &store, &mut run).await?;
-    let thread = store.load_thread(&request.thread_id)?;
-    let assistant_message = store
-        .list_messages(&request.thread_id)?
-        .into_iter()
-        .rev()
-        .find(|message| message.run_id.as_deref() == Some(&run.id) && message.role == HarnessMessageRole::Assistant);
-    Ok(ChatRunOutcome {
-        thread,
-        run,
-        user_message,
-        assistant_message,
-    })
-}
-
-pub async fn resolve_approval_and_resume(
-    repo_root: &Path,
-    config: &ProjectConfig,
-    thread_id: &str,
-    approval_id: &str,
-    status: ApprovalStatus,
-) -> Result<HarnessRunManifest> {
-    let store = HarnessStore::new(repo_root);
-    let approval = store.resolve_approval(thread_id, approval_id, status)?;
-    let mut run = store.load_run(thread_id, &approval.run_id)?;
-    store.append_run_event(
-        thread_id,
-        &run.id,
-        HarnessEvent::ApprovalResolved {
-            thread_id: thread_id.to_string(),
-            run_id: run.id.clone(),
-            approval_id: approval.id.clone(),
-            status: approval.status,
-        },
-    )?;
-
-    let tool = mark_tool_approved(&store, &run, &approval.tool_call_id, &approval.id)?;
-    if approval.status == ApprovalStatus::Denied {
-        mark_tool_resolution(
-            &store,
-            &run,
-            &tool.id,
-            ToolCallStatus::Skipped,
-            Some("用户拒绝执行".to_string()),
-            None,
-        )?;
-        store.append_message(
-            thread_id,
-            HarnessMessageRole::Tool,
-            format!("工具 `{}` 未执行：用户拒绝审批。", tool.name),
-            Some(run.id.clone()),
-        )?;
-        run.status = HarnessRunStatus::Completed;
-        run.summary = Some("审批被拒绝，run 已结束".to_string());
-        if let Some(sandbox) = &run.sandbox {
-            DockerSandboxProvider {
-                image: sandbox.image.clone(),
-            }
-            .destroy(sandbox)?;
-        }
-        run.sandbox = None;
-        store.update_run(thread_id, &run)?;
-        return Ok(run);
-    }
-
-    let thread = store.load_thread(thread_id)?;
-    execute_and_record_tool(&store, &thread, &mut run, &approval.tool_call, &tool)?;
-
-    run_execution(repo_root, config, &store, &mut run).await?;
-    Ok(run)
-}
-
-async fn run_execution(
+pub(super) async fn run_execution(
     repo_root: &Path,
     config: &ProjectConfig,
     store: &HarnessStore,
@@ -176,6 +78,8 @@ async fn run_execution(
         let envelope = backend
             .execute_turn(repo_root, &turn_request, &run.output_path, &run.log_path)
             .await?;
+        let has_tool_calls = !envelope.tool_calls.is_empty();
+        let has_subagent_calls = !envelope.subagent_calls.is_empty();
         store.append_run_event(
             &run.thread_id,
             &run.id,
@@ -200,7 +104,7 @@ async fn run_execution(
             execute_subagent(store, run, &subagent.kind, &subagent.task)?;
         }
 
-        if !envelope.tool_calls.is_empty() {
+        if has_tool_calls {
             for call in envelope.tool_calls {
                 let mut record = store.append_tool_call(run, &call)?;
                 store.append_run_event(
@@ -243,8 +147,17 @@ async fn run_execution(
             }
         }
 
-        if envelope.final_response || (assistant_message.is_some() && run.turn_count >= 1) {
-            finish_run(store, run, None)?;
+        if envelope.final_response
+            || (assistant_message.is_some()
+                && !has_tool_calls
+                && !has_subagent_calls
+                && run.turn_count >= 1)
+        {
+            let final_summary = assistant_message
+                .as_ref()
+                .map(|message| first_non_empty_line(&message.content).to_string())
+                .filter(|value| !value.is_empty());
+            finish_run(store, run, final_summary, None)?;
             return Ok(());
         }
     }
@@ -252,16 +165,17 @@ async fn run_execution(
     finish_run(
         store,
         run,
+        None,
         Some("达到最大 turn 次数仍未完成".to_string()),
     )
 }
 
-fn execute_and_record_tool(
+pub(super) fn execute_and_record_tool(
     store: &HarnessStore,
     thread: &HarnessThreadManifest,
     run: &mut HarnessRunManifest,
     call: &ToolCallRequest,
-    record: &super::types::ToolCallRecord,
+    record: &ToolCallRecord,
 ) -> Result<()> {
     let sandbox = run
         .sandbox
@@ -307,48 +221,10 @@ fn execute_and_record_tool(
     Ok(())
 }
 
-fn execute_subagent(
-    store: &HarnessStore,
-    run: &HarnessRunManifest,
-    kind: &SubagentKind,
-    task: &str,
-) -> Result<()> {
-    let mut subagent = store.append_subagent(run, *kind, task.to_string())?;
-    store.append_run_event(
-        &run.thread_id,
-        &run.id,
-        HarnessEvent::SubagentStarted {
-            thread_id: run.thread_id.clone(),
-            run_id: run.id.clone(),
-            subagent_id: subagent.id.clone(),
-            kind: *kind,
-        },
-    )?;
-    subagent.status = HarnessRunStatus::Completed;
-    subagent.summary = Some(format!("{kind:?} 已分析任务：{task}"));
-    store.update_subagent(run, &subagent)?;
-    store.append_message(
-        &run.thread_id,
-        HarnessMessageRole::Summary,
-        subagent.summary.clone().unwrap_or_default(),
-        Some(run.id.clone()),
-    )?;
-    store.append_run_event(
-        &run.thread_id,
-        &run.id,
-        HarnessEvent::SubagentCompleted {
-            thread_id: run.thread_id.clone(),
-            run_id: run.id.clone(),
-            subagent_id: subagent.id,
-            status: HarnessRunStatus::Completed,
-        },
-    )?;
-    Ok(())
-}
-
 fn finish_run(
     store: &HarnessStore,
     run: &mut HarnessRunManifest,
+    final_summary: Option<String>,
     error: Option<String>,
 ) -> Result<()> {
     if let Some(error) = error {
@@ -366,9 +242,9 @@ fn finish_run(
         )?;
     } else {
         run.status = HarnessRunStatus::Completed;
-        if run.summary.is_none() {
-            run.summary = Some("run 已完成".to_string());
-        }
+        run.summary = final_summary
+            .or_else(|| run.summary.clone())
+            .or(Some("run 已完成".to_string()));
         store.update_run(&run.thread_id, run)?;
         store.append_run_event(
             &run.thread_id,
@@ -389,4 +265,11 @@ fn finish_run(
     run.sandbox = None;
     store.update_run(&run.thread_id, run)?;
     Ok(())
+}
+
+fn first_non_empty_line(text: &str) -> &str {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("")
 }
