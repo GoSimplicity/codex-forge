@@ -1,5 +1,7 @@
 mod support;
 
+use std::fs;
+
 use support::{command, make_repo};
 
 #[test]
@@ -67,6 +69,10 @@ fn approval_flow_and_artifact_commands_work() {
     assert!(
         approve_stdout.contains("status: completed"),
         "{approve_stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("file-a.txt")).expect("read host file"),
+        "beta\n"
     );
 
     let thread_show = command(bin, repo.path())

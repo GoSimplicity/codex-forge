@@ -2,14 +2,14 @@ use anyhow::{Result, bail};
 
 use crate::cli::{ChatArgs, ThinkingModeArg};
 use crate::commands::format::status_label;
-use crate::config::load_project_config;
+use crate::config::load_app_config;
 use crate::harness::{ChatRequest, HarnessStore, chat_once};
 use crate::model::ThinkingMode;
 use crate::workspace::resolve_target_dir;
 
 pub async fn run(args: ChatArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let loaded = load_project_config(&repo_root)?;
+    let config = load_app_config(&repo_root)?;
     let store = HarnessStore::new(&repo_root);
     let thread_id = match args.thread {
         Some(thread_id) => thread_id,
@@ -17,11 +17,11 @@ pub async fn run(args: ChatArgs) -> Result<()> {
     };
     let outcome = chat_once(
         &repo_root,
-        &loaded.value,
+        &config,
         ChatRequest {
             thread_id: thread_id.clone(),
             message: validated_input(&args.message)?,
-            model: args.model.or(loaded.value.backend.default_model.clone()),
+            model: args.model.or(config.backend.model.clone()),
             thinking_mode: args
                 .thinking_mode
                 .map(into_thinking_mode)

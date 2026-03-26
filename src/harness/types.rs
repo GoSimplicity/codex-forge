@@ -4,10 +4,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::BackendProvider;
 use crate::model::ThinkingMode;
 
 fn default_utc_now() -> DateTime<Utc> {
     Utc::now()
+}
+
+fn default_agent_backend_kind() -> AgentBackendKind {
+    AgentBackendKind::Codex
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +82,26 @@ pub enum MemoryLayer {
 #[serde(rename_all = "snake_case")]
 pub enum AgentBackendKind {
     Codex,
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
+    OpenAiCompatible,
+}
+
+impl AgentBackendKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::OpenAiCompatible => "openai_compatible",
+        }
+    }
+}
+
+impl From<BackendProvider> for AgentBackendKind {
+    fn from(value: BackendProvider) -> Self {
+        match value {
+            BackendProvider::Codex => Self::Codex,
+            BackendProvider::OpenAiCompatible => Self::OpenAiCompatible,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +130,7 @@ pub enum TaskNodeKind {
     Plan,
     Initialize,
     BuildExecutionContract,
+    PlanReview,
     SelectNextFeature,
     ExecuteFeature,
     EvaluateFeature,
@@ -199,8 +225,20 @@ pub struct SandboxState {
     pub provider: String,
     pub image: String,
     pub container_name: String,
+    #[serde(default)]
     pub workspace_root: PathBuf,
+    #[serde(default)]
     pub repo_workdir: PathBuf,
+    #[serde(default)]
+    pub container_repo_workdir: PathBuf,
+    #[serde(default)]
+    pub mount_strategy: String,
+    #[serde(default)]
+    pub repair_owner_on_exit: bool,
+    #[serde(default)]
+    pub host_uid: Option<u32>,
+    #[serde(default)]
+    pub host_gid: Option<u32>,
     pub active: bool,
 }
 
@@ -213,6 +251,7 @@ pub struct HarnessRunManifest {
     pub updated_at: DateTime<Utc>,
     pub model: Option<String>,
     pub thinking_mode: ThinkingMode,
+    #[serde(default = "default_agent_backend_kind")]
     pub backend: AgentBackendKind,
     pub turn_count: usize,
     #[serde(default)]
@@ -332,9 +371,15 @@ pub struct ExecutionContract {
 pub struct ProgressLedger {
     pub goal: String,
     #[serde(default)]
+    pub current_phase: Option<String>,
+    #[serde(default)]
     pub completed_features: Vec<String>,
     #[serde(default)]
     pub current_feature: Option<String>,
+    #[serde(default)]
+    pub latest_recoverable_failure: Option<String>,
+    #[serde(default)]
+    pub blocking_reason: Option<String>,
     #[serde(default)]
     pub known_failures: Vec<String>,
     #[serde(default)]
@@ -485,6 +530,12 @@ pub enum HarnessEvent {
         tool_call_id: String,
         status: ToolCallStatus,
     },
+    RecoverableFailureDetected {
+        thread_id: String,
+        run_id: String,
+        source: String,
+        detail: String,
+    },
     ApprovalRequested {
         thread_id: String,
         run_id: String,
@@ -514,6 +565,13 @@ pub enum HarnessEvent {
         run_id: String,
         subagent_id: String,
         status: HarnessRunStatus,
+    },
+    AgentHandoff {
+        thread_id: String,
+        run_id: String,
+        from: String,
+        to: String,
+        reason: String,
     },
     TaskGraphCreated {
         thread_id: String,
@@ -551,6 +609,12 @@ pub enum HarnessEvent {
         thread_id: String,
         run_id: String,
         task_node_id: String,
+    },
+    EvidenceInsufficient {
+        thread_id: String,
+        run_id: String,
+        task_node_id: String,
+        detail: String,
     },
     RunCompleted {
         thread_id: String,

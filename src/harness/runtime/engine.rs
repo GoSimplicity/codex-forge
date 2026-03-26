@@ -1,9 +1,10 @@
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 
-use crate::config::ProjectConfig;
+use crate::config::AppConfig;
 
 use super::subagent::{evaluate_feature, execute_subagent};
 use crate::harness::sandbox::DockerSandboxProvider;
@@ -19,9 +20,14 @@ use crate::harness::types::{
     TaskNodeStatus, ToolCallRecord, ToolCallRequest, ToolCallStatus,
 };
 
+pub(super) enum ToolExecutionOutcome {
+    Succeeded,
+    RecoverableFailure,
+}
+
 pub(super) async fn run_execution(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     store: &HarnessStore,
     run: &mut HarnessRunManifest,
 ) -> Result<()> {
@@ -67,7 +73,7 @@ pub(super) async fn run_execution(
                 return Ok(());
             }
 
-            execute_task_node(
+            if let Err(error) = execute_task_node(
                 repo_root,
                 config,
                 store,
@@ -78,7 +84,17 @@ pub(super) async fn run_execution(
                 &skills_context,
                 &session_context,
             )
-            .await?;
+            .await
+            {
+                let error_text = format!("{error:#}");
+                finish_run(
+                    store,
+                    run,
+                    Some(first_non_empty_line(&error_text).to_string()),
+                    Some(error_text),
+                )?;
+                return Err(error);
+            }
             *run = store.load_run(&run.thread_id, &run.id)?;
             if matches!(
                 run.status,
@@ -140,7 +156,7 @@ pub(super) async fn run_execution(
 
 fn ensure_sandbox_ready(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     store: &HarnessStore,
     run: &mut HarnessRunManifest,
 ) -> Result<()> {
@@ -148,10 +164,7 @@ fn ensure_sandbox_ready(
         return Ok(());
     }
 
-    let sandbox = DockerSandboxProvider {
-        image: config.sandbox.docker_image.clone(),
-    }
-    .start(repo_root, run)?;
+    let sandbox = DockerSandboxProvider::from(&config.sandbox).start(repo_root, run)?;
     run.sandbox = Some(sandbox.clone());
     store.update_run(&run.thread_id, run)?;
     store.append_run_event(
@@ -176,7 +189,7 @@ fn ensure_sandbox_ready(
 }
 
 fn ensure_task_graph(
-    config: &ProjectConfig,
+    config: &AppConfig,
     store: &HarnessStore,
     run: &HarnessRunManifest,
 ) -> Result<()> {
@@ -245,7 +258,7 @@ fn ensure_task_graph(
     Ok(())
 }
 
-fn infer_strategy(config: &ProjectConfig, goal: &str) -> TaskGraphStrategy {
+fn infer_strategy(config: &AppConfig, goal: &str) -> TaskGraphStrategy {
     let lower = goal.to_lowercase();
     let needs_implementation = [
         "修改",
@@ -255,18 +268,48 @@ fn infer_strategy(config: &ProjectConfig, goal: &str) -> TaskGraphStrategy {
         "修复",
         "补齐",
         "完善",
+        "生成",
+        "创建",
+        "建立",
+        "初始化",
+        "搭建",
+        "编写",
+        "落地",
+        "执行",
         "update",
         "fix",
         "implement",
         "refactor",
+        "generate",
+        "create",
+        "run",
+        "scaffold",
+        "skeleton",
+        "bootstrap",
     ]
     .iter()
-    .any(|keyword| lower.contains(keyword));
+    .any(|keyword| lower.contains(keyword))
+        || looks_like_scaffold_request(&lower);
     if needs_implementation && config.runtime.enable_long_running_delivery {
         TaskGraphStrategy::LongRunningDelivery
     } else {
         TaskGraphStrategy::Research
     }
+}
+
+fn looks_like_scaffold_request(goal: &str) -> bool {
+    let scaffold_nouns = [
+        "项目骨架",
+        "目录骨架",
+        "代码骨架",
+        "脚手架",
+        "scaffold",
+        "skeleton",
+        "bootstrap",
+    ];
+    let scaffold_verbs = ["完成", "生成", "创建", "建立", "搭", "搭建", "初始化"];
+    scaffold_nouns.iter().any(|noun| goal.contains(noun))
+        && scaffold_verbs.iter().any(|verb| goal.contains(verb))
 }
 
 fn default_success_criteria(goal: &str, strategy: TaskGraphStrategy) -> Vec<String> {
@@ -358,7 +401,7 @@ fn is_terminal_node(status: TaskNodeStatus) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn execute_task_node(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     store: &HarnessStore,
     thread: &HarnessThreadManifest,
     run: &mut HarnessRunManifest,
@@ -389,6 +432,7 @@ async fn execute_task_node(
         TaskNodeKind::BuildExecutionContract => {
             execute_build_contract_node(store, thread, run, &active)?
         }
+        TaskNodeKind::PlanReview => execute_plan_review_node(store, thread, run, &active)?,
         TaskNodeKind::SelectNextFeature => execute_select_feature_node(store, run, &active)?,
         TaskNodeKind::ExecuteFeature => {
             execute_subagent(
@@ -404,6 +448,17 @@ async fn execute_task_node(
             )
             .await?;
             if store.load_task_node(run, &active.id)?.status == TaskNodeStatus::Completed {
+                store.append_run_event(
+                    &run.thread_id,
+                    &run.id,
+                    HarnessEvent::AgentHandoff {
+                        thread_id: run.thread_id.clone(),
+                        run_id: run.id.clone(),
+                        from: "generator".to_string(),
+                        to: "evaluator".to_string(),
+                        reason: format!("feature `{}` 已有产出，进入评估", active.title),
+                    },
+                )?;
                 append_feature_node(
                     store,
                     run,
@@ -534,6 +589,14 @@ fn execute_initialize_node(
             "missing"
         }
     );
+    update_progress_state(
+        store,
+        &thread.id,
+        "计划",
+        Some("构建 execution contract".to_string()),
+        None,
+        None,
+    )?;
     complete_task_node(store, run, node, summary)?;
     append_feature_node(
         store,
@@ -564,16 +627,23 @@ fn execute_build_contract_node(
     let contract = build_execution_contract(&goal);
     let progress = ProgressLedger {
         goal: goal.clone(),
+        current_phase: Some("计划".to_string()),
         completed_features: Vec::new(),
         current_feature: None,
+        latest_recoverable_failure: None,
+        blocking_reason: None,
         known_failures: Vec::new(),
-        decisions: vec!["已建立 execution contract".to_string()],
+        decisions: vec![
+            "已建立 execution contract".to_string(),
+            "系统将先完成显式计划检查，再进入执行阶段".to_string(),
+        ],
         open_questions: Vec::new(),
-        next_step: Some("选择下一个 feature".to_string()),
+        next_step: Some("审查计划并确认验收标准".to_string()),
         updated_at: Utc::now(),
     };
     store.save_execution_contract(&thread.id, &contract)?;
     store.save_progress_ledger(&thread.id, &progress)?;
+    write_plan_snapshot_artifact(store, thread, run, node, &contract, &progress)?;
     store.append_artifact(
         &thread.id,
         &run.id,
@@ -597,9 +667,76 @@ fn execute_build_contract_node(
         run,
         node,
         format!(
-            "已生成 contract，features={}",
+            "已生成 contract 与初始计划，features={}",
             contract.ordered_features.len()
         ),
+    )?;
+    append_feature_node(
+        store,
+        run,
+        TaskNodeKind::PlanReview,
+        "审查执行计划".to_string(),
+        "检查计划摘要、范围、约束、最小验证方案和下一步 feature 是否完整。".to_string(),
+        vec![node.id.clone()],
+        None,
+    )?;
+    Ok(())
+}
+
+fn execute_plan_review_node(
+    store: &HarnessStore,
+    thread: &HarnessThreadManifest,
+    run: &HarnessRunManifest,
+    node: &TaskNodeRecord,
+) -> Result<()> {
+    let contract = store.load_execution_contract(&thread.id)?;
+    let mut progress = store.load_progress_ledger(&thread.id)?;
+    let missing = validate_execution_plan(&contract, &progress);
+    if !missing.is_empty() {
+        let detail = format!("计划仍缺少：{}", missing.join("、"));
+        progress.open_questions.extend(missing.clone());
+        progress.blocking_reason = Some(detail.clone());
+        progress.next_step = Some("补齐计划缺失项后再进入执行".to_string());
+        progress.updated_at = Utc::now();
+        store.save_progress_ledger(&thread.id, &progress)?;
+        store.append_run_event(
+            &run.thread_id,
+            &run.id,
+            HarnessEvent::EvidenceInsufficient {
+                thread_id: run.thread_id.clone(),
+                run_id: run.id.clone(),
+                task_node_id: node.id.clone(),
+                detail: detail.clone(),
+            },
+        )?;
+        fail_task_node(store, run, node, detail)?;
+        return Ok(());
+    }
+
+    progress.current_phase = Some("计划".to_string());
+    progress.blocking_reason = None;
+    progress
+        .decisions
+        .push("计划检查通过，可以开始执行 feature".to_string());
+    progress.next_step = Some("选择下一个 feature".to_string());
+    progress.updated_at = Utc::now();
+    store.save_progress_ledger(&thread.id, &progress)?;
+    store.append_run_event(
+        &run.thread_id,
+        &run.id,
+        HarnessEvent::AgentHandoff {
+            thread_id: run.thread_id.clone(),
+            run_id: run.id.clone(),
+            from: "planner".to_string(),
+            to: "generator".to_string(),
+            reason: "计划检查通过，开始进入执行阶段".to_string(),
+        },
+    )?;
+    complete_task_node(
+        store,
+        run,
+        node,
+        render_plan_review_summary(&contract, &progress),
     )?;
     append_feature_node(
         store,
@@ -631,7 +768,9 @@ fn execute_select_feature_node(
         let feature_title = feature.title.clone();
         let feature_instructions = render_feature_execution_instructions(feature);
         feature.status = FeatureSliceStatus::InProgress;
+        progress.current_phase = Some("执行".to_string());
         progress.current_feature = Some(feature_id.clone());
+        progress.blocking_reason = None;
         progress.next_step = Some(format!("执行 feature `{}`", feature_title));
         progress.updated_at = Utc::now();
         store.save_execution_contract(&thread.id, &contract)?;
@@ -654,6 +793,11 @@ fn execute_select_feature_node(
         return Ok(());
     }
 
+    progress.current_phase = Some("交付".to_string());
+    progress.current_feature = None;
+    progress.next_step = Some("生成最终交付".to_string());
+    progress.updated_at = Utc::now();
+    store.save_progress_ledger(&thread.id, &progress)?;
     complete_task_node(
         store,
         run,
@@ -675,7 +819,7 @@ fn execute_select_feature_node(
 #[allow(clippy::too_many_arguments)]
 async fn execute_evaluate_node(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     store: &HarnessStore,
     run: &mut HarnessRunManifest,
     node: &TaskNodeRecord,
@@ -726,6 +870,9 @@ async fn execute_evaluate_node(
         progress
             .decisions
             .push(format!("evaluator 通过：{}", decision.reason));
+        progress.current_phase = Some("评估".to_string());
+        progress.latest_recoverable_failure = None;
+        progress.blocking_reason = None;
         progress.next_step = Some("写入 checkpoint 并准备下一个 feature".to_string());
         progress.updated_at = Utc::now();
         store.save_execution_contract(&thread.id, &contract)?;
@@ -751,12 +898,25 @@ async fn execute_evaluate_node(
     let execute_attempts = find_execute_attempts(store, run, node.feature_id.as_deref())?;
     if decision.retryable && execute_attempts < config.runtime.max_feature_retries {
         let mut progress = store.load_progress_ledger(&thread.id)?;
+        progress.current_phase = Some("评估".to_string());
         progress
             .known_failures
             .push(format!("feature 重试前失败：{}", decision.reason));
+        progress.blocking_reason = Some(decision.reason.clone());
         progress.next_step = Some("根据 evaluator 结论重新执行当前 feature".to_string());
         progress.updated_at = Utc::now();
         store.save_progress_ledger(&thread.id, &progress)?;
+        store.append_run_event(
+            &run.thread_id,
+            &run.id,
+            HarnessEvent::AgentHandoff {
+                thread_id: run.thread_id.clone(),
+                run_id: run.id.clone(),
+                from: "evaluator".to_string(),
+                to: "generator".to_string(),
+                reason: format!("评估未通过，准备重试：{}", decision.reason),
+            },
+        )?;
         complete_task_node(
             store,
             run,
@@ -801,7 +961,9 @@ fn execute_checkpoint_node(
     let contract = store.load_execution_contract(&thread.id)?;
     let mut progress = store.load_progress_ledger(&thread.id)?;
     let latest_evaluation = store.list_evaluations(run)?.into_iter().next();
+    progress.current_phase = Some("交付".to_string());
     progress.current_feature = None;
+    progress.blocking_reason = None;
     progress.next_step = contract
         .ordered_features
         .iter()
@@ -828,6 +990,17 @@ fn execute_checkpoint_node(
         node,
         "已更新 progress 并生成 session bootstrap".to_string(),
     )?;
+    store.append_run_event(
+        &run.thread_id,
+        &run.id,
+        HarnessEvent::AgentHandoff {
+            thread_id: run.thread_id.clone(),
+            run_id: run.id.clone(),
+            from: "evaluator".to_string(),
+            to: "planner".to_string(),
+            reason: "评估通过，写入 checkpoint 并决定下一步".to_string(),
+        },
+    )?;
     append_feature_node(
         store,
         run,
@@ -847,11 +1020,17 @@ fn execute_finalize_node(
     node: &TaskNodeRecord,
 ) -> Result<()> {
     let contract = store.load_execution_contract(&thread.id)?;
-    let progress = store.load_progress_ledger(&thread.id)?;
+    let mut progress = store.load_progress_ledger(&thread.id)?;
     let latest_evaluation = store.list_evaluations(run)?.into_iter().next();
+    progress.current_phase = Some("交付".to_string());
+    progress.blocking_reason = None;
+    progress.next_step = Some("向用户输出最终交付摘要".to_string());
+    progress.updated_at = Utc::now();
+    store.save_progress_ledger(&thread.id, &progress)?;
     let final_response = format!(
-        "长期任务已完成。\n目标：{}\n\n已完成 feature：{}\n下一步：{}\n最近评估：{}",
+        "长期任务已完成。\n目标：{}\n\n当前阶段：{}\n已完成 feature：{}\n下一步：{}\n最近评估：{}",
         contract.goal,
+        progress.current_phase.as_deref().unwrap_or("交付"),
         if progress.completed_features.is_empty() {
             "无".to_string()
         } else {
@@ -948,16 +1127,7 @@ fn build_execution_contract(goal: &str) -> ExecutionContract {
             title: title.clone(),
             intent: title.clone(),
             scope_paths: Vec::new(),
-            done_when: vec![
-                AcceptanceCriterion {
-                    id: format!("acc-{}-1", index + 1),
-                    description: "相关代码或产物已经落地".to_string(),
-                },
-                AcceptanceCriterion {
-                    id: format!("acc-{}-2", index + 1),
-                    description: "evaluator 给出通过结论".to_string(),
-                },
-            ],
+            done_when: infer_feature_acceptance(&title, index + 1),
             status: FeatureSliceStatus::Pending,
         })
         .collect::<Vec<_>>();
@@ -990,6 +1160,70 @@ fn build_execution_contract(goal: &str) -> ExecutionContract {
         delivery_notes: vec!["每次只推进一个 feature".to_string()],
         updated_at: Utc::now(),
     }
+}
+
+fn infer_feature_acceptance(title: &str, index: usize) -> Vec<AcceptanceCriterion> {
+    let lower = title.to_lowercase();
+    let is_inspection = [
+        "执行",
+        "查看",
+        "读取",
+        "搜索",
+        "列出",
+        "总结",
+        "解释",
+        "分析",
+        "run",
+        "inspect",
+        "read",
+        "list",
+        "search",
+        "summarize",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        && ![
+            "修改",
+            "实现",
+            "修复",
+            "重构",
+            "生成",
+            "创建",
+            "写入",
+            "落地",
+            "fix",
+            "implement",
+            "refactor",
+            "generate",
+            "create",
+            "write",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+
+    if is_inspection {
+        return vec![
+            AcceptanceCriterion {
+                id: format!("acc-{}-1", index),
+                description: "相关命令或查询已经执行，并记录了结果".to_string(),
+            },
+            AcceptanceCriterion {
+                id: format!("acc-{}-2", index),
+                description: "evaluator 给出通过结论".to_string(),
+            },
+        ];
+    }
+
+    vec![
+        AcceptanceCriterion {
+            id: format!("acc-{}-1", index),
+            description: "相关代码或产物已经落地".to_string(),
+        },
+        AcceptanceCriterion {
+            id: format!("acc-{}-2", index),
+            description: "evaluator 给出通过结论".to_string(),
+        },
+    ]
 }
 
 fn split_goal_into_features(goal: &str) -> Vec<String> {
@@ -1041,6 +1275,151 @@ fn append_feature_node(
     Ok(node)
 }
 
+fn validate_execution_plan(contract: &ExecutionContract, progress: &ProgressLedger) -> Vec<String> {
+    let mut missing = Vec::new();
+    if contract.goal.trim().is_empty() {
+        missing.push("目标".to_string());
+    }
+    if contract.constraints.is_empty() {
+        missing.push("关键约束".to_string());
+    }
+    if contract.ordered_features.is_empty() {
+        missing.push("下一步 feature".to_string());
+    }
+    let has_validation = contract
+        .ordered_features
+        .iter()
+        .any(|feature| !feature.done_when.is_empty());
+    if !has_validation {
+        missing.push("最小验证方案".to_string());
+    }
+    if contract.non_goals.is_empty() {
+        missing.push("范围".to_string());
+    }
+    if progress
+        .next_step
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        missing.push("下一步动作".to_string());
+    }
+    missing
+}
+
+fn render_plan_review_summary(contract: &ExecutionContract, progress: &ProgressLedger) -> String {
+    let first_feature = contract
+        .ordered_features
+        .first()
+        .map(|feature| feature.title.as_str())
+        .unwrap_or("-");
+    format!(
+        "计划检查通过：目标=`{}`，范围={}，约束={}，第一步 feature=`{}`，最小验证项={}",
+        contract.goal,
+        contract.non_goals.join("；"),
+        contract.constraints.join("；"),
+        first_feature,
+        contract
+            .ordered_features
+            .first()
+            .map(|feature| {
+                feature
+                    .done_when
+                    .iter()
+                    .map(|item| item.description.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| progress
+                .next_step
+                .clone()
+                .unwrap_or_else(|| "-".to_string()))
+    )
+}
+
+fn write_plan_snapshot_artifact(
+    store: &HarnessStore,
+    thread: &HarnessThreadManifest,
+    run: &HarnessRunManifest,
+    node: &TaskNodeRecord,
+    contract: &ExecutionContract,
+    progress: &ProgressLedger,
+) -> Result<()> {
+    let artifact_dir = run.run_dir.join("artifact-files");
+    fs::create_dir_all(&artifact_dir)?;
+    let path = artifact_dir.join(format!("plan-snapshot-{}.md", node.id));
+    let body = format!(
+        "# 执行计划\n\n目标：{}\n\n范围限制：\n{}\n\n关键约束：\n{}\n\n第一步 feature：{}\n\n最小验证：\n{}\n\n下一步：{}\n",
+        contract.goal,
+        contract
+            .non_goals
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        contract
+            .constraints
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        contract
+            .ordered_features
+            .first()
+            .map(|feature| feature.title.as_str())
+            .unwrap_or("-"),
+        contract
+            .ordered_features
+            .first()
+            .map(|feature| {
+                feature
+                    .done_when
+                    .iter()
+                    .map(|item| format!("- {}", item.description))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "- 无".to_string()),
+        progress.next_step.as_deref().unwrap_or("-")
+    );
+    fs::write(&path, body)?;
+    store.append_artifact(
+        &thread.id,
+        &run.id,
+        Some(node.id.clone()),
+        None,
+        "plan-snapshot".to_string(),
+        crate::harness::ArtifactKind::PlanSnapshot,
+        path,
+    )?;
+    Ok(())
+}
+
+fn update_progress_state(
+    store: &HarnessStore,
+    thread_id: &str,
+    phase: &str,
+    next_step: Option<String>,
+    blocking_reason: Option<String>,
+    latest_recoverable_failure: Option<String>,
+) -> Result<()> {
+    let mut progress = match store.load_progress_ledger(thread_id) {
+        Ok(progress) => progress,
+        Err(_) => return Ok(()),
+    };
+    progress.current_phase = Some(phase.to_string());
+    if let Some(next_step) = next_step {
+        progress.next_step = Some(next_step);
+    }
+    progress.blocking_reason = blocking_reason;
+    progress.latest_recoverable_failure = latest_recoverable_failure;
+    progress.updated_at = Utc::now();
+    store.save_progress_ledger(thread_id, &progress)
+}
+
 fn next_task_position(store: &HarnessStore, run: &HarnessRunManifest) -> Result<usize> {
     Ok(store
         .list_task_nodes(run)?
@@ -1057,8 +1436,9 @@ fn render_bootstrap(
     latest_evaluation: Option<&EvaluationDecision>,
 ) -> String {
     format!(
-        "# Session Bootstrap\n\ngoal: {}\ncompleted_features: {}\ncurrent_feature: {}\nnext_step: {}\nlatest_evaluation: {}\n\ncontract_features:\n{}\n",
+        "# Session Bootstrap\n\ngoal: {}\nphase: {}\ncompleted_features: {}\ncurrent_feature: {}\nnext_step: {}\nlatest_evaluation: {}\nlatest_recoverable_failure: {}\nblocking_reason: {}\n\ncontract_features:\n{}\n",
         contract.goal,
+        progress.current_phase.as_deref().unwrap_or("-"),
         if progress.completed_features.is_empty() {
             "-".to_string()
         } else {
@@ -1069,6 +1449,11 @@ fn render_bootstrap(
         latest_evaluation
             .map(|item| item.reason.as_str())
             .unwrap_or("-"),
+        progress
+            .latest_recoverable_failure
+            .as_deref()
+            .unwrap_or("-"),
+        progress.blocking_reason.as_deref().unwrap_or("-"),
         contract
             .ordered_features
             .iter()
@@ -1103,6 +1488,15 @@ fn block_on_manual_input(
     waiting.status = TaskNodeStatus::WaitingForInput;
     waiting.output_summary = Some(format!("等待人工判断：{}", decision.reason));
     store.update_task_node(run, &waiting)?;
+    if let Ok(thread) = store.load_thread(&run.thread_id)
+        && let Ok(mut progress) = store.load_progress_ledger(&thread.id)
+    {
+        progress.current_phase = Some("评估".to_string());
+        progress.blocking_reason = Some(decision.reason.clone());
+        progress.next_step = Some("等待人工输入后继续".to_string());
+        progress.updated_at = Utc::now();
+        let _ = store.save_progress_ledger(&thread.id, &progress);
+    }
     run.status = HarnessRunStatus::WaitingForInput;
     run.summary = Some(format!("等待人工判断：{}", decision.reason));
     run.blocked_reason = Some(format!("feature 需要人工处理：{}", decision.reason));
@@ -1116,7 +1510,7 @@ pub(super) fn execute_and_record_tool(
     run: &mut HarnessRunManifest,
     call: &ToolCallRequest,
     record: &ToolCallRecord,
-) -> Result<()> {
+) -> Result<ToolExecutionOutcome> {
     let sandbox = run
         .sandbox
         .clone()
@@ -1129,7 +1523,56 @@ pub(super) fn execute_and_record_tool(
         call,
         record.task_node_id.as_deref(),
         record.subagent_id.as_deref(),
-    )?;
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let detail = format!("工具 `{}` 执行失败：{}", call.name, error);
+            mark_tool_resolution(
+                store,
+                run,
+                &record.id,
+                ToolCallStatus::Failed,
+                Some(first_non_empty_line(&detail).to_string()),
+                Some(format!("{error:#}")),
+            )?;
+            let _ = update_progress_state(
+                store,
+                &thread.id,
+                "执行",
+                Some("根据失败原因重试、换工具或请求人工输入".to_string()),
+                None,
+                Some(detail.clone()),
+            );
+            store.append_message(
+                &run.thread_id,
+                HarnessMessageRole::Tool,
+                detail.clone(),
+                Some(run.id.clone()),
+            )?;
+            store.append_run_event(
+                &run.thread_id,
+                &run.id,
+                HarnessEvent::ToolCallCompleted {
+                    thread_id: run.thread_id.clone(),
+                    run_id: run.id.clone(),
+                    tool_call_id: record.id.clone(),
+                    status: ToolCallStatus::Failed,
+                },
+            )?;
+            store.append_run_event(
+                &run.thread_id,
+                &run.id,
+                HarnessEvent::RecoverableFailureDetected {
+                    thread_id: run.thread_id.clone(),
+                    run_id: run.id.clone(),
+                    source: format!("tool:{}", call.name),
+                    detail: detail.clone(),
+                },
+            )?;
+            return Ok(ToolExecutionOutcome::RecoverableFailure);
+        }
+    };
     mark_tool_resolution(
         store,
         run,
@@ -1166,7 +1609,7 @@ pub(super) fn execute_and_record_tool(
             status: ToolCallStatus::Succeeded,
         },
     )?;
-    Ok(())
+    Ok(ToolExecutionOutcome::Succeeded)
 }
 
 pub(super) fn record_tool_planned(
@@ -1312,6 +1755,9 @@ pub(super) fn finish_run(
     run.blocked_reason = None;
     if let Some(error) = error {
         run.status = HarnessRunStatus::Failed;
+        run.summary = final_summary
+            .or_else(|| run.summary.clone())
+            .or(Some("run 已失败".to_string()));
         run.last_error = Some(error.clone());
         store.update_run(&run.thread_id, run)?;
         store.append_run_event(
@@ -1325,6 +1771,7 @@ pub(super) fn finish_run(
         )?;
     } else {
         run.status = HarnessRunStatus::Completed;
+        run.last_error = None;
         run.summary = final_summary
             .or_else(|| run.summary.clone())
             .or(Some("run 已完成".to_string()));
@@ -1340,10 +1787,7 @@ pub(super) fn finish_run(
     }
 
     if let Some(sandbox) = &run.sandbox {
-        DockerSandboxProvider {
-            image: sandbox.image.clone(),
-        }
-        .destroy(sandbox)?;
+        DockerSandboxProvider::from(sandbox).destroy(sandbox)?;
     }
     run.sandbox = None;
     store.update_run(&run.thread_id, run)?;
@@ -1353,12 +1797,11 @@ pub(super) fn finish_run(
 pub(super) fn cancel_run(store: &HarnessStore, run: &mut HarnessRunManifest) -> Result<()> {
     run.status = HarnessRunStatus::Cancelled;
     run.active_task_node_id = None;
-    run.blocked_reason = Some("用户取消当前 run".to_string());
+    run.summary = Some("当前 run 已取消".to_string());
+    run.last_error = None;
+    run.blocked_reason = None;
     if let Some(sandbox) = &run.sandbox {
-        DockerSandboxProvider {
-            image: sandbox.image.clone(),
-        }
-        .destroy(sandbox)?;
+        DockerSandboxProvider::from(sandbox).destroy(sandbox)?;
     }
     run.sandbox = None;
     store.update_run(&run.thread_id, run)?;
@@ -1479,7 +1922,8 @@ fn render_session_context(
     }
     if let Ok(progress) = store.load_progress_ledger(thread_id) {
         sections.push(format!(
-            "[progress]\ncompleted: {}\ncurrent: {}\nnext_step: {}",
+            "[progress]\nphase: {}\ncompleted: {}\ncurrent: {}\nnext_step: {}\nrecoverable_failure: {}\nblocking: {}",
+            progress.current_phase.as_deref().unwrap_or("-"),
             if progress.completed_features.is_empty() {
                 "-".to_string()
             } else {
@@ -1487,6 +1931,11 @@ fn render_session_context(
             },
             progress.current_feature.as_deref().unwrap_or("-"),
             progress.next_step.as_deref().unwrap_or("-"),
+            progress
+                .latest_recoverable_failure
+                .as_deref()
+                .unwrap_or("-"),
+            progress.blocking_reason.as_deref().unwrap_or("-"),
         ));
     }
     if let Ok(bootstrap) = store.read_session_bootstrap(thread_id)
@@ -1500,4 +1949,116 @@ fn render_session_context(
         sections.push(format!("[bootstrap]\n{limited}"));
     }
     sections.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolExecutionOutcome, execute_and_record_tool, finish_run, infer_strategy};
+    use crate::config::AppConfig;
+    use crate::harness::store::HarnessStore;
+    use crate::harness::types::{
+        AgentBackendKind, SandboxState, TaskGraphStrategy, ToolCallRequest, ToolCallStatus,
+    };
+    use crate::model::ThinkingMode;
+    use tempfile::TempDir;
+
+    #[test]
+    fn finish_run_clears_stale_last_error_after_success() {
+        let repo = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(repo.path());
+        let thread = store.create_thread(Some("测试线程")).expect("thread");
+        let mut run = store
+            .create_run(
+                &thread.id,
+                None,
+                ThinkingMode::Balanced,
+                crate::harness::types::AgentBackendKind::Codex,
+            )
+            .expect("run");
+        run.last_error = Some("旧错误".to_string());
+        store.update_run(&thread.id, &run).expect("update run");
+
+        finish_run(&store, &mut run, Some("已完成".to_string()), None).expect("finish run");
+
+        let updated = store.load_run(&thread.id, &run.id).expect("load run");
+        assert!(updated.last_error.is_none());
+        assert_eq!(updated.summary.as_deref(), Some("已完成"));
+    }
+
+    #[test]
+    fn infer_strategy_treats_scaffold_goal_as_delivery() {
+        let config = AppConfig::default();
+        let strategy = infer_strategy(&config, "根据项目文档，给我完成项目骨架");
+        assert_eq!(strategy, TaskGraphStrategy::LongRunningDelivery);
+    }
+
+    #[test]
+    fn infer_strategy_keeps_analysis_goal_as_research() {
+        let config = AppConfig::default();
+        let strategy = infer_strategy(&config, "请分析这个项目骨架设计");
+        assert_eq!(strategy, TaskGraphStrategy::Research);
+    }
+
+    #[test]
+    fn infer_strategy_treats_run_goal_as_delivery() {
+        let config = AppConfig::default();
+        let strategy = infer_strategy(&config, "请在沙箱里执行 pwd");
+        assert_eq!(strategy, TaskGraphStrategy::LongRunningDelivery);
+    }
+
+    #[test]
+    fn tool_failure_is_recorded_as_recoverable() {
+        let repo = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(repo.path());
+        let thread = store.create_thread(Some("工具失败")).expect("thread");
+        let mut run = store
+            .create_run(
+                &thread.id,
+                None,
+                ThinkingMode::Balanced,
+                AgentBackendKind::Codex,
+            )
+            .expect("run");
+        run.sandbox = Some(SandboxState {
+            provider: "test".to_string(),
+            image: "test-image".to_string(),
+            container_name: "test-box".to_string(),
+            workspace_root: run.run_dir.join("sandbox"),
+            repo_workdir: repo.path().to_path_buf(),
+            container_repo_workdir: "/workspace/repo".into(),
+            mount_strategy: "direct_rw".to_string(),
+            repair_owner_on_exit: false,
+            host_uid: None,
+            host_gid: None,
+            active: true,
+        });
+        store.update_run(&thread.id, &run).expect("update run");
+
+        let call = ToolCallRequest {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"missing.txt"}),
+        };
+        let record = store
+            .append_tool_call(&run, &call, Some("task-1".to_string()), None)
+            .expect("tool");
+
+        let outcome =
+            execute_and_record_tool(&store, &thread, &mut run, &call, &record).expect("execute");
+        assert!(matches!(outcome, ToolExecutionOutcome::RecoverableFailure));
+
+        let updated = store
+            .list_tool_calls(&run)
+            .expect("list tool calls")
+            .into_iter()
+            .find(|item| item.id == record.id)
+            .expect("tool call record");
+        assert_eq!(updated.status, ToolCallStatus::Failed);
+        assert!(
+            updated
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("读取文件失败")
+        );
+    }
 }

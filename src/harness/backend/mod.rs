@@ -1,3 +1,4 @@
+mod openai;
 mod parser;
 mod prompt;
 
@@ -6,16 +7,21 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::codex::{ensure_codex_available, run_text_once};
+use crate::config::{BackendConfig, BackendProvider};
 use crate::model::ThinkingMode;
 
 use super::types::{HarnessMessage, HarnessThreadManifest, TurnEnvelope};
 
+use openai::OpenAiCompatibleBackend;
 pub use parser::parse_turn_envelope;
 pub use prompt::render_lead_turn_prompt;
+
+const CODEX_TEXT_MAX_RETRIES: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct BackendTurnRequest<'a> {
     pub thread: &'a HarnessThreadManifest,
+    pub execution_root: &'a Path,
     pub messages: &'a [HarnessMessage],
     pub thinking_mode: ThinkingMode,
     pub model: Option<&'a str>,
@@ -38,7 +44,7 @@ pub trait AgentBackend {
     fn render_prompt(&self, request: &BackendTurnRequest<'_>) -> String;
     async fn execute_turn(
         &self,
-        repo_root: &Path,
+        execution_root: &Path,
         request: &BackendTurnRequest<'_>,
         output_path: &Path,
         log_path: &Path,
@@ -55,7 +61,7 @@ impl AgentBackend for CodexBackend {
 
     async fn execute_turn(
         &self,
-        repo_root: &Path,
+        execution_root: &Path,
         request: &BackendTurnRequest<'_>,
         output_path: &Path,
         log_path: &Path,
@@ -64,16 +70,62 @@ impl AgentBackend for CodexBackend {
         let prompt = self.render_prompt(request);
         let raw = run_text_once(
             &prompt,
-            repo_root,
+            execution_root,
             request.model,
             request.thinking_mode,
             request.timeout_secs,
             output_path,
             log_path,
-            1,
+            CODEX_TEXT_MAX_RETRIES,
         )
         .await?;
         parse_turn_envelope(&raw)
+    }
+}
+
+pub enum ResolvedBackend {
+    Codex(CodexBackend),
+    OpenAiCompatible(OpenAiCompatibleBackend),
+}
+
+impl ResolvedBackend {
+    pub fn from_config(config: &BackendConfig) -> Result<Self> {
+        match config.provider {
+            BackendProvider::Codex => Ok(Self::Codex(CodexBackend)),
+            BackendProvider::OpenAiCompatible => Ok(Self::OpenAiCompatible(
+                OpenAiCompatibleBackend::new(config.clone())?,
+            )),
+        }
+    }
+}
+
+impl AgentBackend for ResolvedBackend {
+    fn render_prompt(&self, request: &BackendTurnRequest<'_>) -> String {
+        match self {
+            Self::Codex(backend) => backend.render_prompt(request),
+            Self::OpenAiCompatible(backend) => backend.render_prompt(request),
+        }
+    }
+
+    async fn execute_turn(
+        &self,
+        execution_root: &Path,
+        request: &BackendTurnRequest<'_>,
+        output_path: &Path,
+        log_path: &Path,
+    ) -> Result<TurnEnvelope> {
+        match self {
+            Self::Codex(backend) => {
+                backend
+                    .execute_turn(execution_root, request, output_path, log_path)
+                    .await
+            }
+            Self::OpenAiCompatible(backend) => {
+                backend
+                    .execute_turn(execution_root, request, output_path, log_path)
+                    .await
+            }
+        }
     }
 }
 

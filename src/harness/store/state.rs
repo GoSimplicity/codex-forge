@@ -7,7 +7,7 @@ use crate::harness::types::{
 };
 
 use super::HarnessStore;
-use super::jsonl::{append_jsonl, read_jsonl};
+use super::jsonl::{append_jsonl, read_jsonl, write_atomic};
 
 impl HarnessStore {
     pub fn save_execution_contract(
@@ -16,9 +16,9 @@ impl HarnessStore {
         contract: &ExecutionContract,
     ) -> Result<()> {
         let thread = self.load_thread(thread_id)?;
-        fs::write(
+        write_atomic(
             &thread.contract_path,
-            serde_json::to_vec_pretty(contract).context("序列化 execution contract 失败")?,
+            &serde_json::to_vec_pretty(contract).context("序列化 execution contract 失败")?,
         )
         .with_context(|| {
             format!(
@@ -46,9 +46,9 @@ impl HarnessStore {
 
     pub fn save_progress_ledger(&self, thread_id: &str, progress: &ProgressLedger) -> Result<()> {
         let thread = self.load_thread(thread_id)?;
-        fs::write(
+        write_atomic(
             &thread.progress_path,
-            serde_json::to_vec_pretty(progress).context("序列化 progress ledger 失败")?,
+            &serde_json::to_vec_pretty(progress).context("序列化 progress ledger 失败")?,
         )
         .with_context(|| {
             format!(

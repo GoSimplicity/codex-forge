@@ -358,21 +358,26 @@ def run_smoke(binary: Path, repo_dir: Path, bin_dir: Path, transcript_path: Path
 
     try:
         start_mark = session.mark()
-        session.wait_for("启动首页", ["Codex Forge", "Composer"], timeout=15, since=start_mark)
+        session.wait_for("启动首页", ["CODEX FORGE", "Composer"], timeout=15, since=start_mark)
 
         mark = session.mark()
         session.send("n", pause=0.15)
-        session.wait_for("创建 thread", ["已创建 thread"], timeout=5, since=mark)
+        session.wait_for("创建 thread", [f"{repo_dir.name} 主线程"], timeout=5, since=mark)
 
         mark = session.mark()
         session.send("i", pause=0.15)
-        session.wait_for("进入输入模式", ["Enter 发送", "Esc 返回"], timeout=5, since=mark)
+        session.wait_for(
+            "进入输入模式",
+            ["Enter 保存草稿", "Esc 返回浏览模式"],
+            timeout=5,
+            since=mark,
+        )
 
         session.send("真实 PTY smoke")
 
         mark = session.mark()
         session.send("\x1b", pause=0.15)
-        session.wait_for("退出输入模式", ["返回浏览模式"], timeout=5, since=mark)
+        session.wait_for("退出输入模式", ["按 Enter 可运行"], timeout=5, since=mark)
 
         session.send("q", pause=0.1)
         exit_code = session.wait_for_exit(timeout=5)
@@ -407,9 +412,9 @@ def main() -> int:
     try:
         binary = ensure_binary(repo_root, args.bin)
         repo_dir, bin_dir = create_fixture_workspace(temp_dir)
-        home_dir = temp_dir / "home"
-        home_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["HOME"] = str(home_dir)
+        config_home = temp_dir / "home" / ".codex-forge"
+        config_home.mkdir(parents=True, exist_ok=True)
+        os.environ["CODEX_FORGE_HOME"] = str(config_home)
         log(f"[info] 临时仓库：{repo_dir}")
         log(f"[info] fake codex：{bin_dir / 'codex'}")
         log(f"[info] transcript：{transcript_path}")

@@ -1,7 +1,14 @@
 # codex-forge
 
-`codex-forge` 现在是一个 **Rust 编写的本地 Codex harness 产品**。  
+`codex-forge` 现在是一个 **Rust 编写的本地多 backend harness 产品**。  
 当前主路径已经演进为 long-running harness：保留 `thread / message / run / event` 外壳，同时在运行时内核中引入 **execution contract / progress ledger / evaluator gating / session bootstrap**，并以 **Docker run 级沙箱**、**结构化 backend 协议**、**approval**、**artifact**、**CLI/TUI** 为核心能力。
+
+当前支持两类 backend：
+
+- `codex`
+  - 继续通过本地 `codex` CLI 执行
+- `openai_compatible`
+  - 通过 HTTP 调用 OpenAI-compatible `Chat Completions` 接口执行
 
 当前仓库不再保留旧 `orchestrator / session / plan-run-continue / Brain Agent` 的兼容实现。
 
@@ -155,7 +162,6 @@ tests/
       codex.log
       session-bootstrap.md
       sandbox/
-        workspace/
 ```
 
 ## CLI 用法
@@ -166,16 +172,46 @@ tests/
 codex-forge config init
 codex-forge config show
 codex-forge config validate
+codex-forge config init --global
+codex-forge config show --global
+codex-forge config validate --global
 ```
 
-默认 `codex-forge.toml` 包含：
+仓库级 `codex-forge.toml` 包含：
 
-- backend 默认 model
-- backend 单次 turn 超时
 - Docker 镜像
 - runtime 最大 turn 次数
+- generator 子代理最大 turn 次数
 - feature 重试上限
 - evaluator 最大轮次
+
+全局 backend 配置位于 `~/.codex-forge/config.toml`，至少支持：
+
+- `backend.provider`
+- `backend.key`
+- `backend.base_url`
+- `backend.model`
+- `backend.turn_timeout_secs`
+
+示例：
+
+```toml
+[backend]
+provider = "openai_compatible"
+key = "sk-..."
+base_url = "https://example.com/v1"
+model = "gpt-4o-mini"
+turn_timeout_secs = 600
+```
+
+如果继续使用 Codex：
+
+```toml
+[backend]
+provider = "codex"
+model = "gpt-5-codex"
+turn_timeout_secs = 600
+```
 
 ### Thread
 
@@ -245,6 +281,7 @@ TUI 当前快捷键：
 - `Esc` 返回浏览模式
 - `a` 通过当前第一个待审批项
 - `x` 拒绝当前第一个待审批项
+- `s` 恢复当前等待中的 run
 - `n` 新建 thread
 - `r` 刷新
 - `Tab` 切换消息 / 运行 / 审批 / 产物 / 事件面板
@@ -256,7 +293,7 @@ TUI 当前快捷键：
 - 启动 run 时创建独立容器
 - 容器工作目录为 run 级工作区快照
 - `run_shell` 在容器内执行
-- `write_file` 修改 run 工作区中的文件
+- `write_file` / `apply_patch` 先修改 run 工作区，再立即同步回目标目录
 - run 完成或失败后自动销毁容器
 
 默认镜像来自 `codex-forge.toml`：

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -9,7 +9,10 @@ use crate::harness::types::{
     ArtifactKind, HarnessRunManifest, HarnessThreadManifest, SandboxState, ToolCallRequest,
 };
 
-use super::executor::{ToolExecutionResult, materialize_text_artifact, required_string_alias};
+use super::executor::{
+    ToolExecutionResult, materialize_text_artifact, required_string_alias, resolve_repo_path,
+    sync_sandbox_file_to_repo,
+};
 
 pub(super) fn execute_list_tree(
     store: &HarnessStore,
@@ -21,9 +24,10 @@ pub(super) fn execute_list_tree(
     subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let root = resolve_root(
-        &sandbox.repo_workdir,
+        thread,
+        sandbox,
         call.arguments.get("path").and_then(Value::as_str),
-    );
+    )?;
     let max_depth = call
         .arguments
         .get("max_depth")
@@ -72,7 +76,7 @@ pub(super) fn execute_read_file(
     subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let path = required_string_alias(&call.arguments, &["path"])?;
-    let target = sandbox.repo_workdir.join(&path);
+    let target = resolve_repo_path(thread, sandbox, &path)?;
     let content = fs::read_to_string(&target)
         .with_context(|| format!("读取文件失败：{}", target.display()))?;
     let content = truncate_utf8_on_char_boundary(
@@ -108,12 +112,13 @@ pub(super) fn execute_write_file(
         .trim()
         .to_string();
     let content = required_string_alias(&call.arguments, &["content", "text"])?;
-    let target = sandbox.repo_workdir.join(&path);
+    let target = resolve_repo_path(thread, sandbox, &path)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建目录失败：{}", parent.display()))?;
     }
     fs::write(&target, &content).with_context(|| format!("写入文件失败：{}", target.display()))?;
+    let host_target = sync_sandbox_file_to_repo(thread, sandbox, &target)?;
     let artifact = store.append_artifact(
         &thread.id,
         &run.id,
@@ -124,15 +129,23 @@ pub(super) fn execute_write_file(
         target,
     )?;
     Ok(ToolExecutionResult {
-        message: format!("write_file `{path}` 成功"),
+        message: format!(
+            "write_file `{path}` 成功，目标目录文件：{}",
+            host_target.display()
+        ),
         artifacts: vec![artifact],
     })
 }
 
-fn resolve_root(repo_workdir: &Path, relative: Option<&str>) -> PathBuf {
-    relative
-        .map(|path| repo_workdir.join(path))
-        .unwrap_or_else(|| repo_workdir.to_path_buf())
+fn resolve_root(
+    thread: &HarnessThreadManifest,
+    sandbox: &SandboxState,
+    relative: Option<&str>,
+) -> Result<PathBuf> {
+    match relative {
+        Some(path) => resolve_repo_path(thread, sandbox, path),
+        None => Ok(sandbox.repo_workdir.clone()),
+    }
 }
 
 fn truncate_utf8_on_char_boundary(content: String, max_bytes: Option<u64>) -> String {
@@ -160,7 +173,7 @@ mod tests {
     use crate::harness::types::{SandboxState, ToolCallRequest};
     use crate::model::ThinkingMode;
 
-    use super::{execute_list_tree, execute_read_file};
+    use super::{execute_list_tree, execute_read_file, execute_write_file};
 
     fn setup() -> (
         TempDir,
@@ -177,16 +190,21 @@ mod tests {
                 &thread.id,
                 Some("gpt-5".to_string()),
                 ThinkingMode::Balanced,
+                crate::harness::types::AgentBackendKind::Codex,
             )
             .expect("run");
-        let repo_workdir = run.run_dir.join("sandbox").join("repo");
-        fs::create_dir_all(repo_workdir.join("nested")).expect("mkdir");
+        fs::create_dir_all(dir.path().join("nested")).expect("mkdir");
         let sandbox = SandboxState {
             provider: "test".to_string(),
             image: "test-image".to_string(),
             container_name: "test-box".to_string(),
             workspace_root: run.run_dir.join("sandbox"),
-            repo_workdir,
+            repo_workdir: dir.path().to_path_buf(),
+            container_repo_workdir: "/workspace/repo".into(),
+            mount_strategy: "direct_rw".to_string(),
+            repair_owner_on_exit: false,
+            host_uid: None,
+            host_gid: None,
             active: true,
         };
         (dir, store, thread, run, sandbox)
@@ -242,5 +260,62 @@ mod tests {
         .expect("list");
         assert!(result.message.contains("demo.txt"));
         assert!(!result.message.contains("nested/demo.txt"));
+    }
+
+    #[test]
+    fn absolute_repo_path_is_mapped_back_into_sandbox() {
+        let (dir, store, thread, run, sandbox) = setup();
+        let host_repo_file = dir.path().join("README.md");
+        fs::write(&host_repo_file, "host\n").expect("write host");
+        fs::write(sandbox.repo_workdir.join("README.md"), "sandbox\n").expect("write sandbox");
+        let result = execute_read_file(
+            &store,
+            &thread,
+            &run,
+            &sandbox,
+            &ToolCallRequest {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": thread.repo_root.join("README.md").display().to_string()
+                }),
+            },
+            None,
+            None,
+        )
+        .expect("read");
+        assert!(result.message.contains("sandbox"));
+        assert!(!result.message.contains("host"));
+    }
+
+    #[test]
+    fn write_file_syncs_back_to_host_repo() {
+        let (dir, store, thread, run, sandbox) = setup();
+        let result = execute_write_file(
+            &store,
+            &thread,
+            &run,
+            &sandbox,
+            &ToolCallRequest {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "nested/output.txt",
+                    "content": "hello\n"
+                }),
+            },
+            None,
+            None,
+        )
+        .expect("write");
+        assert!(result.message.contains("目标目录文件"));
+        assert_eq!(
+            fs::read_to_string(sandbox.repo_workdir.join("nested").join("output.txt"))
+                .expect("read sandbox"),
+            "hello\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nested").join("output.txt")).expect("read host"),
+            "hello\n"
+        );
+        assert_eq!(thread.repo_root, dir.path());
     }
 }

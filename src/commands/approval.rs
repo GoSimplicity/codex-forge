@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::cli::{ApprovalArgs, ApprovalCommands, ApprovalListArgs, ApprovalResolveArgs};
 use crate::commands::format::status_label;
-use crate::config::load_project_config;
+use crate::config::load_app_config;
 use crate::harness::{ApprovalStatus, HarnessStore, resolve_approval_and_resume};
 use crate::workspace::resolve_target_dir;
 
@@ -33,15 +33,10 @@ fn run_list(args: ApprovalListArgs) -> Result<()> {
 
 async fn run_resolve(args: ApprovalResolveArgs, status: ApprovalStatus) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let loaded = load_project_config(&repo_root)?;
-    let run = resolve_approval_and_resume(
-        &repo_root,
-        &loaded.value,
-        &args.thread,
-        &args.approval_id,
-        status,
-    )
-    .await?;
+    let config = load_app_config(&repo_root)?;
+    let run =
+        resolve_approval_and_resume(&repo_root, &config, &args.thread, &args.approval_id, status)
+            .await?;
     println!("run: {}", run.id);
     println!("status: {}", status_label(run.status));
     if let Some(summary) = run.summary {

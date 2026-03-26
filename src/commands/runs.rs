@@ -5,7 +5,7 @@ use crate::cli::{
     RunRetryNodeArgs, RunShowArgs,
 };
 use crate::commands::format::status_label;
-use crate::config::load_project_config;
+use crate::config::load_app_config;
 use crate::harness::{
     HarnessStore, TaskNodeKind, TaskNodeStatus, cancel_active_run, resume_run,
     retry_task_node_and_resume,
@@ -64,7 +64,7 @@ fn run_show(args: RunShowArgs) -> Result<()> {
     println!("run: {}", run.id);
     println!("status: {}", status_label(run.status));
     println!("thinking: {}", run.thinking_mode.label());
-    println!("backend: codex");
+    println!("backend: {}", run.backend.label());
     if let Some(model) = &run.model {
         println!("model: {model}");
     }
@@ -92,6 +92,10 @@ fn run_show(args: RunShowArgs) -> Result<()> {
     }
     if let Some(progress) = progress {
         println!(
+            "phase: {}",
+            progress.current_phase.as_deref().unwrap_or("-")
+        );
+        println!(
             "completed features: {}",
             if progress.completed_features.is_empty() {
                 "-".to_string()
@@ -106,6 +110,17 @@ fn run_show(args: RunShowArgs) -> Result<()> {
         println!(
             "next step: {}",
             progress.next_step.as_deref().unwrap_or("-")
+        );
+        println!(
+            "latest recoverable failure: {}",
+            progress
+                .latest_recoverable_failure
+                .as_deref()
+                .unwrap_or("-")
+        );
+        println!(
+            "blocking reason: {}",
+            progress.blocking_reason.as_deref().unwrap_or("-")
         );
     }
     if let Some(evaluation) = latest_evaluation {
@@ -149,8 +164,8 @@ fn run_show(args: RunShowArgs) -> Result<()> {
 
 async fn run_resume(args: RunResumeArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let loaded = load_project_config(&repo_root)?;
-    let run = resume_run(&repo_root, &loaded.value, &args.thread, &args.run_id).await?;
+    let config = load_app_config(&repo_root)?;
+    let run = resume_run(&repo_root, &config, &args.thread, &args.run_id).await?;
     println!("run: {}", run.id);
     println!("status: {}", status_label(run.status));
     if let Some(summary) = run.summary {
@@ -169,10 +184,10 @@ fn run_cancel(args: RunCancelArgs) -> Result<()> {
 
 async fn run_retry_node(args: RunRetryNodeArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let loaded = load_project_config(&repo_root)?;
+    let config = load_app_config(&repo_root)?;
     let run = retry_task_node_and_resume(
         &repo_root,
-        &loaded.value,
+        &config,
         &args.thread,
         &args.run,
         &args.task_node_id,
@@ -232,6 +247,7 @@ fn task_kind_label(kind: TaskNodeKind) -> &'static str {
         TaskNodeKind::Plan => "plan",
         TaskNodeKind::Initialize => "initialize",
         TaskNodeKind::BuildExecutionContract => "build_execution_contract",
+        TaskNodeKind::PlanReview => "plan_review",
         TaskNodeKind::SelectNextFeature => "select_next_feature",
         TaskNodeKind::ExecuteFeature => "execute_feature",
         TaskNodeKind::EvaluateFeature => "evaluate_feature",

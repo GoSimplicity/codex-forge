@@ -22,8 +22,12 @@ impl HarnessStore {
         }
     }
 
+    fn store_root(&self) -> PathBuf {
+        self.repo_root.join(".codex-forge")
+    }
+
     fn threads_dir(&self) -> PathBuf {
-        self.repo_root.join(".codex-forge").join("threads")
+        self.store_root().join("threads")
     }
 
     fn thread_manifest_path(&self, thread_id: &str) -> PathBuf {
@@ -41,11 +45,14 @@ impl HarnessStore {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::TempDir;
 
     use crate::harness::types::{
-        AcceptanceCriterion, ApprovalStatus, EvaluationDecision, ExecutionContract, FeatureSlice,
-        FeatureSliceStatus, HarnessMessageRole, MemoryLayer, ProgressLedger, ToolCallRequest,
+        AcceptanceCriterion, AgentBackendKind, ApprovalStatus, EvaluationDecision,
+        ExecutionContract, FeatureSlice, FeatureSliceStatus, HarnessMessageRole, MemoryLayer,
+        ProgressLedger, ToolCallRequest,
     };
     use crate::model::ThinkingMode;
 
@@ -71,6 +78,7 @@ mod tests {
                 &thread.id,
                 Some("gpt-5".to_string()),
                 ThinkingMode::Balanced,
+                AgentBackendKind::Codex,
             )
             .expect("create run");
         let tool = store
@@ -148,7 +156,12 @@ mod tests {
         let store = HarnessStore::new(dir.path());
         let thread = store.create_thread(Some("长任务")).expect("thread");
         let run = store
-            .create_run(&thread.id, None, ThinkingMode::Balanced)
+            .create_run(
+                &thread.id,
+                None,
+                ThinkingMode::Balanced,
+                AgentBackendKind::Codex,
+            )
             .expect("run");
 
         let contract = ExecutionContract {
@@ -180,8 +193,11 @@ mod tests {
 
         let progress = ProgressLedger {
             goal: contract.goal.clone(),
+            current_phase: Some("执行".to_string()),
             completed_features: vec![],
             current_feature: Some("feature-1".to_string()),
+            latest_recoverable_failure: None,
+            blocking_reason: None,
             known_failures: vec![],
             decisions: vec!["先做持久化".to_string()],
             open_questions: vec![],
@@ -209,5 +225,76 @@ mod tests {
             .expect("append evaluation");
         let evaluations = store.list_evaluations(&run).expect("list evaluations");
         assert_eq!(evaluations.len(), 1);
+    }
+
+    #[test]
+    fn delete_thread_removes_manifest_and_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(dir.path());
+        let thread = store.create_thread(Some("待删除")).expect("thread");
+        assert!(thread.thread_dir.exists());
+
+        store.delete_thread(&thread.id).expect("delete thread");
+
+        assert!(!thread.thread_dir.exists());
+        assert!(store.load_thread(&thread.id).is_err());
+    }
+
+    #[test]
+    fn thread_and_run_data_live_under_codex_forge_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(dir.path());
+        let thread = store.create_thread(Some("持久化目录")).expect("thread");
+        let run = store
+            .create_run(
+                &thread.id,
+                None,
+                ThinkingMode::Balanced,
+                AgentBackendKind::Codex,
+            )
+            .expect("run");
+
+        assert!(
+            thread
+                .thread_dir
+                .starts_with(dir.path().join(".codex-forge")),
+            "{}",
+            thread.thread_dir.display()
+        );
+        assert!(
+            run.run_dir.starts_with(dir.path().join(".codex-forge")),
+            "{}",
+            run.run_dir.display()
+        );
+    }
+
+    #[test]
+    fn load_thread_repairs_empty_manifest() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = HarnessStore::new(dir.path());
+        let thread = store.create_thread(Some("恢复")).expect("thread");
+        store
+            .append_message(
+                &thread.id,
+                HarnessMessageRole::User,
+                "恢复一条消息".to_string(),
+                None,
+            )
+            .expect("append message");
+
+        let manifest_path = dir
+            .path()
+            .join(".codex-forge")
+            .join("threads")
+            .join(&thread.id)
+            .join("thread.json");
+        fs::write(&manifest_path, "").expect("truncate manifest");
+
+        let repaired = store.load_thread(&thread.id).expect("repair thread");
+        let repaired_raw = fs::read_to_string(&manifest_path).expect("read repaired manifest");
+
+        assert_eq!(repaired.id, thread.id);
+        assert_eq!(repaired.message_count, 1);
+        assert!(!repaired_raw.trim().is_empty());
     }
 }

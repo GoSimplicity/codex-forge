@@ -13,6 +13,7 @@ use crate::harness::types::{
 
 use super::executor::{
     ToolExecutionResult, materialize_text_artifact, required_string, required_string_alias,
+    resolve_repo_path, sync_sandbox_file_to_repo,
 };
 
 pub(super) fn execute_apply_patch(
@@ -33,7 +34,7 @@ pub(super) fn execute_apply_patch(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let target = sandbox.repo_workdir.join(&path);
+    let target = resolve_repo_path(thread, sandbox, &path)?;
     let original = fs::read_to_string(&target)
         .with_context(|| format!("读取待补丁文件失败：{}", target.display()))?;
     if !original.contains(&search) {
@@ -46,6 +47,7 @@ pub(super) fn execute_apply_patch(
     };
     fs::write(&target, &updated)
         .with_context(|| format!("写入补丁结果失败：{}", target.display()))?;
+    let host_target = sync_sandbox_file_to_repo(thread, sandbox, &target)?;
     let artifact = store.append_artifact(
         &thread.id,
         &run.id,
@@ -56,7 +58,10 @@ pub(super) fn execute_apply_patch(
         target,
     )?;
     Ok(ToolExecutionResult {
-        message: format!("apply_patch `{path}` 成功"),
+        message: format!(
+            "apply_patch `{path}` 成功，目标目录文件：{}",
+            host_target.display()
+        ),
         artifacts: vec![artifact],
     })
 }
@@ -423,6 +428,27 @@ fn merge_progress_patch(
     {
         progress.current_feature = Some(current.to_string());
     }
+    if let Some(phase) = object
+        .get("current_phase")
+        .or_else(|| object.get("phase"))
+        .and_then(Value::as_str)
+    {
+        progress.current_phase = Some(phase.to_string());
+    }
+    if let Some(failure) = object
+        .get("latest_recoverable_failure")
+        .or_else(|| object.get("recoverable_failure"))
+        .and_then(Value::as_str)
+    {
+        progress.latest_recoverable_failure = Some(failure.to_string());
+    }
+    if let Some(blocking_reason) = object
+        .get("blocking_reason")
+        .or_else(|| object.get("blocking"))
+        .and_then(Value::as_str)
+    {
+        progress.blocking_reason = Some(blocking_reason.to_string());
+    }
     if let Some(known_failures) = object.get("known_failures").and_then(Value::as_array) {
         progress.known_failures = known_failures
             .iter()
@@ -730,16 +756,21 @@ mod tests {
                 &thread.id,
                 Some("gpt-5".to_string()),
                 ThinkingMode::Balanced,
+                crate::harness::types::AgentBackendKind::Codex,
             )
             .expect("run");
-        let repo_workdir = run.run_dir.join("sandbox").join("repo");
-        fs::create_dir_all(&repo_workdir).expect("mkdir");
+        fs::create_dir_all(dir.path()).expect("mkdir");
         let sandbox = SandboxState {
             provider: "test".to_string(),
             image: "test-image".to_string(),
             container_name: "test-box".to_string(),
             workspace_root: run.run_dir.join("sandbox"),
-            repo_workdir,
+            repo_workdir: dir.path().to_path_buf(),
+            container_repo_workdir: "/workspace/repo".into(),
+            mount_strategy: "direct_rw".to_string(),
+            repair_owner_on_exit: false,
+            host_uid: None,
+            host_gid: None,
             active: true,
         };
         (dir, store, thread, run, sandbox)
@@ -747,7 +778,7 @@ mod tests {
 
     #[test]
     fn apply_patch_tool_updates_file() {
-        let (_dir, store, thread, run, sandbox) = setup();
+        let (dir, store, thread, run, sandbox) = setup();
         let path = sandbox.repo_workdir.join("demo.txt");
         fs::write(&path, "alpha\n").expect("write");
         let result = execute_apply_patch(
@@ -769,6 +800,10 @@ mod tests {
         .expect("apply patch");
         assert!(result.message.contains("apply_patch"));
         assert_eq!(fs::read_to_string(&path).expect("read"), "beta\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("demo.txt")).expect("read host"),
+            "beta\n"
+        );
     }
 
     #[test]

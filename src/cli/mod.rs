@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "codex-forge",
     version,
-    about = "基于 thread/run 的本地 Codex harness"
+    about = "基于 thread/run 的本地多 backend harness"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -27,7 +27,7 @@ pub enum Commands {
 
 #[derive(Debug, Clone, Args)]
 pub struct TuiArgs {
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
     #[arg(long, help = "启动时默认选中的 thread id")]
     pub thread: Option<String>,
@@ -50,13 +50,13 @@ pub enum ThreadCommands {
 pub struct ThreadNewArgs {
     #[arg(long, help = "线程标题；不传则按仓库名生成")]
     pub title: Option<String>,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ThreadListArgs {
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -64,7 +64,7 @@ pub struct ThreadListArgs {
 pub struct ThreadShowArgs {
     #[arg(help = "thread id")]
     pub thread_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -80,7 +80,7 @@ pub struct ChatArgs {
     pub model: Option<String>,
     #[arg(long, value_enum, help = "思考强度")]
     pub thinking_mode: Option<ThinkingModeArg>,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -104,7 +104,7 @@ pub enum RunCommands {
 pub struct RunListArgs {
     #[arg(long, help = "所属 thread id")]
     pub thread: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -114,7 +114,7 @@ pub struct RunShowArgs {
     pub thread: String,
     #[arg(help = "run id")]
     pub run_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -124,7 +124,7 @@ pub struct RunResumeArgs {
     pub thread: String,
     #[arg(help = "run id")]
     pub run_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -134,7 +134,7 @@ pub struct RunCancelArgs {
     pub thread: String,
     #[arg(help = "run id")]
     pub run_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -146,7 +146,7 @@ pub struct RunRetryNodeArgs {
     pub run: String,
     #[arg(help = "task node id")]
     pub task_node_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -158,7 +158,7 @@ pub struct RunNodeShowArgs {
     pub run: String,
     #[arg(help = "task node id")]
     pub task_node_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -168,7 +168,7 @@ pub struct ReplayArgs {
     pub thread: String,
     #[arg(help = "run id")]
     pub run_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -189,7 +189,7 @@ pub enum ApprovalCommands {
 pub struct ApprovalListArgs {
     #[arg(long, help = "只看某个 thread 的审批")]
     pub thread: Option<String>,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -199,7 +199,7 @@ pub struct ApprovalResolveArgs {
     pub thread: String,
     #[arg(help = "approval id")]
     pub approval_id: String,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -221,7 +221,7 @@ pub struct ArtifactListArgs {
     pub thread: Option<String>,
     #[arg(long, help = "只看某个 run 的 artifact；使用时必须同时指定 --thread")]
     pub run: Option<String>,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -231,7 +231,7 @@ pub struct ArtifactShowArgs {
     pub artifact_id: String,
     #[arg(long, help = "只在某个 thread 范围内查找")]
     pub thread: Option<String>,
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }
 
@@ -246,12 +246,31 @@ pub enum ConfigCommands {
     Init(ConfigTargetArgs),
     Show(ConfigTargetArgs),
     Validate(ConfigTargetArgs),
+    Set(ConfigSetArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ConfigTargetArgs {
-    #[arg(long, help = "目标仓库目录；不传则默认使用当前目录或其 Git 根")]
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "操作全局配置；默认 ~/.codex-forge/config.toml，也支持 CODEX_FORGE_HOME/config.toml"
+    )]
+    pub global: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ConfigSetArgs {
+    #[arg(
+        long,
+        help = "写入全局配置；默认 ~/.codex-forge/config.toml，也支持 CODEX_FORGE_HOME/config.toml"
+    )]
+    pub global: bool,
+    #[arg(help = "配置项；目前仅支持 backend.provider")]
+    pub key: String,
+    #[arg(help = "配置值；backend.provider 仅支持 codex 或 openai_compatible")]
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

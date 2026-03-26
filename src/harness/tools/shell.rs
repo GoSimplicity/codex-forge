@@ -18,9 +18,7 @@ pub(super) fn execute_run_shell(
     subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let command = required_string_alias(&call.arguments, &["command", "cmd"])?;
-    let provider = DockerSandboxProvider {
-        image: sandbox.image.clone(),
-    };
+    let provider = DockerSandboxProvider::from(sandbox);
     let result = provider.exec_shell(sandbox, &command)?;
     shell_result_to_artifacts(
         store,

@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -30,7 +31,8 @@ pub(super) fn overwrite_jsonl<T: serde::Serialize>(path: &Path, values: &[T]) ->
         lines.push('\n');
         lines
     };
-    fs::write(path, payload).with_context(|| format!("覆盖 JSONL 文件失败：{}", path.display()))
+    write_atomic(path, payload.as_bytes())
+        .with_context(|| format!("覆盖 JSONL 文件失败：{}", path.display()))
 }
 
 pub(super) fn rewrite_jsonl<T, F>(path: &Path, rewrite: F) -> Result<()>
@@ -97,4 +99,33 @@ fn ensure_parent(path: &Path) -> Result<()> {
         bail!("路径缺少父目录：{}", path.display());
     };
     fs::create_dir_all(parent).with_context(|| format!("创建父目录失败：{}", parent.display()))
+}
+
+pub(super) fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
+    ensure_parent(path)?;
+    let Some(parent) = path.parent() else {
+        bail!("路径缺少父目录：{}", path.display());
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("tmp");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    fs::write(&temp_path, payload)
+        .with_context(|| format!("写入临时文件失败：{}", temp_path.display()))?;
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| {
+            format!(
+                "原子替换文件失败：{} -> {}",
+                temp_path.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
 }

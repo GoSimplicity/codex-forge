@@ -1,7 +1,8 @@
 use std::fs;
+use std::path::Path;
 
-use anyhow::{Context, Result};
-use chrono::Utc;
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 
 use crate::harness::types::{
     HarnessEvent, HarnessEventRecord, HarnessMessage, HarnessMessageRole, HarnessThreadManifest,
@@ -9,7 +10,7 @@ use crate::harness::types::{
 
 use super::HarnessStore;
 use super::ids::make_id;
-use super::jsonl::{append_jsonl, read_jsonl};
+use super::jsonl::{append_jsonl, read_jsonl, write_atomic};
 
 impl HarnessStore {
     pub fn create_thread(&self, title: Option<&str>) -> Result<HarnessThreadManifest> {
@@ -86,22 +87,11 @@ impl HarnessStore {
             if !manifest_path.exists() {
                 continue;
             }
-            let raw = match fs::read_to_string(&manifest_path) {
-                Ok(raw) => raw,
-                Err(_) => continue,
-            };
-            let Ok(mut manifest) = serde_json::from_str::<HarnessThreadManifest>(&raw) else {
+            let thread_id = entry.file_name().to_string_lossy().to_string();
+            let Ok(manifest) = self.read_or_repair_thread_manifest(&thread_id, &manifest_path)
+            else {
                 continue;
             };
-            if manifest.contract_path.as_os_str().is_empty() {
-                manifest.contract_path = manifest.thread_dir.join("contract.json");
-            }
-            if manifest.progress_path.as_os_str().is_empty() {
-                manifest.progress_path = manifest.thread_dir.join("progress.json");
-            }
-            if manifest.bootstrap_path.as_os_str().is_empty() {
-                manifest.bootstrap_path = manifest.thread_dir.join("session-bootstrap.md");
-            }
             threads.push(manifest);
         }
 
@@ -111,20 +101,13 @@ impl HarnessStore {
 
     pub fn load_thread(&self, thread_id: &str) -> Result<HarnessThreadManifest> {
         let path = self.thread_manifest_path(thread_id);
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("读取 thread manifest 失败：{}", path.display()))?;
-        let mut thread: HarnessThreadManifest = serde_json::from_str(&raw)
-            .with_context(|| format!("解析 thread manifest 失败：{}", path.display()))?;
-        if thread.contract_path.as_os_str().is_empty() {
-            thread.contract_path = thread.thread_dir.join("contract.json");
-        }
-        if thread.progress_path.as_os_str().is_empty() {
-            thread.progress_path = thread.thread_dir.join("progress.json");
-        }
-        if thread.bootstrap_path.as_os_str().is_empty() {
-            thread.bootstrap_path = thread.thread_dir.join("session-bootstrap.md");
-        }
-        Ok(thread)
+        self.read_or_repair_thread_manifest(thread_id, &path)
+    }
+
+    pub fn delete_thread(&self, thread_id: &str) -> Result<()> {
+        let thread = self.load_thread(thread_id)?;
+        fs::remove_dir_all(&thread.thread_dir)
+            .with_context(|| format!("删除 thread 目录失败：{}", thread.thread_dir.display()))
     }
 
     pub fn append_message(
@@ -174,10 +157,123 @@ impl HarnessStore {
 
     pub(super) fn persist_thread(&self, thread: &HarnessThreadManifest) -> Result<()> {
         let path = self.thread_manifest_path(&thread.id);
-        fs::write(
+        write_atomic(
             &path,
-            serde_json::to_vec_pretty(thread).context("序列化 thread manifest 失败")?,
+            &serde_json::to_vec_pretty(thread).context("序列化 thread manifest 失败")?,
         )
         .with_context(|| format!("写入 thread manifest 失败：{}", path.display()))
     }
+
+    fn read_or_repair_thread_manifest(
+        &self,
+        thread_id: &str,
+        path: &Path,
+    ) -> Result<HarnessThreadManifest> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("读取 thread manifest 失败：{}", path.display()))?;
+        if raw.trim().is_empty() {
+            return self.rebuild_thread_manifest(thread_id, path);
+        }
+        match serde_json::from_str::<HarnessThreadManifest>(&raw) {
+            Ok(thread) => Ok(normalize_thread_manifest(thread)),
+            Err(error) if error.is_eof() => self.rebuild_thread_manifest(thread_id, path),
+            Err(error) => {
+                Err(error).with_context(|| format!("解析 thread manifest 失败：{}", path.display()))
+            }
+        }
+    }
+
+    fn rebuild_thread_manifest(
+        &self,
+        thread_id: &str,
+        path: &Path,
+    ) -> Result<HarnessThreadManifest> {
+        let thread_dir = path
+            .parent()
+            .ok_or_else(|| anyhow!("thread manifest 缺少父目录：{}", path.display()))?
+            .to_path_buf();
+        let messages_path = thread_dir.join("messages.jsonl");
+        let runs_dir = thread_dir.join("runs");
+        let approvals_dir = thread_dir.join("approvals");
+        let artifacts_dir = thread_dir.join("artifacts");
+        let memory_dir = thread_dir.join("memory");
+        let updated_at = infer_timestamp(path, &thread_dir);
+        let manifest = HarnessThreadManifest {
+            id: thread_id.to_string(),
+            title: default_thread_title(&self.repo_root),
+            repo_root: self.repo_root.clone(),
+            created_at: updated_at,
+            updated_at,
+            message_count: count_jsonl_records(&messages_path),
+            run_count: count_run_dirs(&runs_dir),
+            last_run_id: None,
+            last_run_status: None,
+            thread_dir,
+            messages_path,
+            runs_dir,
+            approvals_dir,
+            artifacts_dir,
+            memory_dir,
+            contract_path: path
+                .parent()
+                .ok_or_else(|| anyhow!("thread manifest 缺少父目录：{}", path.display()))?
+                .join("contract.json"),
+            progress_path: path
+                .parent()
+                .ok_or_else(|| anyhow!("thread manifest 缺少父目录：{}", path.display()))?
+                .join("progress.json"),
+            bootstrap_path: path
+                .parent()
+                .ok_or_else(|| anyhow!("thread manifest 缺少父目录：{}", path.display()))?
+                .join("session-bootstrap.md"),
+        };
+        self.persist_thread(&manifest)?;
+        Ok(manifest)
+    }
+}
+
+fn normalize_thread_manifest(mut thread: HarnessThreadManifest) -> HarnessThreadManifest {
+    if thread.contract_path.as_os_str().is_empty() {
+        thread.contract_path = thread.thread_dir.join("contract.json");
+    }
+    if thread.progress_path.as_os_str().is_empty() {
+        thread.progress_path = thread.thread_dir.join("progress.json");
+    }
+    if thread.bootstrap_path.as_os_str().is_empty() {
+        thread.bootstrap_path = thread.thread_dir.join("session-bootstrap.md");
+    }
+    thread
+}
+
+fn default_thread_title(repo_root: &Path) -> String {
+    let display_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    format!("{display_name} 主线程")
+}
+
+fn count_jsonl_records(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn count_run_dirs(path: &Path) -> usize {
+    fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().join("run.json").exists())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn infer_timestamp(manifest_path: &Path, thread_dir: &Path) -> DateTime<Utc> {
+    fs::metadata(manifest_path)
+        .and_then(|meta| meta.modified())
+        .or_else(|_| fs::metadata(thread_dir).and_then(|meta| meta.modified()))
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(|_| Utc::now())
 }

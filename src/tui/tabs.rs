@@ -5,52 +5,32 @@ pub(crate) enum FocusMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetailTab {
-    Messages,
-    Node,
-    Approvals,
-    Artifacts,
-    Events,
+pub(crate) enum BrowsePane {
+    Threads,
+    Runs,
+    Steps,
+    Detail,
+    Composer,
 }
 
-impl DetailTab {
-    pub(crate) fn all() -> [Self; 5] {
-        [
-            Self::Messages,
-            Self::Node,
-            Self::Approvals,
-            Self::Artifacts,
-            Self::Events,
-        ]
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Messages => "消息",
-            Self::Node => "节点",
-            Self::Approvals => "审批",
-            Self::Artifacts => "产物",
-            Self::Events => "事件",
-        }
-    }
-
+impl BrowsePane {
     pub(crate) fn next(self) -> Self {
         match self {
-            Self::Messages => Self::Node,
-            Self::Node => Self::Approvals,
-            Self::Approvals => Self::Artifacts,
-            Self::Artifacts => Self::Events,
-            Self::Events => Self::Messages,
+            Self::Threads => Self::Runs,
+            Self::Runs => Self::Steps,
+            Self::Steps => Self::Detail,
+            Self::Detail => Self::Composer,
+            Self::Composer => Self::Threads,
         }
     }
 
-    pub(crate) fn index(self) -> usize {
+    pub(crate) fn prev(self) -> Self {
         match self {
-            Self::Messages => 0,
-            Self::Node => 1,
-            Self::Approvals => 2,
-            Self::Artifacts => 3,
-            Self::Events => 4,
+            Self::Threads => Self::Composer,
+            Self::Runs => Self::Threads,
+            Self::Steps => Self::Runs,
+            Self::Detail => Self::Steps,
+            Self::Composer => Self::Detail,
         }
     }
 }

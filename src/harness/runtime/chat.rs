@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::ProjectConfig;
+use crate::config::AppConfig;
 use crate::model::ThinkingMode;
 
 use super::engine::{
@@ -26,7 +26,7 @@ pub struct ChatRequest {
 
 pub async fn chat_once(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     request: ChatRequest,
 ) -> Result<ChatRunOutcome> {
     let store = HarnessStore::new(repo_root);
@@ -38,11 +38,9 @@ pub async fn chat_once(
     )?;
     let mut run = store.create_run(
         &request.thread_id,
-        request
-            .model
-            .clone()
-            .or(config.backend.default_model.clone()),
+        request.model.clone().or(config.backend.model.clone()),
         request.thinking_mode,
+        config.backend.provider.into(),
     )?;
     run_execution(repo_root, config, &store, &mut run).await?;
     let thread = store.load_thread(&request.thread_id)?;
@@ -64,7 +62,7 @@ pub async fn chat_once(
 
 pub async fn resolve_approval_and_resume(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     thread_id: &str,
     approval_id: &str,
     status: ApprovalStatus,
@@ -109,10 +107,7 @@ pub async fn resolve_approval_and_resume(
         run.status = HarnessRunStatus::Completed;
         run.summary = Some("审批被拒绝，run 已结束".to_string());
         if let Some(sandbox) = &run.sandbox {
-            DockerSandboxProvider {
-                image: sandbox.image.clone(),
-            }
-            .destroy(sandbox)?;
+            DockerSandboxProvider::from(sandbox).destroy(sandbox)?;
         }
         run.sandbox = None;
         store.update_run(thread_id, &run)?;
@@ -120,7 +115,7 @@ pub async fn resolve_approval_and_resume(
     }
 
     let thread = store.load_thread(thread_id)?;
-    execute_and_record_tool(&store, &thread, &mut run, &approval.tool_call, &tool)?;
+    let _ = execute_and_record_tool(&store, &thread, &mut run, &approval.tool_call, &tool)?;
     if let Some(task_node_id) = approval.task_node_id.as_deref()
         && let Ok(mut node) = store.load_task_node(&run, task_node_id)
     {
@@ -131,6 +126,7 @@ pub async fn resolve_approval_and_resume(
     }
     run.status = HarnessRunStatus::Running;
     run.blocked_reason = None;
+    run.last_error = None;
     store.update_run(thread_id, &run)?;
 
     run_execution(repo_root, config, &store, &mut run).await?;
@@ -139,7 +135,7 @@ pub async fn resolve_approval_and_resume(
 
 pub async fn resume_run(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     thread_id: &str,
     run_id: &str,
 ) -> Result<HarnessRunManifest> {
@@ -147,6 +143,7 @@ pub async fn resume_run(
     let mut run = store.load_run(thread_id, run_id)?;
     run.status = HarnessRunStatus::Running;
     run.blocked_reason = None;
+    run.last_error = None;
     store.update_run(thread_id, &run)?;
     run_execution(repo_root, config, &store, &mut run).await?;
     Ok(run)
@@ -165,7 +162,7 @@ pub fn cancel_active_run(
 
 pub async fn retry_task_node_and_resume(
     repo_root: &Path,
-    config: &ProjectConfig,
+    config: &AppConfig,
     thread_id: &str,
     run_id: &str,
     task_node_id: &str,
@@ -176,6 +173,7 @@ pub async fn retry_task_node_and_resume(
     run.active_task_node_id = Some(task_node_id.to_string());
     run.status = HarnessRunStatus::Running;
     run.blocked_reason = None;
+    run.last_error = None;
     store.update_run(thread_id, &run)?;
     run_execution(repo_root, config, &store, &mut run).await?;
     Ok(run)

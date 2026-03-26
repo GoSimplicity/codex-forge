@@ -33,6 +33,8 @@ pub async fn run_tui(args: TuiArgs) -> Result<()> {
 
     let result = async {
         loop {
+            app.poll_background_tasks().await?;
+            app.maybe_auto_refresh()?;
             terminal.draw(|frame| app.render(frame))?;
             if event::poll(Duration::from_millis(150))? {
                 let Event::Key(key) = event::read()? else {

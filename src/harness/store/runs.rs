@@ -13,7 +13,9 @@ use crate::model::ThinkingMode;
 
 use super::HarnessStore;
 use super::ids::make_id;
-use super::jsonl::{append_jsonl, overwrite_jsonl, read_jsonl, replace_by_id, rewrite_jsonl};
+use super::jsonl::{
+    append_jsonl, overwrite_jsonl, read_jsonl, replace_by_id, rewrite_jsonl, write_atomic,
+};
 
 impl HarnessStore {
     pub fn create_run(
@@ -21,6 +23,7 @@ impl HarnessStore {
         thread_id: &str,
         model: Option<String>,
         thinking_mode: ThinkingMode,
+        backend: AgentBackendKind,
     ) -> Result<HarnessRunManifest> {
         let mut thread = self.load_thread(thread_id)?;
         let id = make_id("run");
@@ -36,7 +39,7 @@ impl HarnessStore {
             updated_at: now,
             model,
             thinking_mode,
-            backend: AgentBackendKind::Codex,
+            backend,
             turn_count: 0,
             summary: None,
             last_error: None,
@@ -321,9 +324,9 @@ impl HarnessStore {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        fs::write(
+        write_atomic(
             &run.task_graph_path,
-            serde_json::to_vec_pretty(&graph).context("序列化 task graph 失败")?,
+            &serde_json::to_vec_pretty(&graph).context("序列化 task graph 失败")?,
         )
         .with_context(|| format!("写入 task graph 失败：{}", run.task_graph_path.display()))?;
         Ok(graph)
@@ -404,9 +407,9 @@ impl HarnessStore {
 
     fn persist_run(&self, thread_id: &str, run: &HarnessRunManifest) -> Result<()> {
         let path = self.run_manifest_path(thread_id, &run.id);
-        fs::write(
+        write_atomic(
             &path,
-            serde_json::to_vec_pretty(run).context("序列化 run manifest 失败")?,
+            &serde_json::to_vec_pretty(run).context("序列化 run manifest 失败")?,
         )
         .with_context(|| format!("写入 run manifest 失败：{}", path.display()))
     }

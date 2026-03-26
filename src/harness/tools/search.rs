@@ -9,7 +9,9 @@ use crate::harness::types::{
     ArtifactKind, HarnessRunManifest, HarnessThreadManifest, SandboxState, ToolCallRequest,
 };
 
-use super::executor::{ToolExecutionResult, materialize_text_artifact, required_string_alias};
+use super::executor::{
+    ToolExecutionResult, materialize_text_artifact, required_string_alias, resolve_repo_path,
+};
 
 pub(super) fn execute_search_files(
     store: &HarnessStore,
@@ -21,7 +23,7 @@ pub(super) fn execute_search_files(
     subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let pattern = required_string_alias(&call.arguments, &["pattern", "query", "q", "keyword"])?;
-    let search_root = resolve_search_root(sandbox.repo_workdir.clone(), &call.arguments);
+    let search_root = resolve_search_root(thread, sandbox, &call.arguments)?;
     let max_results = call
         .arguments
         .get("max_results")
@@ -58,12 +60,15 @@ pub(super) fn execute_search_files(
     })
 }
 
-fn resolve_search_root(repo_workdir: PathBuf, arguments: &Value) -> PathBuf {
-    arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .map(|path| repo_workdir.join(path))
-        .unwrap_or(repo_workdir)
+fn resolve_search_root(
+    thread: &HarnessThreadManifest,
+    sandbox: &SandboxState,
+    arguments: &Value,
+) -> Result<PathBuf> {
+    match arguments.get("path").and_then(Value::as_str) {
+        Some(path) => resolve_repo_path(thread, sandbox, path),
+        None => Ok(sandbox.repo_workdir.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -88,17 +93,21 @@ mod tests {
                 &thread.id,
                 Some("gpt-5".to_string()),
                 ThinkingMode::Balanced,
+                crate::harness::types::AgentBackendKind::Codex,
             )
             .expect("run");
-        let repo_workdir = run.run_dir.join("sandbox").join("repo");
-        fs::create_dir_all(&repo_workdir).expect("mkdir");
-        fs::write(repo_workdir.join("README.md"), "hello codex-forge\n").expect("write");
+        fs::write(dir.path().join("README.md"), "hello codex-forge\n").expect("write");
         let sandbox = SandboxState {
             provider: "test".to_string(),
             image: "test-image".to_string(),
             container_name: "test-box".to_string(),
             workspace_root: run.run_dir.join("sandbox"),
-            repo_workdir,
+            repo_workdir: dir.path().to_path_buf(),
+            container_repo_workdir: "/workspace/repo".into(),
+            mount_strategy: "direct_rw".to_string(),
+            repair_owner_on_exit: false,
+            host_uid: None,
+            host_gid: None,
             active: true,
         };
 

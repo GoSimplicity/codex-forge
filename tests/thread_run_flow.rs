@@ -55,12 +55,12 @@ fn thread_new_list_chat_run_and_replay_work() {
         .expect("run chat");
     assert!(chat.status.success(), "{:?}", chat);
     let chat_stdout = String::from_utf8_lossy(&chat.stdout);
-    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
     let run_id = chat_stdout
         .lines()
         .find_map(|line| line.strip_prefix("run: "))
         .expect("run id")
         .to_string();
+    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
 
     let run_show = command(bin, repo.path())
         .args([

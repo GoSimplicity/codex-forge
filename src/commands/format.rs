@@ -30,6 +30,9 @@ pub fn describe_event(event: &HarnessEvent) -> String {
             "工具 `{tool_call_id}` 执行结束：{}",
             tool_status_label(*status)
         ),
+        HarnessEvent::RecoverableFailureDetected { source, detail, .. } => {
+            format!("检测到可恢复失败：{source} | {detail}")
+        }
         HarnessEvent::ApprovalRequested {
             approval_id,
             tool_name,
@@ -56,6 +59,9 @@ pub fn describe_event(event: &HarnessEvent) -> String {
             status,
             ..
         } => format!("子代理 `{subagent_id}` 已结束：{}", status_label(*status)),
+        HarnessEvent::AgentHandoff {
+            from, to, reason, ..
+        } => format!("代理切换：{from} -> {to} | {reason}"),
         HarnessEvent::TaskGraphCreated {
             graph_id, strategy, ..
         } => format!("创建任务图 `{graph_id}`：{:?}", strategy),
@@ -78,6 +84,11 @@ pub fn describe_event(event: &HarnessEvent) -> String {
         HarnessEvent::TaskNodeRetried { task_node_id, .. } => {
             format!("节点 `{task_node_id}` 已重试")
         }
+        HarnessEvent::EvidenceInsufficient {
+            task_node_id,
+            detail,
+            ..
+        } => format!("节点 `{task_node_id}` 证据不足：{detail}"),
         HarnessEvent::RunCompleted { run_id, .. } => format!("run `{run_id}` 已完成"),
         HarnessEvent::RunCancelled { run_id, .. } => format!("run `{run_id}` 已取消"),
         HarnessEvent::RunFailed { run_id, error, .. } => {

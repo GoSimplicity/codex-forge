@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use crate::harness::store::HarnessStore;
 use crate::harness::types::{
@@ -174,4 +175,81 @@ pub(super) fn required_string_alias(arguments: &Value, keys: &[&str]) -> Result<
         }
     }
     Err(anyhow::anyhow!("缺少字符串参数：{}", keys.join(" / ")))
+}
+
+pub(super) fn resolve_repo_path(
+    thread: &HarnessThreadManifest,
+    sandbox: &SandboxState,
+    raw_path: &str,
+) -> Result<PathBuf> {
+    let candidate = Path::new(raw_path);
+    if candidate.is_absolute() {
+        let relative = candidate
+            .strip_prefix(&thread.repo_root)
+            .map_err(|_| anyhow!("路径超出当前仓库范围：{raw_path}"))?;
+        validate_relative_path(relative)?;
+        return Ok(sandbox.repo_workdir.join(relative));
+    }
+
+    validate_relative_path(candidate)?;
+    Ok(sandbox.repo_workdir.join(candidate))
+}
+
+pub(super) fn sync_sandbox_file_to_repo(
+    thread: &HarnessThreadManifest,
+    sandbox: &SandboxState,
+    sandbox_path: &Path,
+) -> Result<PathBuf> {
+    if sandbox.mount_strategy == "direct_rw" {
+        let relative = sandbox_path
+            .strip_prefix(&thread.repo_root)
+            .with_context(|| {
+                format!(
+                    "直接挂载模式下路径不在目标目录内：{}（repo={})",
+                    sandbox_path.display(),
+                    thread.repo_root.display()
+                )
+            })?;
+        validate_relative_path(relative)?;
+        if !sandbox_path.exists() {
+            bail!("目标文件未落到宿主目录：{}", sandbox_path.display());
+        }
+        return Ok(sandbox_path.to_path_buf());
+    }
+
+    let relative = sandbox_path
+        .strip_prefix(&sandbox.repo_workdir)
+        .with_context(|| {
+            format!(
+                "沙箱路径不在 repo 工作区内：{}（repo={})",
+                sandbox_path.display(),
+                sandbox.repo_workdir.display()
+            )
+        })?;
+    validate_relative_path(relative)?;
+    let host_path = thread.repo_root.join(relative);
+    if let Some(parent) = host_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建目标目录失败：{}", parent.display()))?;
+    }
+    fs::copy(sandbox_path, &host_path).with_context(|| {
+        format!(
+            "同步文件回目标目录失败：{} -> {}",
+            sandbox_path.display(),
+            host_path.display()
+        )
+    })?;
+    Ok(host_path)
+}
+
+fn validate_relative_path(path: &Path) -> Result<()> {
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("不允许访问仓库外路径：{}", path.display());
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(())
 }

@@ -18,6 +18,10 @@ pub fn parse_turn_envelope(raw: &str) -> Result<TurnEnvelope> {
         bail!("backend 返回为空");
     }
 
+    if looks_like_incomplete_structured_payload(trimmed) {
+        bail!("backend 返回疑似截断或不完整的结构化内容");
+    }
+
     Ok(TurnEnvelope {
         assistant_message: Some(trimmed.to_string()),
         tool_calls: Vec::new(),
@@ -97,6 +101,17 @@ fn extract_fenced_json_block(text: &str) -> Option<String> {
     }
 }
 
+fn looks_like_incomplete_structured_payload(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with("```json") && !trimmed.ends_with("```") {
+        return true;
+    }
+    if trimmed.starts_with('{') || trimmed.contains("\"assistant_message\"") {
+        return extract_json_object(trimmed).is_none();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_turn_envelope;
@@ -116,5 +131,14 @@ mod tests {
         .expect("parse");
         assert_eq!(envelope.tool_calls.len(), 1);
         assert!(!envelope.final_response);
+    }
+
+    #[test]
+    fn rejects_truncated_structured_payload() {
+        let error = parse_turn_envelope(
+            "{\"assistant_message\":\"半截\",\"tool_calls\":[{\"name\":\"read_file\"}]",
+        )
+        .expect_err("should fail");
+        assert!(format!("{error:#}").contains("疑似截断"));
     }
 }
