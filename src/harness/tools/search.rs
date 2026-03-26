@@ -77,6 +77,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::config::BackendProvider;
     use crate::harness::store::HarnessStore;
     use crate::harness::types::{SandboxState, ToolCallRequest};
     use crate::model::ThinkingMode;
@@ -86,7 +87,7 @@ mod tests {
     #[test]
     fn search_files_accepts_query_alias() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("搜索")).expect("thread");
         let run = store
             .create_run(

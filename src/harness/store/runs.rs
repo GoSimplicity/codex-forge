@@ -5,9 +5,9 @@ use chrono::Utc;
 
 use crate::harness::types::{
     AgentBackendKind, ApprovalRecord, ApprovalStatus, HarnessEvent, HarnessEventRecord,
-    HarnessRunManifest, HarnessRunStatus, HarnessThreadManifest, SubagentKind, SubagentRecord,
-    TaskGraphManifest, TaskGraphStrategy, TaskNodeKind, TaskNodeRecord, TaskNodeStatus,
-    ToolCallRecord, ToolCallRequest, ToolCallStatus,
+    HarnessRunManifest, HarnessRunStatus, HarnessThreadManifest, RunExecutionKind, SubagentKind,
+    SubagentRecord, TaskGraphManifest, TaskGraphStrategy, TaskNodeKind, TaskNodeRecord,
+    TaskNodeStatus, ToolCallRecord, ToolCallRequest, ToolCallStatus,
 };
 use crate::model::ThinkingMode;
 
@@ -40,6 +40,7 @@ impl HarnessStore {
             model,
             thinking_mode,
             backend,
+            execution_kind: default_execution_kind_for_backend(backend),
             turn_count: 0,
             summary: None,
             last_error: None,
@@ -412,5 +413,12 @@ impl HarnessStore {
             &serde_json::to_vec_pretty(run).context("序列化 run manifest 失败")?,
         )
         .with_context(|| format!("写入 run manifest 失败：{}", path.display()))
+    }
+}
+
+fn default_execution_kind_for_backend(backend: AgentBackendKind) -> RunExecutionKind {
+    match backend {
+        AgentBackendKind::Codex => RunExecutionKind::AutonomousCodex,
+        AgentBackendKind::OpenAiCompatible => RunExecutionKind::Orchestrated,
     }
 }

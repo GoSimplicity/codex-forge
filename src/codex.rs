@@ -63,6 +63,50 @@ pub async fn run_text_once(
     Err(last_error.unwrap_or_else(|| anyhow!("未知文本调用失败")))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn run_plain_once(
+    prompt: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    thinking_mode: ThinkingMode,
+    timeout_secs: u64,
+    output_path: &Path,
+    log_path: &Path,
+    max_retries: usize,
+) -> Result<String> {
+    let attempts = max_retries.max(1);
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        match run_plain_attempt(
+            prompt,
+            cwd,
+            model,
+            thinking_mode,
+            timeout_secs,
+            output_path,
+            log_path,
+        )
+        .await
+        {
+            Ok(content) => return Ok(content),
+            Err(error) => {
+                append_text(
+                    log_path,
+                    &format!("\n[attempt {attempt}/{attempts}] plain call failed: {error}\n"),
+                )?;
+                last_error = Some(error);
+                if attempt == attempts {
+                    break;
+                }
+                sleep(backoff_for(attempt)).await;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("未知 Codex 调用失败")))
+}
+
 async fn run_text_attempt(
     prompt: &str,
     cwd: &Path,
@@ -132,6 +176,86 @@ async fn run_text_attempt(
         bail!(
             "{}",
             format_codex_failure("Codex 文本调用失败", &captured.stderr)
+        );
+    }
+
+    read_output_file(output_path)
+}
+
+async fn run_plain_attempt(
+    prompt: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    thinking_mode: ThinkingMode,
+    timeout_secs: u64,
+    output_path: &Path,
+    log_path: &Path,
+) -> Result<String> {
+    let mut command = Command::new("codex");
+    configure_codex_command(&mut command, thinking_mode);
+    command
+        .arg("exec")
+        .arg("--skip-git-repo-check")
+        .arg("--ephemeral")
+        .arg("--color")
+        .arg("never")
+        .arg("-C")
+        .arg(cwd)
+        .arg("-o")
+        .arg(output_path);
+
+    if let Some(model) = model {
+        command.arg("-m").arg(model);
+    }
+
+    command
+        .kill_on_drop(true)
+        .arg(prompt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    prepare_log_file(log_path)?;
+    let mut child = command.spawn().context("执行 codex exec 自主调用失败")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Codex stdout 未成功捕获"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Codex stderr 未成功捕获"))?;
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let stdout_task = tokio::spawn(read_stream(stdout, StreamSource::Stdout, tx.clone()));
+    let stderr_task = tokio::spawn(read_stream(stderr, StreamSource::Stderr, tx.clone()));
+    drop(tx);
+    let logger_task = tokio::spawn(write_stream_log(log_path.to_path_buf(), rx));
+
+    let status = match timeout(Duration::from_secs(timeout_secs.max(1)), child.wait()).await {
+        Ok(result) => result.context("等待 codex exec 结束失败")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let captured = logger_task.await.context("写入实时日志任务失败")??;
+            return recover_timeout_plain_output(
+                output_path,
+                log_path,
+                timeout_secs,
+                &captured.stderr,
+            );
+        }
+    };
+
+    stdout_task.await.context("读取 Codex stdout 任务失败")??;
+    stderr_task.await.context("读取 Codex stderr 任务失败")??;
+    let captured = logger_task.await.context("写入实时日志任务失败")??;
+
+    if !status.success() {
+        bail!(
+            "{}",
+            format_codex_failure("Codex 自主执行失败", &captured.stderr)
         );
     }
 
@@ -216,6 +340,35 @@ fn recover_timeout_output(
     Ok(content)
 }
 
+fn recover_timeout_plain_output(
+    output_path: &Path,
+    log_path: &Path,
+    timeout_secs: u64,
+    stderr: &str,
+) -> Result<String> {
+    let content = match fs::read_to_string(output_path) {
+        Ok(content) if !content.trim().is_empty() => content,
+        _ => {
+            bail!(
+                "{}",
+                format_codex_failure(
+                    &format!("Codex 自主执行超时（>{timeout_secs}s），且没有可恢复输出"),
+                    stderr
+                )
+            );
+        }
+    };
+
+    append_text(
+        log_path,
+        &format!(
+            "\n[timeout recovery] Codex 自主执行超时（>{timeout_secs}s），但已从结果文件恢复输出：{}\n",
+            output_path.display()
+        ),
+    )?;
+    Ok(content)
+}
+
 fn looks_like_turn_envelope(content: &str) -> bool {
     let trimmed = content.trim();
     trimmed.starts_with('{') && serde_json::from_str::<TurnEnvelope>(trimmed).is_ok()
@@ -237,7 +390,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use super::{configure_codex_command, looks_like_turn_envelope, run_text_once};
+    use super::{
+        configure_codex_command, format_codex_failure, looks_like_turn_envelope, run_text_once,
+    };
     use crate::model::ThinkingMode;
     use once_cell::sync::Lazy;
     use tempfile::TempDir;
@@ -272,6 +427,15 @@ mod tests {
             r#"{"assistant_message":"ok","tool_calls":[],"subagent_calls":[],"final_response":true}"#
         ));
         assert!(!looks_like_turn_envelope("普通文本回复"));
+    }
+
+    #[test]
+    fn format_codex_failure_filters_known_startup_noise() {
+        let stderr = "mcp startup: no servers\nwarning: Model metadata for `MiniMax-M2.7` not found.Defaulting to fallback metadata; this can degrade performance\nreal failure";
+        assert_eq!(
+            format_codex_failure("Codex 文本调用失败", stderr),
+            "Codex 文本调用失败：real failure"
+        );
     }
 
     #[tokio::test]
@@ -479,12 +643,29 @@ JSON
 }
 
 fn format_codex_failure(prefix: &str, stderr: &str) -> String {
-    let trimmed = stderr.trim();
+    let trimmed = sanitize_codex_stderr(stderr);
     if trimmed.is_empty() {
         prefix.to_string()
     } else {
         format!("{prefix}：{trimmed}")
     }
+}
+
+fn sanitize_codex_stderr(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| !is_ignorable_codex_stderr_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn is_ignorable_codex_stderr_line(line: &str) -> bool {
+    let lower = line.trim().to_lowercase();
+    lower.starts_with("mcp startup: no servers")
+        || (lower.contains("model metadata for")
+            && lower.contains("defaulting to fallback metadata"))
 }
 
 fn backoff_for(attempt: usize) -> Duration {

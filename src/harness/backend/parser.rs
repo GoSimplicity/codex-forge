@@ -3,13 +3,7 @@ use anyhow::{Result, bail};
 use crate::harness::types::{BackendSubagentCall, TurnEnvelope};
 
 pub fn parse_turn_envelope(raw: &str) -> Result<TurnEnvelope> {
-    if let Ok(envelope) = serde_json::from_str::<TurnEnvelope>(raw) {
-        return Ok(normalize_turn_envelope(envelope));
-    }
-
-    if let Some(json) = extract_json_object(raw)
-        && let Ok(envelope) = serde_json::from_str::<TurnEnvelope>(&json)
-    {
+    if let Some(envelope) = parse_structured_turn_envelope(raw) {
         return Ok(normalize_turn_envelope(envelope));
     }
 
@@ -46,6 +40,36 @@ fn normalize_turn_envelope(mut envelope: TurnEnvelope) -> TurnEnvelope {
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
     envelope
+}
+
+fn parse_structured_turn_envelope(raw: &str) -> Option<TurnEnvelope> {
+    if let Ok(envelope) = serde_json::from_str::<TurnEnvelope>(raw) {
+        return Some(envelope);
+    }
+
+    if let Some(json) = extract_json_object(raw)
+        && let Ok(envelope) = serde_json::from_str::<TurnEnvelope>(&json)
+    {
+        return Some(envelope);
+    }
+
+    let decoded = serde_json::from_str::<String>(raw).ok()?;
+    let trimmed = decoded.trim();
+    if trimmed.is_empty() || trimmed == raw.trim() {
+        return None;
+    }
+
+    if let Ok(envelope) = serde_json::from_str::<TurnEnvelope>(trimmed) {
+        return Some(envelope);
+    }
+
+    if let Some(json) = extract_json_object(trimmed)
+        && let Ok(envelope) = serde_json::from_str::<TurnEnvelope>(&json)
+    {
+        return Some(envelope);
+    }
+
+    None
 }
 
 fn extract_json_object(text: &str) -> Option<String> {
@@ -130,6 +154,17 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(envelope.tool_calls.len(), 1);
+        assert!(!envelope.final_response);
+    }
+
+    #[test]
+    fn parses_json_string_wrapped_envelope() {
+        let envelope = parse_turn_envelope(
+            "\"{\\\"assistant_message\\\":\\\"先读文件\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"read_file\\\",\\\"arguments\\\":{\\\"path\\\":\\\"README.md\\\"}}],\\\"final_response\\\":false}\"",
+        )
+        .expect("parse");
+        assert_eq!(envelope.tool_calls.len(), 1);
+        assert_eq!(envelope.assistant_message.as_deref(), Some("先读文件"));
         assert!(!envelope.final_response);
     }
 

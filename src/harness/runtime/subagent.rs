@@ -9,6 +9,7 @@ use crate::harness::backend::{
     AgentBackend, BackendTurnRequest, ResolvedBackend, ToolDescriptor, built_in_tools,
 };
 use crate::harness::store::HarnessStore;
+use crate::harness::tools::normalize_tool_call;
 use crate::harness::types::{
     ArtifactKind, EvaluationDecision, HarnessEvent, HarnessMessageRole, HarnessRunManifest,
     HarnessRunStatus, SubagentKind, TaskNodeRecord, ToolCallRecord, ToolCallRequest,
@@ -133,7 +134,8 @@ pub(super) async fn execute_subagent(
         let handoff_requested = handoff_to_evaluator_requested(&envelope);
         let mut executed_mutating_tool = false;
         if has_tool_calls {
-            for call in envelope.tool_calls.clone() {
+            for raw_call in envelope.tool_calls.clone() {
+                let call = normalize_tool_call(&raw_call);
                 let record = record_tool_planned(
                     store,
                     run,
@@ -141,7 +143,7 @@ pub(super) async fn execute_subagent(
                     Some(node.id.clone()),
                     Some(subagent.id.clone()),
                 )?;
-                if tool_needs_approval(&call) {
+                if subagent_tool_needs_approval(config, &call) {
                     subagent.status = HarnessRunStatus::WaitingForInput;
                     subagent.summary = Some(format!("等待审批后继续：{}", call.name));
                     store.update_subagent(run, &subagent)?;
@@ -159,6 +161,19 @@ pub(super) async fn execute_subagent(
             }
         }
 
+        if let Some(feedback) = invalid_subagent_delegation_feedback(kind, &envelope) {
+            store.append_message(
+                &run.thread_id,
+                HarnessMessageRole::System,
+                feedback,
+                Some(run.id.clone()),
+            )?;
+            subagent.summary = Some("子代理尝试继续派生，已要求直接收敛结论".to_string());
+            subagent.updated_at = Utc::now();
+            store.update_subagent(run, &subagent)?;
+            continue;
+        }
+
         if kind == SubagentKind::Generator {
             let requires_mutating_evidence = node_requires_mutating_evidence(node);
             let has_evidence = if requires_mutating_evidence {
@@ -169,6 +184,20 @@ pub(super) async fn execute_subagent(
             if executed_mutating_tool || (!requires_mutating_evidence && has_evidence) {
                 complete_subagent_success(store, run, node, &mut subagent, assistant_summary)?;
                 return Ok(());
+            }
+            if generator_requires_real_changes_feedback(
+                requires_mutating_evidence,
+                has_tool_calls,
+                executed_mutating_tool,
+            ) {
+                request_generator_real_changes(
+                    store,
+                    run,
+                    node,
+                    &mut subagent,
+                    &assistant_summary,
+                )?;
+                continue;
             }
             if handoff_requested {
                 if has_evidence {
@@ -198,8 +227,7 @@ pub(super) async fn execute_subagent(
         } else if kind == SubagentKind::Planner {
             let has_evidence = planner_has_minimum_evidence(store, run, node)?;
             let evidence_insufficient = planner_reports_insufficient_evidence(&assistant_summary);
-            if envelope.final_response || (envelope.assistant_message.is_some() && !has_tool_calls)
-            {
+            if envelope.final_response || envelope.assistant_message.is_some() {
                 if has_evidence || evidence_insufficient {
                     if !has_evidence {
                         store.append_run_event(
@@ -227,7 +255,7 @@ pub(super) async fn execute_subagent(
         }
     }
 
-    let error = subagent_max_turn_error(kind, max_turns);
+    let error = subagent_max_turn_error(kind, max_turns, &node.title);
     subagent.status = HarnessRunStatus::Failed;
     subagent.error = Some(error.clone());
     store.update_subagent(run, &subagent)?;
@@ -251,15 +279,19 @@ fn subagent_turn_budget(config: &AppConfig, kind: SubagentKind) -> usize {
     }
 }
 
-fn subagent_max_turn_error(kind: SubagentKind, max_turns: usize) -> String {
+fn subagent_max_turn_error(kind: SubagentKind, max_turns: usize, node_title: &str) -> String {
     match kind {
         SubagentKind::Generator => format!(
-            "子代理 {:?} 达到最大 turn 仍未完成（已执行 {max_turns}/{max_turns} 轮，可调大 runtime.max_generator_turns）",
-            kind
+            "子代理 {:?} 在当前 feature `{}` 上达到最大 turn 仍未完成（已执行 {max_turns}/{max_turns} 轮，可调大 runtime.max_generator_turns；如需继续，请重试当前节点）。",
+            kind, node_title
         ),
-        SubagentKind::Planner | SubagentKind::Evaluator => format!(
-            "子代理 {:?} 达到最大 turn 仍未完成（已执行 {max_turns}/{max_turns} 轮）",
-            kind
+        SubagentKind::Planner => format!(
+            "子代理 Planner 在节点 `{}` 上经过 {max_turns}/{max_turns} 轮后仍未收敛，通常是事实证据不足或一直没有直接给出结论；请补充入口/实现文件证据后重试，或明确写“证据不足”。",
+            node_title
+        ),
+        SubagentKind::Evaluator => format!(
+            "子代理 Evaluator 在节点 `{}` 上经过 {max_turns}/{max_turns} 轮后仍未完成评估；请直接基于现有 evidence 给出通过/失败结论。",
+            node_title
         ),
     }
 }
@@ -296,7 +328,7 @@ fn request_generator_real_changes(
     assistant_summary: &str,
 ) -> Result<()> {
     let feedback = format!(
-        "generator 反馈：当前节点 `{}` 还没有任何已验证的实现落地证据，不能按“已完成”继续。上一轮摘要：{}。下一轮必须实际调用 write_file / apply_patch / run_shell 落地修改，或先读取已存在文件并基于仓库事实说明结果。",
+        "generator 反馈：当前节点 `{}` 还没有任何已验证的实现落地证据，不能按“已完成”继续。上一轮摘要：{}。如果你已经读过文档或目录，不要重复调用 read_file / list_tree / search_files 读取同一份上下文；下一轮只允许实际调用 write_file / apply_patch / run_shell 之一来落地修改，审批会由 harness 挂起并恢复。如果你判断当前节点确实无法实施，就直接 final_response=true 明确说明阻塞原因，但不要继续只读探索。",
         node.title, assistant_summary
     );
     store.append_message(
@@ -308,6 +340,14 @@ fn request_generator_real_changes(
     subagent.summary = Some("缺少实际落地证据，继续要求 generator 给出真实修改".to_string());
     subagent.updated_at = Utc::now();
     store.update_subagent(run, subagent)
+}
+
+fn generator_requires_real_changes_feedback(
+    requires_mutating_evidence: bool,
+    has_tool_calls: bool,
+    executed_mutating_tool: bool,
+) -> bool {
+    requires_mutating_evidence && has_tool_calls && !executed_mutating_tool
 }
 
 fn request_planner_more_evidence(
@@ -348,6 +388,44 @@ fn handoff_to_evaluator_requested(envelope: &TurnEnvelope) -> bool {
             .any(|call| call.kind == SubagentKind::Evaluator)
 }
 
+fn invalid_subagent_delegation_feedback(
+    kind: SubagentKind,
+    envelope: &TurnEnvelope,
+) -> Option<String> {
+    if envelope.subagent_calls.is_empty() {
+        return None;
+    }
+
+    let requested = envelope
+        .subagent_calls
+        .iter()
+        .map(|call| match call.kind {
+            SubagentKind::Planner => "planner",
+            SubagentKind::Generator => "generator",
+            SubagentKind::Evaluator => "evaluator",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match kind {
+        SubagentKind::Planner => Some(format!(
+            "planner 反馈：当前 harness 不支持在 planner 子代理内部继续使用 subagent_calls（请求了：{requested}）。下一轮请直接用 tool_calls 补充事实，或 final_response=true 直接给出结论；如果仓库证据不足，请明确写“证据不足”。"
+        )),
+        SubagentKind::Evaluator => Some(format!(
+            "evaluator 反馈：当前 harness 不支持在 evaluator 子代理内部继续使用 subagent_calls（请求了：{requested}）。请直接基于现有证据返回 evaluation 结论。"
+        )),
+        SubagentKind::Generator => envelope
+            .subagent_calls
+            .iter()
+            .any(|call| call.kind != SubagentKind::Evaluator)
+            .then(|| {
+                format!(
+                    "generator 反馈：当前 harness 不支持 generator 继续派生 {requested}。如果需要验收，只设置 needs_handoff=true 或请求 evaluator，不要再派生 planner/generator。"
+                )
+            }),
+    }
+}
+
 fn planner_reports_insufficient_evidence(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("证据不足")
@@ -362,8 +440,9 @@ fn planner_has_minimum_evidence(
     node: &TaskNodeRecord,
 ) -> Result<bool> {
     let tool_calls = store.list_tool_calls(run)?;
-    let mut has_entry_or_config = false;
+    let mut has_context_source = false;
     let mut has_implementation = false;
+    let requires_implementation = planner_requires_implementation_evidence(node);
     for record in tool_calls {
         if record.task_node_id.as_deref() != Some(node.id.as_str())
             || record.status != ToolCallStatus::Succeeded
@@ -377,24 +456,49 @@ fn planner_has_minimum_evidence(
                     .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if path_looks_like_entry_or_config(path) {
-                    has_entry_or_config = true;
+                if path_looks_like_planner_context(path) {
+                    has_context_source = true;
                 }
                 if path_looks_like_implementation(path) {
                     has_implementation = true;
                 }
             }
             "search_files" => {
-                has_entry_or_config = true;
+                has_context_source = true;
             }
-            "list_tree" => {}
+            "list_tree" => {
+                has_context_source = true;
+            }
             _ => {}
         }
     }
-    Ok(has_entry_or_config && has_implementation)
+    Ok(if requires_implementation {
+        has_context_source && has_implementation
+    } else {
+        has_context_source
+    })
 }
 
-fn path_looks_like_entry_or_config(path: &str) -> bool {
+fn planner_requires_implementation_evidence(node: &TaskNodeRecord) -> bool {
+    let text = format!("{}\n{}", node.title, node.instructions).to_lowercase();
+    ![
+        "根据项目文档",
+        "根据文档",
+        "项目文档",
+        "plan.md",
+        "readme",
+        "文档",
+        "架构",
+        "方案",
+        "设计",
+        "spec",
+        "骨架",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn path_looks_like_planner_context(path: &str) -> bool {
     let lower = path.to_lowercase();
     matches!(
         lower.as_str(),
@@ -406,10 +510,14 @@ fn path_looks_like_entry_or_config(path: &str) -> bool {
             | "go.mod"
             | "makefile"
             | "readme.md"
+            | "plan.md"
     ) || lower.ends_with("/cargo.toml")
         || lower.ends_with("/package.json")
         || lower.ends_with("/pyproject.toml")
         || lower.ends_with("/go.mod")
+        || lower.ends_with("/plan.md")
+        || lower.ends_with("/readme.md")
+        || lower.ends_with(".md")
         || lower.ends_with("/main.rs")
         || lower.ends_with("/lib.rs")
         || lower.ends_with("/main.go")
@@ -464,6 +572,22 @@ fn node_has_tool_result_evidence(
 
 fn node_requires_mutating_evidence(node: &TaskNodeRecord) -> bool {
     let text = format!("{}\n{}", node.title, node.instructions).to_lowercase();
+    if [
+        "不要修改",
+        "不修改",
+        "无需修改",
+        "不需要修改",
+        "不要改动",
+        "只读",
+        "read-only",
+        "readonly",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return false;
+    }
+
     [
         "修改",
         "实现",
@@ -641,7 +765,8 @@ pub(super) async fn evaluate_feature(
         )?;
 
         let has_tool_calls = !envelope.tool_calls.is_empty();
-        for call in envelope.tool_calls {
+        for raw_call in envelope.tool_calls {
+            let call = normalize_tool_call(&raw_call);
             let record = record_tool_planned(
                 store,
                 run,
@@ -649,7 +774,7 @@ pub(super) async fn evaluate_feature(
                 Some(node.id.clone()),
                 Some(subagent.id.clone()),
             )?;
-            if tool_needs_approval(&call) {
+            if subagent_tool_needs_approval(config, &call) {
                 subagent.status = HarnessRunStatus::WaitingForInput;
                 subagent.summary = Some(format!("evaluator 等待审批：{}", call.name));
                 store.update_subagent(run, &subagent)?;
@@ -780,19 +905,23 @@ fn tools_for_subagent(kind: SubagentKind) -> Vec<ToolDescriptor> {
 fn subagent_hint(kind: SubagentKind, node: &TaskNodeRecord) -> String {
     let role_hint = match kind {
         SubagentKind::Planner => {
-            "你是 planner 子代理，负责读取现状、收敛 contract 和下一步，不直接写代码。"
+            "你是 planner 子代理，负责读取现状、收敛 contract 和下一步，不直接写代码，也不要继续使用 subagent_calls 派生其他子代理。拿到最小证据后就直接总结，不要为了“更完整”反复探索。"
         }
         SubagentKind::Generator => {
-            "你是 generator 子代理，只围绕当前 feature 做最小充分实现，不做无关重构。"
+            "你是 generator 子代理，只围绕当前 feature 做最小充分实现，不做无关重构。对于搭骨架/创建文件/修复代码这类落地任务，最多做少量只读探索后就必须直接发起 write_file / apply_patch / run_shell；即使会触发审批也要先提交，不要停留在 read_file / list_tree / search_files 的循环里。如需交给 evaluator 验收，使用 needs_handoff=true，不要继续派生 planner/generator。"
         }
         SubagentKind::Evaluator => {
-            "你是 evaluator 子代理，只根据 done_when、工具结果和现状给出通过/失败结论，不直接写代码。"
+            "你是 evaluator 子代理，只根据 done_when、工具结果和现状给出通过/失败结论，不直接写代码，也不要继续使用 subagent_calls 派生其他子代理。"
         }
     };
     format!(
         "{role_hint} 当前节点：{}。节点任务：{}",
         node.title, node.instructions
     )
+}
+
+fn subagent_tool_needs_approval(config: &AppConfig, call: &ToolCallRequest) -> bool {
+    tool_needs_approval(config, call)
 }
 
 #[cfg(test)]
@@ -805,8 +934,11 @@ mod tests {
     use crate::model::ThinkingMode;
 
     use super::{
-        handoff_to_evaluator_requested, node_has_implementation_evidence,
-        shell_command_looks_mutating, subagent_max_turn_error, subagent_turn_budget,
+        generator_requires_real_changes_feedback, handoff_to_evaluator_requested,
+        invalid_subagent_delegation_feedback, node_has_implementation_evidence,
+        node_requires_mutating_evidence, planner_requires_implementation_evidence,
+        shell_command_looks_mutating, subagent_hint, subagent_max_turn_error,
+        subagent_tool_needs_approval, subagent_turn_budget,
         tool_call_creates_implementation_evidence,
     };
     use crate::config::AppConfig;
@@ -863,6 +995,70 @@ mod tests {
     }
 
     #[test]
+    fn planner_subagent_delegation_is_rejected() {
+        let envelope = crate::harness::types::TurnEnvelope {
+            assistant_message: Some("继续拆分".to_string()),
+            tool_calls: Vec::new(),
+            subagent_calls: vec![crate::harness::types::BackendSubagentCall {
+                kind: crate::harness::types::SubagentKind::Planner,
+                task: "继续规划".to_string(),
+            }],
+            final_response: false,
+            state_update: None,
+            selected_feature_id: None,
+            evaluation: None,
+            needs_handoff: false,
+        };
+        let feedback = invalid_subagent_delegation_feedback(
+            crate::harness::types::SubagentKind::Planner,
+            &envelope,
+        )
+        .expect("planner feedback");
+        assert!(feedback.contains("不支持在 planner 子代理内部继续使用 subagent_calls"));
+        assert!(feedback.contains("证据不足"));
+    }
+
+    #[test]
+    fn generator_allows_evaluator_handoff_without_feedback() {
+        let envelope = crate::harness::types::TurnEnvelope {
+            assistant_message: Some("请验收".to_string()),
+            tool_calls: Vec::new(),
+            subagent_calls: vec![crate::harness::types::BackendSubagentCall {
+                kind: crate::harness::types::SubagentKind::Evaluator,
+                task: "验收".to_string(),
+            }],
+            final_response: false,
+            state_update: None,
+            selected_feature_id: None,
+            evaluation: None,
+            needs_handoff: false,
+        };
+        assert!(
+            invalid_subagent_delegation_feedback(
+                crate::harness::types::SubagentKind::Generator,
+                &envelope,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn planner_hint_forbids_recursive_subagents() {
+        let hint = subagent_hint(crate::harness::types::SubagentKind::Planner, &make_node());
+        assert!(hint.contains("不要继续使用 subagent_calls"));
+    }
+
+    #[test]
+    fn document_driven_planner_task_does_not_require_source_files() {
+        let mut node = make_node();
+        node.title = "采集事实".to_string();
+        node.instructions =
+            "围绕目标收集证据并形成结论：根据项目文档，给我完成项目基本骨架，以支持后续开发"
+                .to_string();
+        assert!(!planner_requires_implementation_evidence(&node));
+    }
+
+    #[test]
     fn tool_call_evidence_requires_mutating_shell() {
         assert!(tool_call_creates_implementation_evidence(
             &ToolCallRequest {
@@ -893,15 +1089,83 @@ mod tests {
 
     #[test]
     fn generator_max_turn_error_points_to_config_override() {
-        let error = subagent_max_turn_error(crate::harness::types::SubagentKind::Generator, 16);
+        let error = subagent_max_turn_error(
+            crate::harness::types::SubagentKind::Generator,
+            16,
+            "执行 feature",
+        );
         assert!(error.contains("runtime.max_generator_turns"));
         assert!(error.contains("16/16"));
     }
 
     #[test]
+    fn planner_max_turn_error_mentions_evidence_and_resolution() {
+        let error = subagent_max_turn_error(
+            crate::harness::types::SubagentKind::Planner,
+            6,
+            "规划执行路径",
+        );
+        assert!(error.contains("6/6"));
+        assert!(error.contains("事实证据不足"));
+        assert!(error.contains("证据不足"));
+    }
+
+    #[test]
+    fn readonly_generator_tools_trigger_real_change_feedback() {
+        assert!(generator_requires_real_changes_feedback(true, true, false));
+        assert!(!generator_requires_real_changes_feedback(true, true, true));
+        assert!(!generator_requires_real_changes_feedback(
+            true, false, false
+        ));
+        assert!(!generator_requires_real_changes_feedback(
+            false, true, false
+        ));
+    }
+
+    #[test]
+    fn readonly_run_shell_is_auto_approved_by_default() {
+        let config = AppConfig::default();
+        assert!(!subagent_tool_needs_approval(
+            &config,
+            &ToolCallRequest {
+                name: "run_shell".to_string(),
+                arguments: serde_json::json!({"command":"mkdir -p out && touch out/x"}),
+            }
+        ));
+    }
+
+    #[test]
+    fn manual_approval_can_be_enabled_for_mutating_tools() {
+        let mut config = AppConfig::default();
+        config.runtime.require_tool_approval = true;
+        assert!(!subagent_tool_needs_approval(
+            &config,
+            &ToolCallRequest {
+                name: "run_shell".to_string(),
+                arguments: serde_json::json!({"command":"cat README.md"}),
+            }
+        ));
+        assert!(subagent_tool_needs_approval(
+            &config,
+            &ToolCallRequest {
+                name: "run_shell".to_string(),
+                arguments: serde_json::json!({"command":"mkdir -p out && touch out/x"}),
+            }
+        ));
+    }
+
+    #[test]
+    fn readonly_explanation_node_does_not_require_mutating_evidence() {
+        let mut node = make_node();
+        node.title = "说明 file-a.txt 当前内容。不要修改任何文件。".to_string();
+        node.instructions = "只读说明，不要修改".to_string();
+        assert!(!node_requires_mutating_evidence(&node));
+    }
+
+    #[test]
     fn node_evidence_comes_from_succeeded_mutating_tools() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), crate::config::BackendProvider::Codex);
         let thread = store.create_thread(Some("demo")).expect("thread");
         let run = store
             .create_run(

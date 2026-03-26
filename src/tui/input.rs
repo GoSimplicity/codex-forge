@@ -58,6 +58,8 @@ impl TuiApp {
                 } else if matches!(self.browse_pane, super::tabs::BrowsePane::Composer) {
                     self.focus = FocusMode::Compose;
                     self.status = "开始输入；Enter 保存，Esc 返回".to_string();
+                } else if self.can_confirm_selected_plan() {
+                    self.confirm_selected_plan_and_resume().await?;
                 } else {
                     self.enter_detail();
                 }
@@ -92,7 +94,7 @@ impl TuiApp {
             KeyCode::Char('d') | KeyCode::Char('D') => self.delete_selected_thread()?,
             KeyCode::Char('m') => self.cycle_backend_provider(),
             KeyCode::Char('s') => self.resume_selected_run().await?,
-            KeyCode::Char('R') => self.retry_selected_task_node().await?,
+            KeyCode::Char('t') => self.retry_selected_task_node().await?,
             KeyCode::Char('r') => {
                 self.refresh()?;
                 self.status = "已刷新".to_string();

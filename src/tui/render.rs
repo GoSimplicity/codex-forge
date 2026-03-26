@@ -172,7 +172,7 @@ fn render_header<'a>(app: &'a TuiApp) -> Paragraph<'a> {
             Span::raw(" "),
             chip("Agent", &agent_name, color_chip_neutral()),
             Span::raw(" "),
-            chip("Backend", current_backend_name(app), color_chip_neutral()),
+            chip("执行模式", current_backend_name(app), color_chip_neutral()),
         ]),
         Line::from(vec![
             chip("Thread", &short_id(thread_label, 18), color_chip_neutral()),
@@ -246,7 +246,7 @@ fn render_alert_bar<'a>(app: &'a TuiApp) -> Paragraph<'a> {
 }
 
 fn render_primary_right_panel(frame: &mut ratatui::Frame, app: &TuiApp, area: Rect) {
-    let active = matches!(app.browse_pane, BrowsePane::Detail);
+    let active = matches!(app.browse_pane, BrowsePane::Error | BrowsePane::Detail);
     let (title, body) = primary_panel_content(app);
     let scroll = effective_primary_panel_scroll(app, &body, area);
     if !app.approvals.is_empty() {
@@ -336,8 +336,10 @@ fn thread_items(app: &TuiApp, width: u16) -> Vec<ListItem<'static>> {
 fn current_status_text(app: &TuiApp) -> String {
     let Some(run) = current_run(app) else {
         return format!(
-            "thread   {}\nrun      暂无\nfocus    {} / {}\ncomposer {}\nqueue    审批 {} · 产物 {}",
+            "thread   {}\nrun      暂无\ndefault  {}\nmodel    {}\nfocus    {} / {}\ncomposer {}\nqueue    审批 {} · 产物 {}",
             selected_thread_title(app),
+            configured_backend_summary(app),
+            configured_model_summary(app),
             pane_label(app.browse_pane),
             if matches!(app.focus, FocusMode::Compose) {
                 "编辑"
@@ -358,29 +360,19 @@ fn current_status_text(app: &TuiApp) -> String {
     let latest_event = latest_event_text(app);
     let progress = node_progress_text(app);
     let phase = current_phase_text(app);
-    let blocked = current_blocked_text(app).unwrap_or_else(|| "-".to_string());
-    let recoverable = current_recoverable_failure_text(app).unwrap_or_else(|| "-".to_string());
-    let next_step = current_next_action_text(app);
     format!(
-        "thread   {}\nrun      {} · {} · turns={}\nphase    {}\nfocus    {} / {} / {}\nstep     {}\nprogress {}\nblocked  {}\nrecover  {}\nnext     {}\nqueue    审批 {} · 产物 {} · 子代理 {}\nlatest   {}",
+        "thread   {}\nrun      {} · {} · turns={}\ncurrent  {}\ndefault  {}\nmodel    {}\nphase    {}\nstep     {}\nprogress {}\nqueue    审批 {} · 产物 {} · 子代理 {}\nlatest   {}",
         selected_thread_title(app),
         status_label(run.status),
         format_run_duration(run),
         run.turn_count,
+        current_run_backend_summary(run),
+        configured_backend_summary(app),
+        configured_model_summary(app),
         phase,
-        pane_label(app.browse_pane),
-        if matches!(app.focus, FocusMode::Compose) {
-            "编辑"
-        } else {
-            "浏览"
-        },
-        current_agent_name(app),
         node.map(|node| trim_line(node.title.as_str(), 36))
             .unwrap_or_else(|| "-".to_string()),
         progress,
-        blocked,
-        recoverable,
-        next_step,
         app.approvals.len(),
         app.artifacts.len(),
         app.subagents.len(),
@@ -678,6 +670,7 @@ fn pane_tabs_line(app: &TuiApp) -> Line<'static> {
         (BrowsePane::Threads, "Threads"),
         (BrowsePane::Runs, "Runs"),
         (BrowsePane::Steps, "Steps"),
+        (BrowsePane::Error, "Error"),
         (BrowsePane::Detail, "Detail"),
         (BrowsePane::Composer, "Composer"),
     ];
@@ -721,7 +714,15 @@ fn render_composer<'a>(app: &'a TuiApp) -> Paragraph<'a> {
     if app.composer.trim().is_empty() && !matches!(app.focus, FocusMode::Compose) {
         return Paragraph::new(vec![
             Line::from(vec![Span::styled(
-                "在这里输入任务描述。直接打字即可开始，或按 Enter 进入编辑模式。",
+                format!("当前新 run 默认：{}", configured_backend_summary(app)),
+                Style::default().fg(color_text_main()),
+            )]),
+            Line::from(vec![Span::styled(
+                format!("模型设置：{}", configured_model_summary(app)),
+                Style::default().fg(color_text_dim()),
+            )]),
+            Line::from(vec![Span::styled(
+                "浏览模式按 m 可切换执行模式；直接打字即可开始，或按 Enter 进入编辑模式。",
                 Style::default()
                     .fg(color_border())
                     .add_modifier(Modifier::ITALIC),
@@ -831,6 +832,7 @@ fn pane_label(pane: BrowsePane) -> &'static str {
         BrowsePane::Threads => "Threads",
         BrowsePane::Runs => "Runs",
         BrowsePane::Steps => "执行步骤",
+        BrowsePane::Error => "错误视图",
         BrowsePane::Detail => "详情视图",
         BrowsePane::Composer => "Composer",
     }
@@ -840,32 +842,42 @@ fn primary_hint(app: &TuiApp) -> String {
     match app.focus {
         FocusMode::Compose => "输入草稿 | Enter 保存 | Esc 返回".to_string(),
         FocusMode::Browse if !app.approvals.is_empty() => {
-            "当前优先处理审批：上下/jk 切换，Enter/a 通过，Backspace/x 拒绝 | m 切换 Backend"
+            "当前优先处理审批：上下/jk 切换，Enter/a 通过，Backspace/x 拒绝 | m 切换执行模式"
+                .to_string()
+        }
+        FocusMode::Browse if current_plan_wait_text(app).is_some() => {
+            "计划已生成：Enter 确认继续；也可以在 Composer 输入反馈后重新生成计划 | m 切换执行模式"
                 .to_string()
         }
         FocusMode::Browse if current_blocked_text(app).is_some() => {
-            "当前运行在等待输入：若无审批，可按 s 恢复执行 | m 切换 Backend".to_string()
+            "当前运行在等待输入：若无审批，可按 s 恢复执行 | m 切换执行模式".to_string()
+        }
+        FocusMode::Browse if matches!(app.browse_pane, BrowsePane::Error) => {
+            "错误视图：集中查看失败原因、错误内容与恢复动作；用上下方向键滚动 | m 切换执行模式"
+                .to_string()
         }
         FocusMode::Browse if matches!(app.browse_pane, BrowsePane::Detail) => {
             if matches!(app.detail_parent_pane, BrowsePane::Runs) {
-                "实时输出：内容完整显示，单行过长自动换行；用上下方向键滚动 | m 切换 Backend"
+                "实时输出：内容完整显示，单行过长自动换行；用上下方向键滚动 | m 切换执行模式"
                     .to_string()
+            } else if matches!(app.detail_parent_pane, BrowsePane::Error) {
+                "错误详情：单行过长自动换行；用上下方向键滚动 | m 切换执行模式".to_string()
             } else {
-                "详情视图：单行过长自动换行；用上下方向键滚动 | m 切换 Backend".to_string()
+                "详情视图：单行过长自动换行；用上下方向键滚动 | m 切换执行模式".to_string()
             }
         }
         FocusMode::Browse if app.pending_delete_thread_id.is_some() => {
-            "正在确认删除当前 thread：Enter 删除，Esc 取消 | m 切换 Backend".to_string()
+            "正在确认删除当前 thread：Enter 删除，Esc 取消 | m 切换执行模式".to_string()
         }
         FocusMode::Browse if app.pending_send.is_some() => {
-            "任务正在后台运行，界面会自动刷新，你可以继续浏览 | m 切换 Backend".to_string()
+            "任务正在后台运行，界面会自动刷新，你可以继续浏览 | m 切换执行模式".to_string()
         }
         FocusMode::Browse if !app.composer.trim().is_empty() => {
-            "草稿已保存，按 Enter 直接运行；若想修改，再按 Enter 继续编辑 | m 切换 Backend"
+            "草稿已保存，按 Enter 直接运行；若想修改，再按 Enter 继续编辑 | m 切换执行模式"
                 .to_string()
         }
         FocusMode::Browse => {
-            "用 Tab 或左右切换面板，用上下移动；直接输入或按 Enter 开始 | m 切换 Backend"
+            "用 Tab 或左右切换面板，用上下移动；直接输入或按 Enter 开始 | m 切换执行模式"
                 .to_string()
         }
     }
@@ -886,7 +898,7 @@ fn current_alert(app: &TuiApp) -> AlertBanner<'static> {
         return AlertBanner {
             title: "等待计划确认",
             text: format!(
-                "当前仍在计划阶段：{} | 系统会先补齐计划，再进入执行",
+                "当前计划待确认：{} | 按 Enter 继续执行，或在 Composer 输入反馈后重新生成计划",
                 plan_wait
             ),
             style: banner_style(Color::White, Color::Blue),
@@ -988,24 +1000,45 @@ fn render_footer<'a>(app: &'a TuiApp) -> Paragraph<'a> {
     } else {
         "  a/Enter 通过  x/Backspace 拒绝  "
     };
+    let retry_hint = if current_error_text(app).is_some() {
+        Some(vec![keycap("t"), Span::raw(" 重试失败步骤  ")])
+    } else {
+        None
+    };
+    let plan_hint = if current_plan_wait_text(app).is_some() {
+        Some(vec![keycap("Enter"), Span::raw(" 确认计划  ")])
+    } else {
+        None
+    };
+    let mut first_line = vec![
+        keycap("Tab"),
+        Span::raw(" 切栏  "),
+        keycap("↑↓"),
+        Span::raw(" 导航  "),
+        Span::raw(approval_hint),
+    ];
+    if let Some(items) = plan_hint {
+        first_line.extend(items);
+    }
+    if let Some(items) = retry_hint {
+        first_line.extend(items);
+    }
+    first_line.extend([
+        keycap("Enter"),
+        Span::raw(" 打开/发送  "),
+        keycap("i"),
+        Span::raw(" 编辑  "),
+        keycap("n"),
+        Span::raw(" 新线程  "),
+        keycap("r"),
+        Span::raw(" 刷新  "),
+        keycap("m"),
+        Span::raw(" 切模式  "),
+        keycap("q"),
+        Span::raw(" 退出"),
+    ]);
     Paragraph::new(vec![
-        Line::from(vec![
-            keycap("Tab"),
-            Span::raw(" 切栏  "),
-            keycap("↑↓"),
-            Span::raw(" 导航  "),
-            Span::raw(approval_hint),
-            keycap("Enter"),
-            Span::raw(" 打开/发送  "),
-            keycap("i"),
-            Span::raw(" 编辑  "),
-            keycap("n"),
-            Span::raw(" 新线程  "),
-            keycap("r"),
-            Span::raw(" 刷新  "),
-            keycap("q"),
-            Span::raw(" 退出"),
-        ]),
+        Line::from(first_line),
         Line::from(vec![
             Span::styled(
                 "状态 ",
@@ -1042,7 +1075,14 @@ fn primary_panel_content(app: &TuiApp) -> (String, String) {
         );
     }
 
+    if current_plan_wait_text(app).is_some()
+        && !matches!(app.browse_pane, BrowsePane::Error | BrowsePane::Detail)
+    {
+        return ("计划确认".to_string(), plan_confirmation_card_text(app));
+    }
+
     match app.browse_pane {
+        BrowsePane::Error => ("错误详情".to_string(), error_detail_text(app)),
         BrowsePane::Detail => match app.detail_parent_pane {
             BrowsePane::Threads => (
                 format!(
@@ -1052,6 +1092,7 @@ fn primary_panel_content(app: &TuiApp) -> (String, String) {
                 thread_detail_text(app),
             ),
             BrowsePane::Steps => ("步骤详情".to_string(), step_detail_text(app)),
+            BrowsePane::Error => ("错误详情".to_string(), error_detail_text(app)),
             BrowsePane::Runs | BrowsePane::Detail | BrowsePane::Composer => {
                 ("运行概览".to_string(), run_decision_summary_text(app))
             }
@@ -1090,16 +1131,21 @@ fn step_detail_text(app: &TuiApp) -> String {
         return "当前没有选中步骤".to_string();
     };
     let summary = node.output_summary.as_deref().unwrap_or("暂无摘要");
+    let plan_action = if current_plan_wait_text(app).is_some() {
+        "\n\n执行入口\n----------------\n按 Enter 继续执行当前计划；如果要修改计划，在 Composer 输入反馈后重新提交。"
+    } else {
+        ""
+    };
     let error_section = node.error.as_deref().map_or_else(String::new, |error| {
         format!("\n\n错误\n----------------\n{error}")
     });
     let retry_hint = if matches!(node.status, TaskNodeStatus::Failed) {
-        "\n\n手动操作\n----------------\n可按 R 手动重试这个失败步骤。"
+        "\n\n手动操作\n----------------\n可按 t 手动重试这个失败步骤。"
     } else {
         ""
     };
     format!(
-        "标题：{}\n状态：{}\n类型：{}\n尝试次数：{}\nagent：{}\n\n说明\n----------------\n{}\n\n摘要\n----------------\n{}{}{}",
+        "标题：{}\n状态：{}\n类型：{}\n尝试次数：{}\nagent：{}\n\n说明\n----------------\n{}\n\n摘要\n----------------\n{}{}{}{}",
         node.title,
         task_status_label(node.status),
         task_kind_label(node.kind),
@@ -1107,8 +1153,63 @@ fn step_detail_text(app: &TuiApp) -> String {
         node.last_subagent_id.as_deref().unwrap_or("main"),
         node.instructions,
         summary,
+        plan_action,
         error_section,
         retry_hint
+    )
+}
+
+fn plan_confirmation_card_text(app: &TuiApp) -> String {
+    let summary = app
+        .current_contract
+        .as_ref()
+        .map(|contract| trim_line(contract.goal.as_str(), 96))
+        .unwrap_or_else(|| "当前计划已完成检查".to_string());
+    let next_step = app
+        .current_progress
+        .as_ref()
+        .and_then(|progress| progress.next_step.as_deref())
+        .map(|text| trim_line(text, 96))
+        .unwrap_or_else(|| "选择下一个 feature".to_string());
+    format!(
+        "计划已生成，等待你确认。\n\n目标：{}\n下一步：{}\n\n操作\n----------------\n[Enter] 继续执行\n[i] 进入 Composer 编辑反馈\n[m] 仅切换后续新 run 的执行模式",
+        summary, next_step
+    )
+}
+
+fn error_detail_text(app: &TuiApp) -> String {
+    let Some(error) = current_error_text(app) else {
+        return "当前没有错误。\n\n如果后续 run 或步骤失败，这里会集中显示失败对象、原因、原始错误与恢复动作。"
+            .to_string();
+    };
+    let failure_scope = selected_node(app)
+        .map(|node| format!("步骤：{} ({})", node.title, task_status_label(node.status)))
+        .or_else(|| {
+            current_run(app).map(|run| {
+                format!(
+                    "Run：{} ({})",
+                    short_id(&run.id, 24),
+                    status_label(run.status)
+                )
+            })
+        })
+        .unwrap_or_else(|| "当前失败对象未知".to_string());
+    let why = selected_node(app)
+        .and_then(|node| node.output_summary.clone())
+        .or_else(|| current_run(app).and_then(|run| run.summary.clone()))
+        .unwrap_or_else(|| "没有记录到额外上下文，只拿到了错误文本".to_string());
+    let related = latest_failure_event_text(app).unwrap_or_else(|| "暂无相关失败事件".to_string());
+    let action = if current_plan_wait_text(app).is_some() {
+        "下一步：先处理计划确认。按 Enter 确认继续，或在 Composer 输入反馈重新生成计划。"
+            .to_string()
+    } else if selected_node(app).is_some_and(|node| matches!(node.status, TaskNodeStatus::Failed)) {
+        "下一步：先看错误原因与最近事件；确认后按 t 重试当前失败步骤。".to_string()
+    } else {
+        "下一步：先看错误原因与最近事件，再决定是否重新发送任务或切换 run。".to_string()
+    };
+    format!(
+        "失败对象\n----------------\n{}\n\n为什么会失败\n----------------\n{}\n\n错误内容\n----------------\n{}\n\n最近相关事件\n----------------\n{}\n\n恢复动作\n----------------\n{}",
+        failure_scope, why, error, related, action
     )
 }
 
@@ -1197,6 +1298,53 @@ fn current_backend_name(app: &TuiApp) -> &'static str {
     app.config.backend.provider.display_name()
 }
 
+fn current_run_backend_summary(run: &HarnessRunManifest) -> String {
+    format!(
+        "当前 run {} · {}",
+        agent_backend_display_name(run.backend),
+        run.execution_kind.display_name()
+    )
+}
+
+fn configured_backend_summary(app: &TuiApp) -> String {
+    format!(
+        "新 run 默认 {}{} · 按 m 切到 {}",
+        current_backend_name(app),
+        if matches!(
+            app.config.backend.provider,
+            crate::config::BackendProvider::Codex
+        ) {
+            "（默认）"
+        } else {
+            ""
+        },
+        app.config.backend.provider.next().display_name()
+    )
+}
+
+fn configured_model_summary(app: &TuiApp) -> String {
+    let configured_model = app
+        .config
+        .backend
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    match app.config.backend.provider {
+        crate::config::BackendProvider::Codex => "Codex CLI 内置模型".to_string(),
+        crate::config::BackendProvider::OpenAiCompatible => format!(
+            "OpenAI 兼容接口 · model={}",
+            trim_line(configured_model.unwrap_or("未配置"), 24)
+        ),
+    }
+}
+
+fn agent_backend_display_name(backend: crate::harness::types::AgentBackendKind) -> &'static str {
+    match backend {
+        crate::harness::types::AgentBackendKind::Codex => "Codex",
+        crate::harness::types::AgentBackendKind::OpenAiCompatible => "OpenAI Compatible",
+    }
+}
+
 fn current_activity(app: &TuiApp) -> String {
     if app.pending_delete_thread_id.is_some() {
         return "等待删除确认".to_string();
@@ -1218,6 +1366,12 @@ fn current_activity(app: &TuiApp) -> String {
             return trim_line(summary, 60);
         }
         return trim_line(node.title.as_str(), 60);
+    }
+    if current_run(app).is_some_and(|run| run.execution_kind.is_autonomous_codex()) {
+        return current_run(app)
+            .and_then(|run| run.summary.as_deref())
+            .map(|summary| trim_line(summary, 60))
+            .unwrap_or_else(|| "Codex 正在自主执行".to_string());
     }
     latest_event_text(app)
 }
@@ -1281,6 +1435,9 @@ fn current_recoverable_failure_text(app: &TuiApp) -> Option<String> {
 }
 
 fn current_phase_text(app: &TuiApp) -> String {
+    if current_run(app).is_some_and(|run| run.execution_kind.is_autonomous_codex()) {
+        return "自主执行".to_string();
+    }
     app.current_progress
         .as_ref()
         .and_then(|progress| progress.current_phase.clone())
@@ -1288,6 +1445,11 @@ fn current_phase_text(app: &TuiApp) -> String {
 }
 
 fn current_next_action_text(app: &TuiApp) -> String {
+    if current_run(app).is_some_and(|run| run.execution_kind.is_autonomous_codex()) {
+        return current_run(app)
+            .and_then(|run| run.blocked_reason.clone())
+            .unwrap_or_else(|| "等待 Codex 完成当前任务".to_string());
+    }
     app.current_progress
         .as_ref()
         .and_then(|progress| progress.next_step.clone())
@@ -1311,19 +1473,48 @@ fn current_next_action_text(app: &TuiApp) -> String {
 }
 
 fn current_plan_wait_text(app: &TuiApp) -> Option<String> {
-    if current_phase_text(app) != "计划" {
+    let run = current_run(app)?;
+    let node = selected_node(app)?;
+    if current_phase_text(app) != "计划"
+        || !matches!(
+            run.status,
+            crate::harness::HarnessRunStatus::WaitingForInput
+        )
+        || !matches!(node.kind, TaskNodeKind::PlanReview)
+        || !matches!(node.status, TaskNodeStatus::WaitingForInput)
+    {
         return None;
     }
-    selected_node(app)
-        .map(|node| trim_line(node.title.as_str(), 96))
-        .or_else(|| {
-            app.current_progress
-                .as_ref()
-                .and_then(|progress| progress.next_step.clone())
+    Some(trim_line(
+        app.current_progress
+            .as_ref()
+            .and_then(|progress| progress.next_step.clone())
+            .unwrap_or_else(|| node.title.clone())
+            .as_str(),
+        96,
+    ))
+}
+
+fn latest_failure_event_text(app: &TuiApp) -> Option<String> {
+    app.events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.payload {
+            crate::harness::HarnessEvent::TaskNodeFailed { .. }
+            | crate::harness::HarnessEvent::RunFailed { .. }
+            | crate::harness::HarnessEvent::EvidenceInsufficient { .. } => Some(format!(
+                "{} {}",
+                event.at.format("%H:%M:%S"),
+                describe_event(&event.payload)
+            )),
+            _ => None,
         })
 }
 
 fn infer_phase_from_node(app: &TuiApp) -> &'static str {
+    if current_run(app).is_some_and(|run| run.execution_kind.is_autonomous_codex()) {
+        return "自主执行";
+    }
     match selected_node(app).map(|node| node.kind) {
         Some(
             TaskNodeKind::Plan
@@ -1339,6 +1530,9 @@ fn infer_phase_from_node(app: &TuiApp) -> &'static str {
 }
 
 fn node_progress_text(app: &TuiApp) -> String {
+    if current_run(app).is_some_and(|run| run.execution_kind.is_autonomous_codex()) {
+        return "自主执行".to_string();
+    }
     if app.task_nodes.is_empty() {
         return "0/0".to_string();
     }
@@ -1483,12 +1677,16 @@ fn composer_cursor_position(area: Rect, content: &str) -> Position {
 #[cfg(test)]
 mod tests {
     use super::{
-        composer_cursor_position, current_alert, current_backend_name, current_blocked_text,
-        footer_text, format_duration, primary_hint,
+        composer_cursor_position, configured_model_summary, current_alert, current_backend_name,
+        current_blocked_text, footer_text, format_duration, plan_confirmation_card_text,
+        primary_hint, primary_panel_content,
     };
     use crate::config::{AppConfig, BackendProvider};
     use crate::harness::HarnessStore;
-    use crate::harness::types::{AgentBackendKind, HarnessRunManifest, HarnessRunStatus};
+    use crate::harness::types::{
+        AgentBackendKind, ExecutionContract, HarnessRunManifest, HarnessRunStatus, ProgressLedger,
+        RunExecutionKind, TaskNodeKind, TaskNodeRecord, TaskNodeStatus,
+    };
     use crate::model::ThinkingMode;
     use chrono::{Duration, Utc};
     use ratatui::layout::{Position, Rect};
@@ -1526,7 +1724,7 @@ mod tests {
     fn cancelled_run_is_not_treated_as_blocked() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let run_dir = repo_root.join("run");
         let run = HarnessRunManifest {
             id: "run-1".to_string(),
@@ -1537,6 +1735,7 @@ mod tests {
             model: None,
             thinking_mode: ThinkingMode::Balanced,
             backend: AgentBackendKind::Codex,
+            execution_kind: RunExecutionKind::AutonomousCodex,
             turn_count: 1,
             summary: Some("当前 run 已取消".to_string()),
             last_error: None,
@@ -1599,7 +1798,7 @@ mod tests {
     fn error_alert_uses_white_text_on_red_background() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let run_dir = repo_root.join("run");
         let run = HarnessRunManifest {
             id: "run-1".to_string(),
@@ -1610,6 +1809,7 @@ mod tests {
             model: None,
             thinking_mode: ThinkingMode::Balanced,
             backend: AgentBackendKind::Codex,
+            execution_kind: RunExecutionKind::AutonomousCodex,
             turn_count: 1,
             summary: Some("run 已失败".to_string()),
             last_error: Some("boom".to_string()),
@@ -1675,7 +1875,7 @@ mod tests {
     fn cancelled_alert_uses_white_text_on_dark_background() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let run_dir = repo_root.join("run");
         let run = HarnessRunManifest {
             id: "run-1".to_string(),
@@ -1686,6 +1886,7 @@ mod tests {
             model: None,
             thinking_mode: ThinkingMode::Balanced,
             backend: AgentBackendKind::Codex,
+            execution_kind: RunExecutionKind::AutonomousCodex,
             turn_count: 1,
             summary: Some("当前 run 已取消".to_string()),
             last_error: None,
@@ -1751,7 +1952,7 @@ mod tests {
     fn default_status_alert_uses_white_text_on_green_background() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let app = TuiApp {
             repo_root,
             store,
@@ -1798,7 +1999,7 @@ mod tests {
     fn browse_hint_mentions_backend_switch_shortcut() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let app = TuiApp {
             repo_root,
             store,
@@ -1835,14 +2036,14 @@ mod tests {
             status: String::new(),
         };
 
-        assert!(primary_hint(&app).contains("m 切换 Backend"));
+        assert!(primary_hint(&app).contains("m 切换执行模式"));
     }
 
     #[test]
     fn current_backend_name_uses_user_facing_label() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let mut config = AppConfig::default();
         config.backend.provider = BackendProvider::OpenAiCompatible;
         let app = TuiApp {
@@ -1887,8 +2088,211 @@ mod tests {
     #[test]
     fn footer_prefers_runtime_status_message() {
         let dir = TempDir::new().expect("tempdir");
-        let mut app = TuiApp::new(dir.path().to_path_buf(), None).expect("app");
+        let repo_root = dir.path().to_path_buf();
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
+        let mut app = TuiApp {
+            repo_root,
+            store,
+            config: AppConfig::default(),
+            threads: Vec::new(),
+            selected_thread_id: None,
+            selected_run_id: None,
+            selected_task_node_id: None,
+            messages: Vec::new(),
+            runs: Vec::new(),
+            task_nodes: Vec::new(),
+            events: Vec::new(),
+            approvals: Vec::new(),
+            selected_approval_index: 0,
+            artifacts: Vec::new(),
+            subagents: Vec::new(),
+            current_contract: None,
+            current_progress: None,
+            working_memory: Vec::new(),
+            project_memory: Vec::new(),
+            focus: FocusMode::Browse,
+            browse_pane: BrowsePane::Threads,
+            detail_parent_pane: BrowsePane::Runs,
+            composer: String::new(),
+            pending_send: None,
+            pending_delete_thread_id: None,
+            last_refresh_at: Instant::now(),
+            live_output_title: "实时输出".to_string(),
+            live_output_body: String::new(),
+            live_output_scroll: 0,
+            live_output_follow_latest: true,
+            detail_viewport_width: 0,
+            detail_viewport_height: 0,
+            status: String::new(),
+        };
         app.status = "刚刚刷新完成".to_string();
         assert_eq!(footer_text(&app), "刚刚刷新完成");
+    }
+
+    #[test]
+    fn configured_model_summary_hides_openai_model_in_codex_mode() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo_root = dir.path().to_path_buf();
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
+        let mut config = AppConfig::default();
+        config.backend.provider = BackendProvider::Codex;
+        config.backend.model = Some("MiniMax-M2.7".to_string());
+        let app = TuiApp {
+            repo_root,
+            store,
+            config,
+            threads: Vec::new(),
+            selected_thread_id: None,
+            selected_run_id: None,
+            selected_task_node_id: None,
+            messages: Vec::new(),
+            runs: Vec::new(),
+            task_nodes: Vec::new(),
+            events: Vec::new(),
+            approvals: Vec::new(),
+            selected_approval_index: 0,
+            artifacts: Vec::new(),
+            subagents: Vec::new(),
+            current_contract: None,
+            current_progress: None,
+            working_memory: Vec::new(),
+            project_memory: Vec::new(),
+            focus: FocusMode::Browse,
+            browse_pane: BrowsePane::Threads,
+            detail_parent_pane: BrowsePane::Runs,
+            composer: String::new(),
+            pending_send: None,
+            pending_delete_thread_id: None,
+            last_refresh_at: Instant::now(),
+            live_output_title: "实时输出".to_string(),
+            live_output_body: String::new(),
+            live_output_scroll: 0,
+            live_output_follow_latest: true,
+            detail_viewport_width: 0,
+            detail_viewport_height: 0,
+            status: String::new(),
+        };
+
+        assert_eq!(configured_model_summary(&app), "Codex CLI 内置模型");
+    }
+
+    #[test]
+    fn plan_wait_uses_explicit_confirmation_card() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo_root = dir.path().to_path_buf();
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
+        let run_dir = repo_root.join("run");
+        let run = HarnessRunManifest {
+            id: "run-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            status: HarnessRunStatus::WaitingForInput,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            thinking_mode: ThinkingMode::Balanced,
+            backend: AgentBackendKind::Codex,
+            execution_kind: RunExecutionKind::Orchestrated,
+            turn_count: 2,
+            summary: Some("计划已生成，等待用户确认".to_string()),
+            last_error: None,
+            blocked_reason: Some("计划已生成，等待用户确认或补充反馈".to_string()),
+            run_dir: run_dir.clone(),
+            events_path: run_dir.join("events.jsonl"),
+            output_path: run_dir.join("assistant.md"),
+            log_path: run_dir.join("codex.log"),
+            tool_calls_path: run_dir.join("tool-calls.jsonl"),
+            approvals_path: run_dir.join("approvals.jsonl"),
+            artifacts_path: run_dir.join("artifacts.jsonl"),
+            subagents_path: run_dir.join("subagents.jsonl"),
+            task_graph_path: run_dir.join("task-graph.json"),
+            task_nodes_path: run_dir.join("task-nodes.jsonl"),
+            evaluation_log_path: run_dir.join("evaluations.jsonl"),
+            bootstrap_path: run_dir.join("session-bootstrap.md"),
+            active_task_node_id: Some("node-1".to_string()),
+            sandbox: None,
+        };
+        let node = TaskNodeRecord {
+            id: "node-1".to_string(),
+            graph_id: "graph-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            run_id: "run-1".to_string(),
+            kind: TaskNodeKind::PlanReview,
+            title: "审查执行计划".to_string(),
+            instructions: "检查计划摘要并等待确认".to_string(),
+            depends_on: Vec::new(),
+            position: 0,
+            status: TaskNodeStatus::WaitingForInput,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            output_summary: Some("等待操作：按 Enter 确认计划继续执行".to_string()),
+            error: None,
+            last_subagent_id: None,
+            attempt_count: 0,
+            feature_id: None,
+        };
+        let app = TuiApp {
+            repo_root,
+            store,
+            config: AppConfig::default(),
+            threads: Vec::new(),
+            selected_thread_id: Some("thread-1".to_string()),
+            selected_run_id: Some("run-1".to_string()),
+            selected_task_node_id: Some("node-1".to_string()),
+            messages: Vec::new(),
+            runs: vec![run],
+            task_nodes: vec![node],
+            events: Vec::new(),
+            approvals: Vec::new(),
+            selected_approval_index: 0,
+            artifacts: Vec::new(),
+            subagents: Vec::new(),
+            current_contract: Some(ExecutionContract {
+                goal: "修复 Codex 模式串线".to_string(),
+                non_goals: Vec::new(),
+                constraints: Vec::new(),
+                ordered_features: Vec::new(),
+                global_acceptance: Vec::new(),
+                delivery_notes: Vec::new(),
+                updated_at: Utc::now(),
+            }),
+            current_progress: Some(ProgressLedger {
+                goal: "修复 Codex 模式串线".to_string(),
+                current_phase: Some("计划".to_string()),
+                completed_features: Vec::new(),
+                current_feature: None,
+                latest_recoverable_failure: None,
+                blocking_reason: Some("等待用户确认计划或补充反馈".to_string()),
+                known_failures: Vec::new(),
+                decisions: vec!["计划已生成，等待用户确认".to_string()],
+                open_questions: Vec::new(),
+                next_step: Some(
+                    "按 Enter 确认计划，或在 Composer 提交反馈后重新生成计划".to_string(),
+                ),
+                updated_at: Utc::now(),
+            }),
+            working_memory: Vec::new(),
+            project_memory: Vec::new(),
+            focus: FocusMode::Browse,
+            browse_pane: BrowsePane::Runs,
+            detail_parent_pane: BrowsePane::Runs,
+            composer: String::new(),
+            pending_send: None,
+            pending_delete_thread_id: None,
+            last_refresh_at: Instant::now(),
+            live_output_title: "实时输出".to_string(),
+            live_output_body: String::new(),
+            live_output_scroll: 0,
+            live_output_follow_latest: true,
+            detail_viewport_width: 0,
+            detail_viewport_height: 0,
+            status: String::new(),
+        };
+
+        let (title, body) = primary_panel_content(&app);
+        assert_eq!(title, "计划确认");
+        assert!(body.contains("[Enter] 继续执行"));
+        assert!(plan_confirmation_card_text(&app).contains("[i] 进入 Composer"));
     }
 }

@@ -17,14 +17,16 @@ pub fn render_lead_turn_prompt(request: &BackendTurnRequest<'_>) -> String {
     rendered.push_str("规则：\n");
     rendered.push_str("- 如果你已经能直接回答用户，就设置 final_response=true，并在 assistant_message 中给最终回复。\n");
     rendered.push_str("- 如果需要查文件、搜索、列目录、执行命令、写文件，就使用 tool_calls。\n");
-    rendered.push_str("- 高风险工具会被要求审批，你不需要自己模拟审批结果。\n");
+    rendered.push_str("- 工具默认直接执行；如果当前运行配置开启审批，harness 会自行挂起并恢复，你不需要自己模拟审批结果。\n");
     rendered.push_str(
         "- 不要把 Codex 原生 CLI 自己的 sandbox/approval 提示当成任务约束；真实执行能力以当前 harness 暴露的 tool_calls 为准。\n",
     );
     rendered.push_str(
         "- 当前工作目录映射到目标项目目录；需要落地文件时，直接调用 write_file、apply_patch 或 run_shell。\n",
     );
-    rendered.push_str("- subagent_calls 只在确实需要分工时使用；避免无限派生。\n");
+    rendered.push_str(
+        "- 当前是子代理执行环境，不要继续使用 subagent_calls 派生新的子代理；generator 如需申请 evaluator 验收，设置 needs_handoff=true。\n",
+    );
     rendered.push_str("- 不要返回未知工具名。\n");
     rendered.push_str("- 优先复用 memory 和 skills，再决定是否读更多上下文。\n");
     rendered.push_str(
@@ -82,7 +84,7 @@ pub fn render_lead_turn_prompt(request: &BackendTurnRequest<'_>) -> String {
             tool.name,
             tool.description,
             if tool.requires_approval {
-                "默认需要审批"
+                "可配置审批"
             } else {
                 "默认自动执行"
             }

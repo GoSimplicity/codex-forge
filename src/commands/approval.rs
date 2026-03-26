@@ -16,7 +16,8 @@ pub async fn run(args: ApprovalArgs) -> Result<()> {
 
 fn run_list(args: ApprovalListArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let approvals = store.list_pending_approvals(args.thread.as_deref())?;
     if approvals.is_empty() {
         println!("当前没有待处理审批");

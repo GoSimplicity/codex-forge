@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::cli::{ThreadArgs, ThreadCommands, ThreadListArgs, ThreadNewArgs, ThreadShowArgs};
 use crate::commands::format::{first_line, role_label, status_label};
+use crate::config::load_app_config;
 use crate::harness::{HarnessStore, MemoryLayer};
 use crate::workspace::resolve_target_dir;
 
@@ -15,7 +16,8 @@ pub fn run(args: ThreadArgs) -> Result<()> {
 
 fn run_new(args: ThreadNewArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let thread = store.create_thread(args.title.as_deref())?;
     println!("id: {}", thread.id);
     println!("title: {}", thread.title);
@@ -25,7 +27,8 @@ fn run_new(args: ThreadNewArgs) -> Result<()> {
 
 fn run_list(args: ThreadListArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let threads = store.list_threads()?;
     if threads.is_empty() {
         println!("当前没有 thread");
@@ -47,7 +50,8 @@ fn run_list(args: ThreadListArgs) -> Result<()> {
 
 fn run_show(args: ThreadShowArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let thread = store.load_thread(&args.thread_id)?;
     let messages = store.list_messages(&args.thread_id)?;
     let runs = store.list_runs(&args.thread_id)?;

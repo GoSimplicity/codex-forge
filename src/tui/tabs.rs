@@ -9,6 +9,7 @@ pub(crate) enum BrowsePane {
     Threads,
     Runs,
     Steps,
+    Error,
     Detail,
     Composer,
 }
@@ -18,7 +19,8 @@ impl BrowsePane {
         match self {
             Self::Threads => Self::Runs,
             Self::Runs => Self::Steps,
-            Self::Steps => Self::Detail,
+            Self::Steps => Self::Error,
+            Self::Error => Self::Detail,
             Self::Detail => Self::Composer,
             Self::Composer => Self::Threads,
         }
@@ -29,7 +31,8 @@ impl BrowsePane {
             Self::Threads => Self::Composer,
             Self::Runs => Self::Threads,
             Self::Steps => Self::Runs,
-            Self::Detail => Self::Steps,
+            Self::Error => Self::Steps,
+            Self::Detail => Self::Error,
             Self::Composer => Self::Detail,
         }
     }

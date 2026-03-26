@@ -647,7 +647,7 @@ pub(super) fn execute_list_skills(
     task_node_id: Option<&str>,
     subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
-    let text = SkillAdapter::list()
+    let text = SkillAdapter::list(run.backend.into())
         .into_iter()
         .map(|skill| {
             format!(
@@ -689,7 +689,8 @@ pub(super) fn execute_read_skill(
     subagent_id: Option<&str>,
 ) -> Result<ToolExecutionResult> {
     let name = required_string(&call.arguments, "name")?;
-    let content = SkillAdapter::read_body(&name).ok_or_else(|| anyhow!("未找到 skill：{name}"))?;
+    let content = SkillAdapter::read_body(run.backend.into(), &name)
+        .ok_or_else(|| anyhow!("未找到 skill：{name}"))?;
     let artifact = materialize_text_artifact(
         store,
         thread,
@@ -735,6 +736,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::config::BackendProvider;
     use crate::harness::store::HarnessStore;
     use crate::harness::types::{SandboxState, ToolCallRequest};
     use crate::model::ThinkingMode;
@@ -749,7 +751,7 @@ mod tests {
         SandboxState,
     ) {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("工具测试")).expect("thread");
         let run = store
             .create_run(

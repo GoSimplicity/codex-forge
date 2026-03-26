@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 
 use crate::cli::{ArtifactArgs, ArtifactCommands, ArtifactListArgs, ArtifactShowArgs};
 use crate::commands::format::artifact_kind_label;
+use crate::config::load_app_config;
 use crate::harness::{ArtifactKind, HarnessStore};
 use crate::workspace::resolve_target_dir;
 
@@ -14,7 +15,8 @@ pub fn run(args: ArtifactArgs) -> Result<()> {
 
 fn run_list(args: ArtifactListArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let artifacts = store.list_artifacts(args.thread.as_deref(), args.run.as_deref())?;
     if artifacts.is_empty() {
         println!("当前没有 artifact");
@@ -35,7 +37,8 @@ fn run_list(args: ArtifactListArgs) -> Result<()> {
 
 fn run_show(args: ArtifactShowArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let artifacts = store.list_artifacts(args.thread.as_deref(), None)?;
     let artifact = artifacts
         .into_iter()

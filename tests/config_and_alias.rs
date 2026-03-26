@@ -22,10 +22,7 @@ fn cmd_alias_from_backend_is_supported() {
         .expect("run chat");
     assert!(chat.status.success(), "{:?}", chat);
     let chat_stdout = String::from_utf8_lossy(&chat.stdout);
-    assert!(
-        chat_stdout.contains("status: waiting_for_input"),
-        "{chat_stdout}"
-    );
+    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
     let thread_id = chat_stdout
         .lines()
         .find_map(|line| line.strip_prefix("thread: "))
@@ -45,30 +42,9 @@ fn cmd_alias_from_backend_is_supported() {
         .expect("approval list");
     assert!(approval_list.status.success(), "{:?}", approval_list);
     let approval_stdout = String::from_utf8_lossy(&approval_list.stdout);
-    let approval_id = approval_stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split('\t').next())
-        .expect("approval id")
-        .to_string();
-
-    let approve = command(bin, repo.path())
-        .args([
-            "approval",
-            "approve",
-            "--thread",
-            &thread_id,
-            &approval_id,
-            "--target-dir",
-            repo.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("approval approve");
-    assert!(approve.status.success(), "{:?}", approve);
-    let approve_stdout = String::from_utf8_lossy(&approve.stdout);
     assert!(
-        approve_stdout.contains("status: completed"),
-        "{approve_stdout}"
+        approval_stdout.contains("当前没有待处理审批"),
+        "{approval_stdout}"
     );
 }
 
@@ -252,6 +228,11 @@ fn global_validate_rejects_incomplete_openai_backend() {
 #[test]
 fn sandbox_uses_direct_mount_with_privileged_flags_and_run_shell_outputs_land_in_target_dir() {
     let repo = make_repo();
+    fs::write(
+        repo.path().join("codex-forge.toml"),
+        "[runtime]\nrequire_tool_approval = true\nauto_approve_readonly = true\n",
+    )
+    .expect("write config");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
     let chat = command(bin, repo.path())
@@ -267,15 +248,7 @@ fn sandbox_uses_direct_mount_with_privileged_flags_and_run_shell_outputs_land_in
         .expect("run chat");
     assert!(chat.status.success(), "{:?}", chat);
     let chat_stdout = String::from_utf8_lossy(&chat.stdout);
-    assert!(
-        chat_stdout.contains("status: waiting_for_input"),
-        "{chat_stdout}"
-    );
-    let thread_id = chat_stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("thread: "))
-        .expect("thread id")
-        .to_string();
+    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
 
     let docker_state = docker_state_dir(repo.path());
     let repo_root = repo.path().canonicalize().expect("canonical repo");
@@ -291,40 +264,6 @@ fn sandbox_uses_direct_mount_with_privileged_flags_and_run_shell_outputs_land_in
         run_args.contains(&format!("-v {}:/workspace/repo", repo_root.display())),
         "{run_args}"
     );
-
-    let approval_list = command(bin, repo.path())
-        .args([
-            "approval",
-            "list",
-            "--thread",
-            &thread_id,
-            "--target-dir",
-            repo.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("approval list");
-    assert!(approval_list.status.success(), "{:?}", approval_list);
-    let approval_stdout = String::from_utf8_lossy(&approval_list.stdout);
-    let approval_id = approval_stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split('\t').next())
-        .expect("approval id")
-        .to_string();
-
-    let approve = command(bin, repo.path())
-        .args([
-            "approval",
-            "approve",
-            "--thread",
-            &thread_id,
-            &approval_id,
-            "--target-dir",
-            repo.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("approval approve");
-    assert!(approve.status.success(), "{:?}", approve);
     assert_eq!(
         fs::read_to_string(repo.path().join("out").join("result.txt")).expect("read artifact"),
         "artifact"

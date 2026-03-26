@@ -82,6 +82,16 @@ impl Default for BackendConfig {
 }
 
 impl BackendConfig {
+    pub fn resolve_model<'a>(&'a self, requested: Option<&'a str>) -> Option<&'a str> {
+        let requested = non_empty_model(requested);
+        match self.provider {
+            BackendProvider::Codex => requested,
+            BackendProvider::OpenAiCompatible => {
+                requested.or_else(|| non_empty_model(self.model.as_deref()))
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.turn_timeout_secs == 0 {
             bail!("backend.turn_timeout_secs 必须大于 0");
@@ -177,6 +187,10 @@ pub struct RuntimeConfig {
     #[serde(default = "default_enable_long_running_delivery")]
     pub enable_long_running_delivery: bool,
     #[serde(default)]
+    pub interactive_plan_confirmation: bool,
+    #[serde(default)]
+    pub require_tool_approval: bool,
+    #[serde(default)]
     pub auto_approve_readonly: bool,
 }
 
@@ -189,6 +203,8 @@ impl Default for RuntimeConfig {
             max_evaluator_loops: default_max_evaluator_loops(),
             bootstrap_message_limit: default_bootstrap_message_limit(),
             enable_long_running_delivery: default_enable_long_running_delivery(),
+            interactive_plan_confirmation: false,
+            require_tool_approval: false,
             auto_approve_readonly: true,
         }
     }
@@ -342,6 +358,10 @@ fn default_docker_image() -> String {
     "codex-forge-sandbox:latest".to_string()
 }
 
+fn non_empty_model(value: Option<&str>) -> Option<&str> {
+    value.filter(|item| !item.trim().is_empty())
+}
+
 fn default_mount_strategy() -> SandboxMountStrategy {
     SandboxMountStrategy::DirectRw
 }
@@ -385,7 +405,7 @@ mod tests {
     use once_cell::sync::Lazy;
     use tempfile::TempDir;
 
-    use super::{RuntimeConfig, global_config_path};
+    use super::{BackendProvider, GlobalConfig, RuntimeConfig, global_config_path};
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -393,6 +413,12 @@ mod tests {
     fn generator_budget_defaults_to_more_than_main_turns() {
         let runtime = RuntimeConfig::default();
         assert!(runtime.max_generator_turns > runtime.max_turns);
+    }
+
+    #[test]
+    fn interactive_plan_confirmation_defaults_to_false() {
+        let runtime = RuntimeConfig::default();
+        assert!(!runtime.interactive_plan_confirmation);
     }
 
     #[test]
@@ -410,5 +436,44 @@ mod tests {
         unsafe {
             std::env::remove_var("CODEX_FORGE_HOME");
         }
+    }
+
+    #[test]
+    fn global_default_backend_provider_is_codex() {
+        assert_eq!(
+            GlobalConfig::default().backend.provider,
+            BackendProvider::Codex
+        );
+    }
+
+    #[test]
+    fn codex_provider_only_uses_explicit_model_override() {
+        let config = super::BackendConfig {
+            provider: BackendProvider::Codex,
+            key: Some("sk-demo".to_string()),
+            base_url: Some("https://example.com/v1".to_string()),
+            model: Some("MiniMax-M2.7".to_string()),
+            turn_timeout_secs: 600,
+        };
+
+        assert_eq!(config.resolve_model(None), None);
+        assert_eq!(config.resolve_model(Some("gpt-5")), Some("gpt-5"));
+    }
+
+    #[test]
+    fn openai_compatible_provider_falls_back_to_configured_model() {
+        let config = super::BackendConfig {
+            provider: BackendProvider::OpenAiCompatible,
+            key: Some("sk-demo".to_string()),
+            base_url: Some("https://example.com/v1".to_string()),
+            model: Some("MiniMax-M2.7".to_string()),
+            turn_timeout_secs: 600,
+        };
+
+        assert_eq!(config.resolve_model(None), Some("MiniMax-M2.7"));
+        assert_eq!(
+            config.resolve_model(Some("custom-model")),
+            Some("custom-model")
+        );
     }
 }

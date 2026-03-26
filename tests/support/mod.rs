@@ -107,6 +107,28 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$prompt" in
+  *"执行模式：autonomous_codex"* )
+    case "$prompt" in
+      *"请修改 file-a.txt 为 beta"* )
+        printf 'beta\n' > "$cwd/file-a.txt"
+        printf '%s\n' "file-a.txt 已修改为 beta，并完成本次任务。" > "$output"
+        ;;
+      *"请在沙箱里生成 out/result.txt"* )
+        mkdir -p "$cwd/out"
+        printf 'artifact' > "$cwd/out/result.txt"
+        printf '%s\n' "out/result.txt 已生成。" > "$output"
+        ;;
+      *"请总结这个仓库目前的用途"* )
+        printf '%s\n' "这是一个本地 Codex harness，用 thread/run 管理对话与执行，并带有长期任务状态机。" > "$output"
+        ;;
+      *"请解释当前线程的作用"* )
+        printf '%s\n' "这个线程用于承载当前任务的连续对话和运行历史。" > "$output"
+        ;;
+      * )
+        printf '%s\n' "默认回复。" > "$output"
+        ;;
+    esac
+    ;;
   *"请修改 file-a.txt 为 beta"* )
     if printf "%s" "$prompt" | grep -q 'write_file `file-a.txt` 成功'; then
       cat > "$output" <<'JSON'
@@ -256,7 +278,7 @@ case "$cmd" in
   rm)
     if [ "${1:-}" = "-f" ]; then shift; fi
     name="$1"
-    rm -f "$state_dir/$name.repo" "$state_dir/$name.run" "$state_dir/$name.run-args"
+    rm -f "$state_dir/$name.repo" "$state_dir/$name.run"
     ;;
   *)
     echo "unsupported docker subcommand: $cmd" >&2

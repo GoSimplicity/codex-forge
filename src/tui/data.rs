@@ -7,14 +7,14 @@ use std::time::Duration;
 use crate::commands::format::status_label;
 use crate::config::{BackendProvider, LoadedGlobalConfig, set_global_backend_provider};
 use crate::harness::{
-    ApprovalStatus, ChatRequest, HarnessRunStatus, MemoryLayer, chat_once,
+    ApprovalStatus, ChatRequest, HarnessRunStatus, MemoryLayer, cancel_active_run, chat_once,
     resolve_approval_and_resume,
 };
-use crate::harness::{resume_run, retry_task_node_and_resume};
+use crate::harness::{confirm_plan_review_and_resume, resume_run, retry_task_node_and_resume};
 use crate::model::ThinkingMode;
 
-use super::app::PendingSend;
 use super::app::TuiApp;
+use super::app::{PendingSend, PendingTaskKind, PendingTaskOutcome};
 use super::render::paragraph_max_scroll;
 use super::tabs::{BrowsePane, FocusMode};
 
@@ -180,24 +180,46 @@ impl TuiApp {
             Some(thread_id) => thread_id,
             None => self.store.create_thread(None)?.id,
         };
+        let abandoned_run_id = if self.can_confirm_selected_plan() {
+            self.selected_run_id
+                .clone()
+                .map(|run_id| {
+                    cancel_active_run(&self.repo_root, &self.config, &thread_id, &run_id)?;
+                    Ok::<String, anyhow::Error>(run_id)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let repo_root = self.repo_root.clone();
         let config = self.config.clone();
         let request = ChatRequest {
             thread_id: thread_id.clone(),
             message,
-            model: self.config.backend.model.clone(),
+            model: None,
             thinking_mode: ThinkingMode::Balanced,
         };
         self.selected_thread_id = Some(thread_id.clone());
+        self.selected_run_id = None;
         self.focus = FocusMode::Browse;
         self.pending_delete_thread_id = None;
         self.pending_send = Some(PendingSend {
             thread_id: thread_id.clone(),
-            handle: tokio::spawn(async move { chat_once(&repo_root, &config, request).await }),
+            kind: PendingTaskKind::ChatMessage,
+            handle: tokio::spawn(async move {
+                chat_once(&repo_root, &config, request)
+                    .await
+                    .map(PendingTaskOutcome::Chat)
+            }),
         });
         self.refresh()?;
-        self.status =
-            format!("草稿已提交到 `{thread_id}`，后台开始运行；你可以继续浏览，按 r 查看最新进度");
+        self.status = if let Some(run_id) = abandoned_run_id {
+            format!(
+                "已自动废弃旧计划 run `{run_id}`，并把反馈提交到 `{thread_id}`；后台开始重新生成计划，按 r 查看最新进度"
+            )
+        } else {
+            format!("草稿已提交到 `{thread_id}`，后台开始运行；你可以继续浏览，按 r 查看最新进度")
+        };
         Ok(())
     }
 
@@ -216,61 +238,103 @@ impl TuiApp {
         let pending = self.pending_send.take().expect("pending send should exist");
         let thread_id = pending.thread_id.clone();
         match pending.handle.await.context("后台运行任务异常退出")? {
-            Ok(outcome) => {
+            Ok(PendingTaskOutcome::Chat(outcome)) => {
                 self.selected_thread_id = Some(thread_id.clone());
+                self.selected_run_id = Some(outcome.run.id.clone());
                 self.composer.clear();
                 self.refresh()?;
                 self.status = format!("thread `{thread_id}` 运行完成：{}", outcome.run.id);
             }
+            Ok(PendingTaskOutcome::Run(run)) => {
+                self.selected_thread_id = Some(thread_id.clone());
+                self.selected_run_id = Some(run.id.clone());
+                self.refresh()?;
+                self.status = pending_success_status(&pending.kind, &run);
+            }
             Err(error) => {
                 self.selected_thread_id = Some(thread_id.clone());
                 self.refresh()?;
-                self.status = format!("thread `{thread_id}` 运行失败：{error:#}");
+                self.status = format!(
+                    "{}：{error:#}",
+                    pending_failure_status(&pending.kind, &thread_id)
+                );
             }
         }
         Ok(())
     }
 
     pub(crate) async fn approve_first_pending(&mut self) -> Result<()> {
+        if self.pending_send.is_some() {
+            self.status = "已有后台任务运行，请等待完成后再继续".to_string();
+            return Ok(());
+        }
         let Some(approval) = self.selected_approval().cloned() else {
             self.status = "当前没有待处理审批".to_string();
             return Ok(());
         };
-        let run = resolve_approval_and_resume(
-            &self.repo_root,
-            &self.config,
-            &approval.thread_id,
-            &approval.id,
-            ApprovalStatus::Approved,
-        )
-        .await?;
-        self.refresh()?;
+        let repo_root = self.repo_root.clone();
+        let config = self.config.clone();
+        let thread_id = approval.thread_id.clone();
+        let approval_id = approval.id.clone();
+        self.pending_send = Some(PendingSend {
+            thread_id: thread_id.clone(),
+            kind: PendingTaskKind::ResolveApproval {
+                approval_id: approval_id.clone(),
+                approved: true,
+            },
+            handle: tokio::spawn(async move {
+                resolve_approval_and_resume(
+                    &repo_root,
+                    &config,
+                    &thread_id,
+                    &approval_id,
+                    ApprovalStatus::Approved,
+                )
+                .await
+                .map(PendingTaskOutcome::Run)
+            }),
+        });
         self.status = format!(
-            "已通过审批 `{}`，run 状态：{}",
-            approval.id,
-            status_label(run.status)
+            "已提交审批 `{}`，后台继续执行；你可以继续浏览，按 r 查看最新进度",
+            approval.id
         );
         Ok(())
     }
 
     pub(crate) async fn deny_first_pending(&mut self) -> Result<()> {
+        if self.pending_send.is_some() {
+            self.status = "已有后台任务运行，请等待完成后再继续".to_string();
+            return Ok(());
+        }
         let Some(approval) = self.selected_approval().cloned() else {
             self.status = "当前没有待处理审批".to_string();
             return Ok(());
         };
-        let run = resolve_approval_and_resume(
-            &self.repo_root,
-            &self.config,
-            &approval.thread_id,
-            &approval.id,
-            ApprovalStatus::Denied,
-        )
-        .await?;
-        self.refresh()?;
+        let repo_root = self.repo_root.clone();
+        let config = self.config.clone();
+        let thread_id = approval.thread_id.clone();
+        let approval_id = approval.id.clone();
+        self.pending_send = Some(PendingSend {
+            thread_id: thread_id.clone(),
+            kind: PendingTaskKind::ResolveApproval {
+                approval_id: approval_id.clone(),
+                approved: false,
+            },
+            handle: tokio::spawn(async move {
+                resolve_approval_and_resume(
+                    &repo_root,
+                    &config,
+                    &thread_id,
+                    &approval_id,
+                    ApprovalStatus::Denied,
+                )
+                .await
+                .map(PendingTaskOutcome::Run)
+            }),
+        });
         self.status = format!(
-            "已拒绝审批 `{}`，run 状态：{}",
-            approval.id,
-            status_label(run.status)
+            "已提交拒绝 `{}`，后台更新 run 状态；你可以继续浏览，按 r 查看最新进度",
+            approval.id
         );
         Ok(())
     }
@@ -303,7 +367,7 @@ impl TuiApp {
         if matches!(self.browse_pane, BrowsePane::Detail)
             && matches!(
                 current,
-                BrowsePane::Threads | BrowsePane::Runs | BrowsePane::Steps
+                BrowsePane::Threads | BrowsePane::Runs | BrowsePane::Steps | BrowsePane::Error
             )
         {
             self.detail_parent_pane = current;
@@ -324,7 +388,9 @@ impl TuiApp {
 
     pub(crate) fn enter_detail(&mut self) {
         self.detail_parent_pane = match self.browse_pane {
-            BrowsePane::Threads | BrowsePane::Runs | BrowsePane::Steps => self.browse_pane,
+            BrowsePane::Threads | BrowsePane::Runs | BrowsePane::Steps | BrowsePane::Error => {
+                self.browse_pane
+            }
             BrowsePane::Detail => self.detail_parent_pane,
             BrowsePane::Composer => BrowsePane::Runs,
         };
@@ -332,6 +398,8 @@ impl TuiApp {
         self.reset_detail_position_for_parent();
         self.status = if matches!(self.detail_parent_pane, BrowsePane::Runs) {
             "已进入实时输出详情；默认跟随最新输出，手动滚动后会固定当前位置，Esc 返回".to_string()
+        } else if matches!(self.detail_parent_pane, BrowsePane::Error) {
+            "已进入错误详情视图，可上下滚动，Esc 返回".to_string()
         } else {
             "已进入详情视图，可上下滚动，Esc 返回".to_string()
         };
@@ -379,7 +447,7 @@ impl TuiApp {
             BrowsePane::Threads => self.select_next(),
             BrowsePane::Runs => self.select_next_run(),
             BrowsePane::Steps => self.select_next_task_node(),
-            BrowsePane::Detail => {
+            BrowsePane::Error | BrowsePane::Detail => {
                 self.scroll_detail_down();
                 Ok(())
             }
@@ -392,7 +460,7 @@ impl TuiApp {
             BrowsePane::Threads => self.select_prev(),
             BrowsePane::Runs => self.select_prev_run(),
             BrowsePane::Steps => self.select_prev_task_node(),
-            BrowsePane::Detail => {
+            BrowsePane::Error | BrowsePane::Detail => {
                 self.scroll_detail_up();
                 Ok(())
             }
@@ -550,6 +618,17 @@ impl TuiApp {
             .or_else(|| self.runs.first())
     }
 
+    fn current_task_node_manifest(&self) -> Option<&crate::harness::TaskNodeRecord> {
+        self.selected_task_node_id
+            .as_ref()
+            .and_then(|id| self.task_nodes.iter().find(|node| &node.id == id))
+            .or_else(|| {
+                self.current_run_manifest()
+                    .and_then(|run| run.active_task_node_id.as_ref())
+                    .and_then(|id| self.task_nodes.iter().find(|node| &node.id == id))
+            })
+    }
+
     fn current_live_output_max_scroll(&self) -> u16 {
         if self.detail_viewport_width == 0 || self.detail_viewport_height == 0 {
             return 0;
@@ -563,6 +642,10 @@ impl TuiApp {
     }
 
     pub(crate) async fn resume_selected_run(&mut self) -> Result<()> {
+        if self.pending_send.is_some() {
+            self.status = "已有后台任务运行，请等待完成后再继续".to_string();
+            return Ok(());
+        }
         let Some(thread_id) = self.selected_thread_id.clone() else {
             self.status = "当前没有选中 thread".to_string();
             return Ok(());
@@ -571,13 +654,87 @@ impl TuiApp {
             self.status = "当前没有选中 run".to_string();
             return Ok(());
         };
-        let run = resume_run(&self.repo_root, &self.config, &thread_id, &run_id).await?;
-        self.refresh()?;
-        self.status = format!("已恢复 run `{}`：{}", run.id, status_label(run.status));
+        let repo_root = self.repo_root.clone();
+        let config = self.config.clone();
+        let status_run_id = run_id.clone();
+        self.pending_send = Some(PendingSend {
+            thread_id: thread_id.clone(),
+            kind: PendingTaskKind::ResumeRun,
+            handle: tokio::spawn(async move {
+                resume_run(&repo_root, &config, &thread_id, &run_id)
+                    .await
+                    .map(PendingTaskOutcome::Run)
+            }),
+        });
+        self.status = format!(
+            "已提交恢复请求，后台继续 run `{}`；你可以继续浏览，按 r 查看最新进度",
+            status_run_id
+        );
+        Ok(())
+    }
+
+    pub(crate) fn can_confirm_selected_plan(&self) -> bool {
+        self.current_run_manifest()
+            .is_some_and(|run| matches!(run.status, HarnessRunStatus::WaitingForInput))
+            && self.current_task_node_manifest().is_some_and(|node| {
+                matches!(node.kind, crate::harness::types::TaskNodeKind::PlanReview)
+                    && matches!(
+                        node.status,
+                        crate::harness::types::TaskNodeStatus::WaitingForInput
+                    )
+            })
+    }
+
+    pub(crate) async fn confirm_selected_plan_and_resume(&mut self) -> Result<()> {
+        if self.pending_send.is_some() {
+            self.status = "已有后台任务运行，请等待完成后再继续".to_string();
+            return Ok(());
+        }
+        let Some(thread_id) = self.selected_thread_id.clone() else {
+            self.status = "当前没有选中 thread".to_string();
+            return Ok(());
+        };
+        let Some(run_id) = self.selected_run_id.clone() else {
+            self.status = "当前没有选中 run".to_string();
+            return Ok(());
+        };
+        let Some(task_node_id) = self
+            .current_task_node_manifest()
+            .map(|node| node.id.clone())
+        else {
+            self.status = "当前没有待确认的计划节点".to_string();
+            return Ok(());
+        };
+        let repo_root = self.repo_root.clone();
+        let config = self.config.clone();
+        let status_run_id = run_id.clone();
+        self.pending_send = Some(PendingSend {
+            thread_id: thread_id.clone(),
+            kind: PendingTaskKind::ConfirmPlan,
+            handle: tokio::spawn(async move {
+                confirm_plan_review_and_resume(
+                    &repo_root,
+                    &config,
+                    &thread_id,
+                    &run_id,
+                    &task_node_id,
+                )
+                .await
+                .map(PendingTaskOutcome::Run)
+            }),
+        });
+        self.status = format!(
+            "已确认计划，后台继续执行 run `{}`；你可以继续浏览，按 r 查看最新进度",
+            status_run_id
+        );
         Ok(())
     }
 
     pub(crate) async fn retry_selected_task_node(&mut self) -> Result<()> {
+        if self.pending_send.is_some() {
+            self.status = "已有后台任务运行，请等待完成后再继续".to_string();
+            return Ok(());
+        }
         let Some(thread_id) = self.selected_thread_id.clone() else {
             self.status = "当前没有选中 thread".to_string();
             return Ok(());
@@ -590,20 +747,23 @@ impl TuiApp {
             self.status = "当前没有选中节点".to_string();
             return Ok(());
         };
-        let run = retry_task_node_and_resume(
-            &self.repo_root,
-            &self.config,
-            &thread_id,
-            &run_id,
-            &task_node_id,
-        )
-        .await?;
-        self.refresh()?;
+        let repo_root = self.repo_root.clone();
+        let config = self.config.clone();
+        let status_task_node_id = task_node_id.clone();
+        self.pending_send = Some(PendingSend {
+            thread_id: thread_id.clone(),
+            kind: PendingTaskKind::RetryTaskNode {
+                task_node_id: task_node_id.clone(),
+            },
+            handle: tokio::spawn(async move {
+                retry_task_node_and_resume(&repo_root, &config, &thread_id, &run_id, &task_node_id)
+                    .await
+                    .map(PendingTaskOutcome::Run)
+            }),
+        });
         self.status = format!(
-            "已重试节点 `{}`，run `{}` 状态：{}",
-            task_node_id,
-            run.id,
-            status_label(run.status)
+            "已提交重试 `{}`，后台继续执行；你可以继续浏览，按 r 查看最新进度",
+            status_task_node_id
         );
         Ok(())
     }
@@ -669,21 +829,92 @@ impl TuiApp {
         match persist(next) {
             Ok(loaded) => {
                 self.config.backend = loaded.value.backend;
-                let carry_over_note = if self.pending_send.is_some() {
-                    "；当前后台 run 保持原 Backend，后续新 run 才会使用新配置"
-                } else {
-                    ""
-                };
-                self.status = format!(
-                    "默认 Backend 已切换为 {}，并写入 {}{}",
-                    self.config.backend.provider.display_name(),
-                    loaded.path.display(),
-                    carry_over_note
+                self.store = crate::harness::HarnessStore::new(
+                    &self.repo_root,
+                    self.config.backend.provider,
                 );
+                self.selected_thread_id = None;
+                self.selected_run_id = None;
+                self.selected_task_node_id = None;
+                self.pending_delete_thread_id = None;
+                self.selected_approval_index = 0;
+                self.clear_selected_thread_state();
+                let refresh_error = self.refresh().err();
+                let carry_over_note = if self.pending_send.is_some() {
+                    "；旧后台 run 保持原模式继续执行，当前视图与后续新 run 已切到新模式"
+                } else {
+                    "；当前视图与后续新 run 已切到新模式"
+                };
+                self.status = if let Some(error) = refresh_error {
+                    format!(
+                        "执行模式已切换为 {}，但刷新新模式视图失败：{error:#}",
+                        self.config.backend.provider.display_name()
+                    )
+                } else {
+                    format!(
+                        "执行模式已切换为 {}，并写入 {}{}",
+                        self.config.backend.provider.display_name(),
+                        loaded.path.display(),
+                        carry_over_note
+                    )
+                };
             }
             Err(error) => {
-                self.status = format!("切换 Backend 失败：{error:#}");
+                self.status = format!("切换执行模式失败：{error:#}");
             }
+        }
+    }
+}
+
+fn pending_success_status(
+    kind: &PendingTaskKind,
+    run: &crate::harness::HarnessRunManifest,
+) -> String {
+    match kind {
+        PendingTaskKind::ChatMessage => format!("thread `{}` 运行完成：{}", run.thread_id, run.id),
+        PendingTaskKind::ConfirmPlan => {
+            format!(
+                "已确认计划，run `{}` 状态：{}",
+                run.id,
+                status_label(run.status)
+            )
+        }
+        PendingTaskKind::ResolveApproval {
+            approval_id,
+            approved,
+        } => format!(
+            "已{}审批 `{}`，run 状态：{}",
+            if *approved { "通过" } else { "拒绝" },
+            approval_id,
+            status_label(run.status)
+        ),
+        PendingTaskKind::ResumeRun => {
+            format!("已恢复 run `{}`：{}", run.id, status_label(run.status))
+        }
+        PendingTaskKind::RetryTaskNode { task_node_id } => format!(
+            "已重试节点 `{}`，run `{}` 状态：{}",
+            task_node_id,
+            run.id,
+            status_label(run.status)
+        ),
+    }
+}
+
+fn pending_failure_status(kind: &PendingTaskKind, thread_id: &str) -> String {
+    match kind {
+        PendingTaskKind::ChatMessage => format!("thread `{thread_id}` 运行失败"),
+        PendingTaskKind::ConfirmPlan => "确认计划后恢复执行失败".to_string(),
+        PendingTaskKind::ResolveApproval {
+            approval_id,
+            approved,
+        } => format!(
+            "{}审批 `{}` 失败",
+            if *approved { "通过" } else { "拒绝" },
+            approval_id
+        ),
+        PendingTaskKind::ResumeRun => "恢复 run 失败".to_string(),
+        PendingTaskKind::RetryTaskNode { task_node_id } => {
+            format!("重试节点 `{task_node_id}` 失败")
         }
     }
 }
@@ -951,6 +1182,7 @@ fn pane_label(pane: BrowsePane) -> &'static str {
         BrowsePane::Threads => "Threads",
         BrowsePane::Runs => "Runs",
         BrowsePane::Steps => "执行步骤",
+        BrowsePane::Error => "错误视图",
         BrowsePane::Detail => "详情视图",
         BrowsePane::Composer => "Composer",
     }
@@ -973,10 +1205,10 @@ mod tests {
     use crate::harness::HarnessStore;
     use crate::harness::types::{
         AgentBackendKind, HarnessEvent, HarnessMessageRole, HarnessRunManifest, HarnessRunStatus,
-        TaskNodeKind, TaskNodeRecord, TaskNodeStatus,
+        RunExecutionKind, TaskNodeKind, TaskNodeRecord, TaskNodeStatus,
     };
     use crate::model::ThinkingMode;
-    use crate::tui::app::TuiApp;
+    use crate::tui::app::{PendingSend, PendingTaskKind, PendingTaskOutcome, TuiApp};
     use crate::tui::tabs::{BrowsePane, FocusMode};
 
     fn make_task_node(
@@ -1011,7 +1243,7 @@ mod tests {
     fn make_test_app(provider: BackendProvider) -> TuiApp {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.keep();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, provider);
         let mut config = AppConfig::default();
         config.backend.provider = provider;
         TuiApp {
@@ -1108,6 +1340,7 @@ mod tests {
             model: None,
             thinking_mode: ThinkingMode::Balanced,
             backend: AgentBackendKind::Codex,
+            execution_kind: RunExecutionKind::AutonomousCodex,
             turn_count: 1,
             summary: None,
             last_error: None,
@@ -1153,6 +1386,7 @@ mod tests {
             model: None,
             thinking_mode: ThinkingMode::Balanced,
             backend: AgentBackendKind::Codex,
+            execution_kind: RunExecutionKind::AutonomousCodex,
             turn_count: 1,
             summary: None,
             last_error: None,
@@ -1182,6 +1416,8 @@ mod tests {
     #[test]
     fn cycling_backend_updates_runtime_config_and_status() {
         let mut app = make_test_app(BackendProvider::Codex);
+        let thread = app.store.create_thread(Some("codex")).expect("thread");
+        app.selected_thread_id = Some(thread.id);
 
         app.cycle_backend_provider_with(|provider| {
             Ok(LoadedGlobalConfig {
@@ -1202,12 +1438,28 @@ mod tests {
             app.config.backend.provider,
             BackendProvider::OpenAiCompatible
         );
+        assert!(app.selected_thread_id.is_none());
+        assert!(app.threads.is_empty());
+        let isolated_thread = app
+            .store
+            .create_thread(Some("openai"))
+            .expect("openai thread");
+        assert!(
+            isolated_thread.thread_dir.ends_with(
+                std::path::Path::new(".codex-forge")
+                    .join("modes")
+                    .join("openai_compatible")
+                    .join("threads")
+                    .join(&isolated_thread.id)
+            )
+        );
         assert!(app.status.contains("OpenAI Compatible"), "{}", app.status);
         assert!(
             app.status.contains("/tmp/.codex-forge/config.toml"),
             "{}",
             app.status
         );
+        assert!(app.status.contains("当前视图与后续新 run 已切到新模式"));
     }
 
     #[test]
@@ -1217,7 +1469,7 @@ mod tests {
         app.cycle_backend_provider_with(|_| Err(anyhow!("backend.key 不能为空")));
 
         assert_eq!(app.config.backend.provider, BackendProvider::Codex);
-        assert!(app.status.contains("切换 Backend 失败"), "{}", app.status);
+        assert!(app.status.contains("切换执行模式失败"), "{}", app.status);
         assert!(
             app.status.contains("backend.key 不能为空"),
             "{}",
@@ -1229,7 +1481,7 @@ mod tests {
     fn entering_run_detail_starts_with_scrollable_offset() {
         let dir = TempDir::new().expect("tempdir");
         let repo_root = dir.path().to_path_buf();
-        let store = HarnessStore::new(&repo_root);
+        let store = HarnessStore::new(&repo_root, BackendProvider::Codex);
         let mut app = TuiApp {
             repo_root,
             store,
@@ -1276,7 +1528,7 @@ mod tests {
     #[test]
     fn load_selected_thread_keeps_messages_and_events_when_output_files_missing() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("demo")).expect("thread");
         store
             .append_message(
@@ -1305,11 +1557,97 @@ mod tests {
             )
             .expect("event");
 
-        let mut app = TuiApp::new(dir.path().to_path_buf(), Some(thread.id.clone())).expect("app");
+        let mut app = TuiApp {
+            repo_root: dir.path().to_path_buf(),
+            store,
+            config: AppConfig::default(),
+            threads: Vec::new(),
+            selected_thread_id: Some(thread.id.clone()),
+            selected_run_id: None,
+            selected_task_node_id: None,
+            messages: Vec::new(),
+            runs: Vec::new(),
+            task_nodes: Vec::new(),
+            events: Vec::new(),
+            approvals: Vec::new(),
+            selected_approval_index: 0,
+            artifacts: Vec::new(),
+            subagents: Vec::new(),
+            current_contract: None,
+            current_progress: None,
+            working_memory: Vec::new(),
+            project_memory: Vec::new(),
+            focus: FocusMode::Browse,
+            browse_pane: BrowsePane::Threads,
+            detail_parent_pane: BrowsePane::Runs,
+            composer: String::new(),
+            pending_send: None,
+            pending_delete_thread_id: None,
+            last_refresh_at: Instant::now(),
+            live_output_title: "实时输出".to_string(),
+            live_output_body: "等待运行...".to_string(),
+            live_output_scroll: 0,
+            live_output_follow_latest: true,
+            detail_viewport_width: 0,
+            detail_viewport_height: 0,
+            status: String::new(),
+        };
         app.refresh().expect("refresh");
 
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.events.len(), 1);
         assert!(app.live_output_body.contains("等待输出"));
+    }
+
+    #[tokio::test]
+    async fn poll_background_tasks_handles_resumed_run_without_blocking_ui() {
+        let mut app = make_test_app(BackendProvider::Codex);
+        let thread = app.store.create_thread(Some("thread")).expect("thread");
+        let thread_id = thread.id.clone();
+        app.selected_thread_id = Some(thread_id.clone());
+        let run_dir = app.repo_root.join("run");
+        let spawned_thread_id = thread_id.clone();
+        app.pending_send = Some(PendingSend {
+            thread_id: thread_id.clone(),
+            kind: PendingTaskKind::ConfirmPlan,
+            handle: tokio::spawn(async move {
+                Ok(PendingTaskOutcome::Run(HarnessRunManifest {
+                    id: "run-1".to_string(),
+                    thread_id: spawned_thread_id.clone(),
+                    status: HarnessRunStatus::Running,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    model: None,
+                    thinking_mode: ThinkingMode::Balanced,
+                    backend: AgentBackendKind::Codex,
+                    execution_kind: RunExecutionKind::Orchestrated,
+                    turn_count: 3,
+                    summary: Some("继续执行".to_string()),
+                    last_error: None,
+                    blocked_reason: None,
+                    run_dir: run_dir.clone(),
+                    events_path: run_dir.join("events.jsonl"),
+                    output_path: run_dir.join("assistant.md"),
+                    log_path: run_dir.join("codex.log"),
+                    tool_calls_path: run_dir.join("tool-calls.jsonl"),
+                    approvals_path: run_dir.join("approvals.jsonl"),
+                    artifacts_path: run_dir.join("artifacts.jsonl"),
+                    subagents_path: run_dir.join("subagents.jsonl"),
+                    task_graph_path: run_dir.join("task-graph.json"),
+                    task_nodes_path: run_dir.join("task-nodes.jsonl"),
+                    evaluation_log_path: run_dir.join("evaluations.jsonl"),
+                    bootstrap_path: run_dir.join("session-bootstrap.md"),
+                    active_task_node_id: None,
+                    sandbox: None,
+                }))
+            }),
+        });
+
+        tokio::task::yield_now().await;
+        app.poll_background_tasks().await.expect("poll");
+
+        assert!(app.pending_send.is_none());
+        assert!(app.status.contains("已确认计划"), "{}", app.status);
+        assert_eq!(app.selected_thread_id.as_deref(), Some(thread_id.as_str()));
     }
 }

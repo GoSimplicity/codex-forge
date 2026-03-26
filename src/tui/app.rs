@@ -13,9 +13,23 @@ use crate::harness::{
 
 use super::tabs::{BrowsePane, FocusMode};
 
+pub(crate) enum PendingTaskOutcome {
+    Chat(ChatRunOutcome),
+    Run(HarnessRunManifest),
+}
+
+pub(crate) enum PendingTaskKind {
+    ChatMessage,
+    ConfirmPlan,
+    ResolveApproval { approval_id: String, approved: bool },
+    ResumeRun,
+    RetryTaskNode { task_node_id: String },
+}
+
 pub(crate) struct PendingSend {
     pub(crate) thread_id: String,
-    pub(crate) handle: JoinHandle<Result<ChatRunOutcome>>,
+    pub(crate) kind: PendingTaskKind,
+    pub(crate) handle: JoinHandle<Result<PendingTaskOutcome>>,
 }
 
 pub(crate) struct TuiApp {
@@ -57,8 +71,9 @@ pub(crate) struct TuiApp {
 impl TuiApp {
     pub(crate) fn new(repo_root: PathBuf, selected_thread_id: Option<String>) -> Result<Self> {
         let config = load_app_config(&repo_root)?;
+        let store = crate::harness::HarnessStore::new(&repo_root, config.backend.provider);
         Ok(Self {
-            store: HarnessStore::new(&repo_root),
+            store,
             repo_root,
             config,
             threads: Vec::new(),

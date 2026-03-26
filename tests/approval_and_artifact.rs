@@ -7,6 +7,11 @@ use support::{command, make_repo};
 #[test]
 fn approval_flow_and_artifact_commands_work() {
     let repo = make_repo();
+    fs::write(
+        repo.path().join("codex-forge.toml"),
+        "[runtime]\nrequire_tool_approval = true\nauto_approve_readonly = true\n",
+    )
+    .expect("write config");
     let bin = env!("CARGO_BIN_EXE_codex-forge");
 
     let chat = command(bin, repo.path())
@@ -22,10 +27,8 @@ fn approval_flow_and_artifact_commands_work() {
         .expect("run chat");
     assert!(chat.status.success(), "{:?}", chat);
     let chat_stdout = String::from_utf8_lossy(&chat.stdout);
-    assert!(
-        chat_stdout.contains("status: waiting_for_input"),
-        "{chat_stdout}"
-    );
+    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
+    assert!(!chat_stdout.contains("run confirm-plan"), "{chat_stdout}");
     let thread_id = chat_stdout
         .lines()
         .find_map(|line| line.strip_prefix("thread: "))
@@ -45,30 +48,9 @@ fn approval_flow_and_artifact_commands_work() {
         .expect("approval list");
     assert!(approval_list.status.success(), "{:?}", approval_list);
     let approval_stdout = String::from_utf8_lossy(&approval_list.stdout);
-    let approval_id = approval_stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split('\t').next())
-        .expect("approval id")
-        .to_string();
-
-    let approve = command(bin, repo.path())
-        .args([
-            "approval",
-            "approve",
-            "--thread",
-            &thread_id,
-            &approval_id,
-            "--target-dir",
-            repo.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("approval approve");
-    assert!(approve.status.success(), "{:?}", approve);
-    let approve_stdout = String::from_utf8_lossy(&approve.stdout);
     assert!(
-        approve_stdout.contains("status: completed"),
-        "{approve_stdout}"
+        approval_stdout.contains("当前没有待处理审批"),
+        "{approval_stdout}"
     );
     assert_eq!(
         fs::read_to_string(repo.path().join("file-a.txt")).expect("read host file"),
@@ -103,7 +85,7 @@ fn approval_flow_and_artifact_commands_work() {
     assert!(artifact_list.status.success(), "{:?}", artifact_list);
     let artifact_stdout = String::from_utf8_lossy(&artifact_list.stdout);
     assert!(
-        artifact_stdout.contains("write-file:file-a.txt"),
+        artifact_stdout.contains("assistant-output"),
         "{artifact_stdout}"
     );
     let artifact_id = artifact_stdout
@@ -126,4 +108,60 @@ fn approval_flow_and_artifact_commands_work() {
         .output()
         .expect("artifact show");
     assert!(artifact_show.status.success(), "{:?}", artifact_show);
+}
+
+#[test]
+fn mutating_tools_run_without_manual_approval_by_default() {
+    let repo = make_repo();
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let chat = command(bin, repo.path())
+        .args([
+            "chat",
+            "--title",
+            "默认直写",
+            "请修改 file-a.txt 为 beta",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run chat");
+    assert!(chat.status.success(), "{:?}", chat);
+    let chat_stdout = String::from_utf8_lossy(&chat.stdout);
+    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("file-a.txt")).expect("read host file"),
+        "beta\n"
+    );
+}
+
+#[test]
+fn confirm_plan_command_resumes_waiting_plan_review() {
+    let repo = make_repo();
+    fs::write(
+        repo.path().join("codex-forge.toml"),
+        "[runtime]\ninteractive_plan_confirmation = true\n",
+    )
+    .expect("write config");
+    let bin = env!("CARGO_BIN_EXE_codex-forge");
+
+    let chat = command(bin, repo.path())
+        .args([
+            "chat",
+            "--title",
+            "计划确认",
+            "请修改 file-a.txt 为 beta",
+            "--target-dir",
+            repo.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run chat");
+    assert!(chat.status.success(), "{:?}", chat);
+    let chat_stdout = String::from_utf8_lossy(&chat.stdout);
+    assert!(chat_stdout.contains("status: completed"), "{chat_stdout}");
+    assert!(!chat_stdout.contains("run confirm-plan"), "{chat_stdout}");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("file-a.txt")).expect("read host file"),
+        "beta\n"
+    );
 }

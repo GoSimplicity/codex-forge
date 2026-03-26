@@ -2,14 +2,15 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::BackendProvider;
 use crate::harness::types::SkillSummary;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SkillAdapter;
 
 impl SkillAdapter {
-    pub fn list() -> Vec<SkillSummary> {
-        let mut skills = discover_skill_dirs()
+    pub fn list(provider: BackendProvider) -> Vec<SkillSummary> {
+        let mut skills = discover_skill_dirs(provider)
             .into_iter()
             .flat_map(find_skill_files)
             .filter_map(read_skill_summary)
@@ -19,9 +20,9 @@ impl SkillAdapter {
         skills
     }
 
-    pub fn find_by_name(name: &str) -> Option<SkillSummary> {
+    pub fn find_by_name(provider: BackendProvider, name: &str) -> Option<SkillSummary> {
         let wanted = name.trim().to_lowercase();
-        Self::list().into_iter().find(|skill| {
+        Self::list(provider).into_iter().find(|skill| {
             skill.name.to_lowercase() == wanted
                 || skill
                     .path
@@ -31,8 +32,8 @@ impl SkillAdapter {
         })
     }
 
-    pub fn read_body(name_or_path: &str) -> Option<String> {
-        if let Some(skill) = Self::find_by_name(name_or_path) {
+    pub fn read_body(provider: BackendProvider, name_or_path: &str) -> Option<String> {
+        if let Some(skill) = Self::find_by_name(provider, name_or_path) {
             return fs::read_to_string(skill.path).ok();
         }
         let path = PathBuf::from(name_or_path);
@@ -40,16 +41,15 @@ impl SkillAdapter {
     }
 }
 
-fn discover_skill_dirs() -> Vec<PathBuf> {
-    if let Ok(value) = env::var("CODEX_FORGE_SKILL_DIRS") {
-        return env::split_paths(&value).collect();
-    }
-
+fn discover_skill_dirs(provider: BackendProvider) -> Vec<PathBuf> {
     let home = env::var_os("HOME").map(PathBuf::from);
     let mut dirs = Vec::new();
     if let Some(home) = home {
-        dirs.push(home.join(".codex").join("skills"));
-        dirs.push(home.join(".agents").join("skills"));
+        let path = match provider {
+            BackendProvider::Codex => home.join(".codex").join("skills"),
+            BackendProvider::OpenAiCompatible => home.join(".agents").join("skills"),
+        };
+        dirs.push(path);
     }
     dirs
 }
@@ -104,25 +104,41 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::config::BackendProvider;
+
     use super::SkillAdapter;
 
     #[test]
-    fn discovers_skill_from_override_dirs() {
+    fn discovers_skills_from_provider_specific_home_dirs() {
         let dir = TempDir::new().expect("tempdir");
-        let skill_dir = dir.path().join("demo");
-        fs::create_dir_all(&skill_dir).expect("mkdir");
+        let codex_skill_dir = dir.path().join(".codex").join("skills").join("demo");
+        let agents_skill_dir = dir.path().join(".agents").join("skills").join("agent-demo");
+        fs::create_dir_all(&codex_skill_dir).expect("mkdir codex");
+        fs::create_dir_all(&agents_skill_dir).expect("mkdir agents");
         fs::write(
-            skill_dir.join("SKILL.md"),
+            codex_skill_dir.join("SKILL.md"),
             "---\nname: demo-skill\ndescription: demo desc\n---\nbody",
         )
-        .expect("write");
+        .expect("write codex");
+        fs::write(
+            agents_skill_dir.join("SKILL.md"),
+            "---\nname: agent-skill\ndescription: agent desc\n---\nbody",
+        )
+        .expect("write agents");
         unsafe {
-            std::env::set_var("CODEX_FORGE_SKILL_DIRS", dir.path());
+            std::env::set_var("HOME", dir.path());
         }
-        let skills = SkillAdapter::list();
-        assert!(skills.iter().any(|skill| skill.name == "demo-skill"));
+        let codex_skills = SkillAdapter::list(BackendProvider::Codex);
+        let openai_skills = SkillAdapter::list(BackendProvider::OpenAiCompatible);
+        assert!(codex_skills.iter().any(|skill| skill.name == "demo-skill"));
+        assert!(
+            openai_skills
+                .iter()
+                .any(|skill| skill.name == "agent-skill")
+        );
+        assert!(!openai_skills.iter().any(|skill| skill.name == "demo-skill"));
         unsafe {
-            std::env::remove_var("CODEX_FORGE_SKILL_DIRS");
+            std::env::remove_var("HOME");
         }
     }
 }

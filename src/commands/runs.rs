@@ -1,14 +1,14 @@
 use anyhow::Result;
 
 use crate::cli::{
-    RunArgs, RunCancelArgs, RunCommands, RunListArgs, RunNodeShowArgs, RunResumeArgs,
-    RunRetryNodeArgs, RunShowArgs,
+    RunArgs, RunCancelArgs, RunCommands, RunConfirmPlanArgs, RunListArgs, RunNodeShowArgs,
+    RunResumeArgs, RunRetryNodeArgs, RunShowArgs,
 };
-use crate::commands::format::status_label;
+use crate::commands::format::{status_label, waiting_action_hint};
 use crate::config::load_app_config;
 use crate::harness::{
-    HarnessStore, TaskNodeKind, TaskNodeStatus, cancel_active_run, resume_run,
-    retry_task_node_and_resume,
+    HarnessStore, RunExecutionKind, TaskNodeKind, TaskNodeStatus, cancel_active_run,
+    confirm_plan_review_and_resume, resume_run, retry_task_node_and_resume,
 };
 use crate::workspace::resolve_target_dir;
 
@@ -17,6 +17,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         RunCommands::List(args) => run_list(args),
         RunCommands::Show(args) => run_show(args),
         RunCommands::Resume(args) => run_resume(args).await,
+        RunCommands::ConfirmPlan(args) => run_confirm_plan(args).await,
         RunCommands::Cancel(args) => run_cancel(args),
         RunCommands::RetryNode(args) => run_retry_node(args).await,
         RunCommands::Node(args) => run_node_show(args),
@@ -25,7 +26,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
 fn run_list(args: RunListArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let runs = store.list_runs(&args.thread)?;
     if runs.is_empty() {
         println!("当前 thread 没有 run");
@@ -34,9 +36,10 @@ fn run_list(args: RunListArgs) -> Result<()> {
 
     for run in runs {
         println!(
-            "{}\t{}\tturns={}\tactive={}\t{}",
+            "{}\t{}\t{}\tturns={}\tactive={}\t{}",
             run.id,
             status_label(run.status),
+            run.execution_kind.label(),
             run.turn_count,
             run.active_task_node_id.as_deref().unwrap_or("-"),
             run.summary.as_deref().unwrap_or("无摘要")
@@ -47,24 +50,36 @@ fn run_list(args: RunListArgs) -> Result<()> {
 
 fn run_show(args: RunShowArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let run = store.load_run(&args.thread, &args.run_id)?;
     let tool_calls = store.list_tool_calls(&run)?;
     let artifacts = store.list_artifacts(Some(&args.thread), Some(&args.run_id))?;
     let subagents = store.list_subagents(&run)?;
-    let graph = store.load_task_graph(&run)?;
-    let nodes = store.list_task_nodes(&run)?;
-    let contract = store.load_execution_contract(&args.thread).ok();
-    let progress = store.load_progress_ledger(&args.thread).ok();
-    let latest_evaluation = store
-        .list_evaluations(&run)
-        .ok()
-        .and_then(|mut items| items.drain(..).next());
+    let graph = matches!(run.execution_kind, RunExecutionKind::Orchestrated)
+        .then(|| store.load_task_graph(&run).ok())
+        .flatten();
+    let nodes = store.list_task_nodes(&run).unwrap_or_default();
+    let contract = matches!(run.execution_kind, RunExecutionKind::Orchestrated)
+        .then(|| store.load_execution_contract(&args.thread).ok())
+        .flatten();
+    let progress = matches!(run.execution_kind, RunExecutionKind::Orchestrated)
+        .then(|| store.load_progress_ledger(&args.thread).ok())
+        .flatten();
+    let latest_evaluation = matches!(run.execution_kind, RunExecutionKind::Orchestrated)
+        .then(|| {
+            store
+                .list_evaluations(&run)
+                .ok()
+                .and_then(|mut items| items.drain(..).next())
+        })
+        .flatten();
     println!("thread: {}", run.thread_id);
     println!("run: {}", run.id);
     println!("status: {}", status_label(run.status));
     println!("thinking: {}", run.thinking_mode.label());
     println!("backend: {}", run.backend.label());
+    println!("execution: {}", run.execution_kind.label());
     if let Some(model) = &run.model {
         println!("model: {model}");
     }
@@ -72,23 +87,51 @@ fn run_show(args: RunShowArgs) -> Result<()> {
     println!("tool calls: {}", tool_calls.len());
     println!("artifacts: {}", artifacts.len());
     println!("subagents: {}", subagents.len());
-    println!("task graph: {}", graph.id);
-    println!("strategy: {}", graph_strategy_label(graph.strategy));
-    println!("goal: {}", graph.goal);
+    if let Some(graph) = &graph {
+        println!("task graph: {}", graph.id);
+        println!("strategy: {}", graph_strategy_label(graph.strategy));
+        println!("goal: {}", graph.goal);
+    }
     println!(
         "active node: {}",
         run.active_task_node_id.as_deref().unwrap_or("-")
     );
     println!("output: {}", run.output_path.display());
     println!("log: {}", run.log_path.display());
-    if !graph.success_criteria.is_empty() {
+    if let Some(graph) = &graph
+        && !graph.success_criteria.is_empty()
+    {
         println!("success criteria:");
-        for item in graph.success_criteria {
+        for item in &graph.success_criteria {
             println!("  - {item}");
         }
     }
     if let Some(contract) = contract {
-        println!("features: {}", contract.ordered_features.len());
+        let total = contract.ordered_features.len();
+        let completed = contract
+            .ordered_features
+            .iter()
+            .filter(|feature| {
+                matches!(
+                    feature.status,
+                    crate::harness::FeatureSliceStatus::Completed
+                )
+            })
+            .count();
+        let next_feature = contract
+            .ordered_features
+            .iter()
+            .find(|feature| {
+                !matches!(
+                    feature.status,
+                    crate::harness::FeatureSliceStatus::Completed
+                )
+            })
+            .map(|feature| feature.title.as_str())
+            .unwrap_or("全部完成");
+        println!("features: {total}");
+        println!("feature progress: {completed}/{total}");
+        println!("next feature: {next_feature}");
     }
     if let Some(progress) = progress {
         println!(
@@ -146,6 +189,21 @@ fn run_show(args: RunShowArgs) -> Result<()> {
     if let Some(sandbox) = &run.sandbox {
         println!("sandbox: {} ({})", sandbox.container_name, sandbox.image);
     }
+    let active_node = run
+        .active_task_node_id
+        .as_deref()
+        .and_then(|node_id| store.load_task_node(&run, node_id).ok());
+    let pending_approval = matches!(run.execution_kind, RunExecutionKind::Orchestrated)
+        .then(|| {
+            store
+                .list_pending_approvals(Some(&args.thread))
+                .ok()
+                .and_then(|items| items.into_iter().find(|approval| approval.run_id == run.id))
+        })
+        .flatten();
+    if let Some(hint) = waiting_action_hint(&run, active_node.as_ref(), pending_approval.as_ref()) {
+        println!("next action: {hint}");
+    }
     if !nodes.is_empty() {
         println!("nodes:");
         for node in nodes {
@@ -174,9 +232,29 @@ async fn run_resume(args: RunResumeArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_confirm_plan(args: RunConfirmPlanArgs) -> Result<()> {
+    let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
+    let config = load_app_config(&repo_root)?;
+    let run = confirm_plan_review_and_resume(
+        &repo_root,
+        &config,
+        &args.thread,
+        &args.run_id,
+        &args.task_node_id,
+    )
+    .await?;
+    println!("run: {}", run.id);
+    println!("status: {}", status_label(run.status));
+    if let Some(summary) = run.summary {
+        println!("summary: {summary}");
+    }
+    Ok(())
+}
+
 fn run_cancel(args: RunCancelArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let run = cancel_active_run(&repo_root, &args.thread, &args.run_id)?;
+    let config = load_app_config(&repo_root)?;
+    let run = cancel_active_run(&repo_root, &config, &args.thread, &args.run_id)?;
     println!("run: {}", run.id);
     println!("status: {}", status_label(run.status));
     Ok(())
@@ -203,7 +281,8 @@ async fn run_retry_node(args: RunRetryNodeArgs) -> Result<()> {
 
 fn run_node_show(args: RunNodeShowArgs) -> Result<()> {
     let repo_root = resolve_target_dir(args.target_dir.as_deref())?.path;
-    let store = HarnessStore::new(&repo_root);
+    let config = load_app_config(&repo_root)?;
+    let store = HarnessStore::new(&repo_root, config.backend.provider);
     let run = store.load_run(&args.thread, &args.run)?;
     let node = store.load_task_node(&run, &args.task_node_id)?;
     println!("thread: {}", node.thread_id);

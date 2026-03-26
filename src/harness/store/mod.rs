@@ -8,22 +8,29 @@ mod threads;
 
 use std::path::{Path, PathBuf};
 
+use crate::config::BackendProvider;
+
 pub use ids::make_id;
 
 #[derive(Debug, Clone)]
 pub struct HarnessStore {
     repo_root: PathBuf,
+    provider: BackendProvider,
 }
 
 impl HarnessStore {
-    pub fn new(repo_root: &Path) -> Self {
+    pub fn new(repo_root: &Path, provider: BackendProvider) -> Self {
         Self {
             repo_root: repo_root.to_path_buf(),
+            provider,
         }
     }
 
     fn store_root(&self) -> PathBuf {
-        self.repo_root.join(".codex-forge")
+        self.repo_root
+            .join(".codex-forge")
+            .join("modes")
+            .join(self.provider.config_value())
     }
 
     fn threads_dir(&self) -> PathBuf {
@@ -49,6 +56,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::config::BackendProvider;
     use crate::harness::types::{
         AcceptanceCriterion, AgentBackendKind, ApprovalStatus, EvaluationDecision,
         ExecutionContract, FeatureSlice, FeatureSliceStatus, HarnessMessageRole, MemoryLayer,
@@ -61,7 +69,7 @@ mod tests {
     #[test]
     fn thread_run_and_approval_roundtrip() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store
             .create_thread(Some("测试线程"))
             .expect("create thread");
@@ -118,7 +126,7 @@ mod tests {
     #[test]
     fn memory_roundtrip_works() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("记忆")).expect("thread");
         store
             .append_memory_entry(
@@ -153,7 +161,7 @@ mod tests {
     #[test]
     fn contract_progress_and_evaluation_roundtrip() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("长任务")).expect("thread");
         let run = store
             .create_run(
@@ -230,7 +238,7 @@ mod tests {
     #[test]
     fn delete_thread_removes_manifest_and_directory() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("待删除")).expect("thread");
         assert!(thread.thread_dir.exists());
 
@@ -243,7 +251,7 @@ mod tests {
     #[test]
     fn thread_and_run_data_live_under_codex_forge_directory() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("持久化目录")).expect("thread");
         let run = store
             .create_run(
@@ -257,21 +265,40 @@ mod tests {
         assert!(
             thread
                 .thread_dir
-                .starts_with(dir.path().join(".codex-forge")),
+                .starts_with(dir.path().join(".codex-forge").join("modes").join("codex")),
             "{}",
             thread.thread_dir.display()
         );
         assert!(
-            run.run_dir.starts_with(dir.path().join(".codex-forge")),
+            run.run_dir
+                .starts_with(dir.path().join(".codex-forge").join("modes").join("codex")),
             "{}",
             run.run_dir.display()
         );
     }
 
     #[test]
+    fn different_modes_use_isolated_thread_namespaces() {
+        let dir = TempDir::new().expect("tempdir");
+        let codex_store = HarnessStore::new(dir.path(), BackendProvider::Codex);
+        let openai_store = HarnessStore::new(dir.path(), BackendProvider::OpenAiCompatible);
+        let codex_thread = codex_store
+            .create_thread(Some("codex"))
+            .expect("codex thread");
+        let openai_thread = openai_store
+            .create_thread(Some("openai"))
+            .expect("openai thread");
+
+        assert!(codex_store.load_thread(&codex_thread.id).is_ok());
+        assert!(codex_store.load_thread(&openai_thread.id).is_err());
+        assert!(openai_store.load_thread(&openai_thread.id).is_ok());
+        assert!(openai_store.load_thread(&codex_thread.id).is_err());
+    }
+
+    #[test]
     fn load_thread_repairs_empty_manifest() {
         let dir = TempDir::new().expect("tempdir");
-        let store = HarnessStore::new(dir.path());
+        let store = HarnessStore::new(dir.path(), BackendProvider::Codex);
         let thread = store.create_thread(Some("恢复")).expect("thread");
         store
             .append_message(
@@ -285,6 +312,8 @@ mod tests {
         let manifest_path = dir
             .path()
             .join(".codex-forge")
+            .join("modes")
+            .join("codex")
             .join("threads")
             .join(&thread.id)
             .join("thread.json");

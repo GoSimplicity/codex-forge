@@ -15,6 +15,10 @@ fn default_agent_backend_kind() -> AgentBackendKind {
     AgentBackendKind::Codex
 }
 
+fn default_run_execution_kind() -> RunExecutionKind {
+    RunExecutionKind::Orchestrated
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessRunStatus {
@@ -101,6 +105,42 @@ impl From<BackendProvider> for AgentBackendKind {
             BackendProvider::Codex => Self::Codex,
             BackendProvider::OpenAiCompatible => Self::OpenAiCompatible,
         }
+    }
+}
+
+impl From<AgentBackendKind> for BackendProvider {
+    fn from(value: AgentBackendKind) -> Self {
+        match value {
+            AgentBackendKind::Codex => Self::Codex,
+            AgentBackendKind::OpenAiCompatible => Self::OpenAiCompatible,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunExecutionKind {
+    AutonomousCodex,
+    Orchestrated,
+}
+
+impl RunExecutionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutonomousCodex => "autonomous_codex",
+            Self::Orchestrated => "orchestrated",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::AutonomousCodex => "Codex 自主执行",
+            Self::Orchestrated => "编排式执行",
+        }
+    }
+
+    pub fn is_autonomous_codex(self) -> bool {
+        matches!(self, Self::AutonomousCodex)
     }
 }
 
@@ -253,6 +293,8 @@ pub struct HarnessRunManifest {
     pub thinking_mode: ThinkingMode,
     #[serde(default = "default_agent_backend_kind")]
     pub backend: AgentBackendKind,
+    #[serde(default = "default_run_execution_kind")]
+    pub execution_kind: RunExecutionKind,
     pub turn_count: usize,
     #[serde(default)]
     pub summary: Option<String>,

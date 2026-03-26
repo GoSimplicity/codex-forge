@@ -95,6 +95,7 @@ pub enum RunCommands {
     List(RunListArgs),
     Show(RunShowArgs),
     Resume(RunResumeArgs),
+    ConfirmPlan(RunConfirmPlanArgs),
     Cancel(RunCancelArgs),
     RetryNode(RunRetryNodeArgs),
     Node(RunNodeShowArgs),
@@ -124,6 +125,18 @@ pub struct RunResumeArgs {
     pub thread: String,
     #[arg(help = "run id")]
     pub run_id: String,
+    #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RunConfirmPlanArgs {
+    #[arg(long, help = "所属 thread id")]
+    pub thread: String,
+    #[arg(help = "run id")]
+    pub run_id: String,
+    #[arg(help = "plan_review 节点 id")]
+    pub task_node_id: String,
     #[arg(long, help = "目标仓库目录；严格使用该目录，不再自动上卷到 Git 根")]
     pub target_dir: Option<PathBuf>,
 }

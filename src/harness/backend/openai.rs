@@ -11,6 +11,8 @@ use crate::config::BackendConfig;
 use super::{AgentBackend, BackendTurnRequest, parse_turn_envelope, render_lead_turn_prompt};
 use crate::harness::types::TurnEnvelope;
 
+const OPENAI_COMPATIBLE_UNSUPPORTED_MODEL_STATUS: i64 = 2061;
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleBackend {
     config: BackendConfig,
@@ -34,6 +36,66 @@ impl OpenAiCompatibleBackend {
 
     fn resolved_model<'a>(&'a self, request: &'a BackendTurnRequest<'_>) -> Option<&'a str> {
         request.model.or(self.config.model.as_deref())
+    }
+
+    async fn request_completion(
+        &self,
+        endpoint: &str,
+        key: &str,
+        prompt: &str,
+        model: &str,
+        timeout_secs: u64,
+        log_path: &Path,
+    ) -> Result<Value> {
+        let payload = json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            "response_format": {
+                "type": "json_object"
+            }
+        });
+
+        append_log(
+            log_path,
+            &format!(
+                "[request] POST {}\n{}\n",
+                endpoint,
+                serde_json::to_string_pretty(&payload).context("序列化 openai 请求体失败")?
+            ),
+        )?;
+
+        let response = self
+            .client
+            .post(endpoint)
+            .bearer_auth(key)
+            .timeout(Duration::from_secs(timeout_secs.max(1)))
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("调用 openai-compatible 接口失败：{}", endpoint))?;
+
+        let status = response.status();
+        let raw = response
+            .text()
+            .await
+            .context("读取 openai-compatible 响应失败")?;
+
+        append_log(log_path, &format!("[response] status={status}\n{raw}\n"))?;
+
+        if !status.is_success() {
+            bail!(
+                "openai-compatible 接口调用失败：HTTP {}{}",
+                status.as_u16(),
+                summarize_response_body(&raw)
+            );
+        }
+
+        serde_json::from_str(&raw).context("解析 openai-compatible 响应 JSON 失败")
     }
 }
 
@@ -62,59 +124,53 @@ impl AgentBackend for OpenAiCompatibleBackend {
             .ok_or_else(|| anyhow!("openai-compatible backend 缺少 key"))?;
 
         prepare_log_file(log_path)?;
-        let payload = json!({
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            "response_format": {
-                "type": "json_object"
-            }
-        });
-
         let endpoint = self.endpoint();
-        append_log(
-            log_path,
-            &format!(
-                "[request] POST {}\n{}\n",
-                endpoint,
-                serde_json::to_string_pretty(&payload).context("序列化 openai 请求体失败")?
-            ),
-        )?;
-
-        let response = self
-            .client
-            .post(&endpoint)
-            .bearer_auth(key)
-            .timeout(Duration::from_secs(request.timeout_secs.max(1)))
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("调用 openai-compatible 接口失败：{}", endpoint))?;
-
-        let status = response.status();
-        let raw = response
-            .text()
-            .await
-            .context("读取 openai-compatible 响应失败")?;
-
-        append_log(log_path, &format!("[response] status={status}\n{raw}\n"))?;
-
-        if !status.is_success() {
-            bail!(
-                "openai-compatible 接口调用失败：HTTP {}{}",
-                status.as_u16(),
-                summarize_response_body(&raw)
-            );
-        }
-
-        let value: Value =
-            serde_json::from_str(&raw).context("解析 openai-compatible 响应 JSON 失败")?;
-        if let Some(api_error) = extract_api_error(&value) {
-            bail!("openai-compatible 接口返回业务错误：{api_error}");
+        let value = self
+            .request_completion(
+                &endpoint,
+                key,
+                &prompt,
+                model,
+                request.timeout_secs,
+                log_path,
+            )
+            .await?;
+        if let Some(api_error) = extract_api_error_details(&value) {
+            if let Some(fallback_model) = fallback_model_for_unsupported_model(model, &api_error) {
+                append_log(
+                    log_path,
+                    &format!(
+                        "[fallback] 模型 `{}` 当前套餐不可用，自动回退到 `{}`\n",
+                        model, fallback_model
+                    ),
+                )?;
+                let fallback_value = self
+                    .request_completion(
+                        &endpoint,
+                        key,
+                        &prompt,
+                        &fallback_model,
+                        request.timeout_secs,
+                        log_path,
+                    )
+                    .await?;
+                if let Some(fallback_error) = extract_api_error(&fallback_value) {
+                    bail!(
+                        "openai-compatible 接口返回业务错误：主模型 `{}` 失败（{}）；回退模型 `{}` 仍失败（{}）",
+                        model,
+                        api_error.message,
+                        fallback_model,
+                        fallback_error
+                    );
+                }
+                let content = extract_message_content(&fallback_value).ok_or_else(|| {
+                    anyhow!("openai-compatible 响应缺少 choices[0].message.content")
+                })?;
+                fs::write(output_path, &content)
+                    .with_context(|| format!("写入 backend 输出失败：{}", output_path.display()))?;
+                return parse_turn_envelope(&content);
+            }
+            bail!("openai-compatible 接口返回业务错误：{}", api_error.message);
         }
         let content = extract_message_content(&value)
             .ok_or_else(|| anyhow!("openai-compatible 响应缺少 choices[0].message.content"))?;
@@ -201,6 +257,17 @@ fn extract_message_content(value: &Value) -> Option<String> {
 }
 
 fn extract_api_error(value: &Value) -> Option<String> {
+    extract_api_error_details(value).map(|details| details.message)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApiErrorDetails {
+    message: String,
+    status_code: Option<i64>,
+    status_msg: Option<String>,
+}
+
+fn extract_api_error_details(value: &Value) -> Option<ApiErrorDetails> {
     if let Some(message) = value
         .get("error")
         .and_then(|error| {
@@ -212,7 +279,11 @@ fn extract_api_error(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|message| !message.is_empty())
     {
-        return Some(message.to_string());
+        return Some(ApiErrorDetails {
+            message: message.to_string(),
+            status_code: None,
+            status_msg: None,
+        });
     }
 
     let base_resp = value.get("base_resp")?;
@@ -231,9 +302,27 @@ fn extract_api_error(value: &Value) -> Option<String> {
         .filter(|message| !message.is_empty())
         .unwrap_or("未知错误");
 
-    Some(format!(
-        "status_code={status_code}, status_msg={status_msg}"
-    ))
+    Some(ApiErrorDetails {
+        message: format!("status_code={status_code}, status_msg={status_msg}"),
+        status_code: Some(status_code),
+        status_msg: Some(status_msg.to_string()),
+    })
+}
+
+fn fallback_model_for_unsupported_model(
+    requested_model: &str,
+    api_error: &ApiErrorDetails,
+) -> Option<String> {
+    let status_code = api_error.status_code?;
+    if status_code != OPENAI_COMPATIBLE_UNSUPPORTED_MODEL_STATUS {
+        return None;
+    }
+    let status_msg = api_error.status_msg.as_deref()?.to_ascii_lowercase();
+    if !status_msg.contains("not support model") {
+        return None;
+    }
+    let fallback = requested_model.strip_suffix("-highspeed")?.trim();
+    (!fallback.is_empty() && fallback != requested_model).then(|| fallback.to_string())
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -247,7 +336,10 @@ fn chat_completions_endpoint(base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_completions_endpoint, extract_api_error, extract_message_content};
+    use super::{
+        ApiErrorDetails, OPENAI_COMPATIBLE_UNSUPPORTED_MODEL_STATUS, chat_completions_endpoint,
+        extract_api_error, extract_message_content, fallback_model_for_unsupported_model,
+    };
 
     #[test]
     fn extracts_string_or_array_message_content() {
@@ -305,6 +397,36 @@ mod tests {
         assert_eq!(
             extract_api_error(&body).as_deref(),
             Some("status_code=2061, status_msg=model not supported")
+        );
+    }
+
+    #[test]
+    fn falls_back_from_highspeed_model_when_plan_does_not_support_it() {
+        let error = ApiErrorDetails {
+            message: "status_code=2061, status_msg=your current token plan not support model, MiniMax-M2.7-highspeed".to_string(),
+            status_code: Some(OPENAI_COMPATIBLE_UNSUPPORTED_MODEL_STATUS),
+            status_msg: Some(
+                "your current token plan not support model, MiniMax-M2.7-highspeed".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            fallback_model_for_unsupported_model("MiniMax-M2.7-highspeed", &error).as_deref(),
+            Some("MiniMax-M2.7")
+        );
+    }
+
+    #[test]
+    fn does_not_fall_back_for_non_highspeed_model() {
+        let error = ApiErrorDetails {
+            message: "status_code=2061, status_msg=your current token plan not support model, MiniMax-M2.7".to_string(),
+            status_code: Some(OPENAI_COMPATIBLE_UNSUPPORTED_MODEL_STATUS),
+            status_msg: Some("your current token plan not support model, MiniMax-M2.7".to_string()),
+        };
+
+        assert_eq!(
+            fallback_model_for_unsupported_model("MiniMax-M2.7", &error),
+            None
         );
     }
 }

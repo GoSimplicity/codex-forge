@@ -1,5 +1,6 @@
 use crate::harness::{
-    ApprovalStatus, ArtifactKind, HarnessEvent, HarnessMessageRole, HarnessRunStatus,
+    ApprovalRecord, ApprovalStatus, ArtifactKind, HarnessEvent, HarnessMessageRole,
+    HarnessRunManifest, HarnessRunStatus, TaskNodeKind, TaskNodeRecord, TaskNodeStatus,
 };
 
 pub fn describe_event(event: &HarnessEvent) -> String {
@@ -158,4 +159,39 @@ pub fn first_line(text: &str) -> &str {
         .find(|line| !line.trim().is_empty())
         .map(str::trim)
         .unwrap_or("空")
+}
+
+pub fn waiting_action_hint(
+    run: &HarnessRunManifest,
+    node: Option<&TaskNodeRecord>,
+    pending_approval: Option<&ApprovalRecord>,
+) -> Option<String> {
+    if run.status != HarnessRunStatus::WaitingForInput {
+        return None;
+    }
+
+    if let Some(approval) = pending_approval {
+        return Some(format!(
+            "下一步：运行 `codex-forge approval approve --thread {} {}`，批准工具 `{}` 后继续执行。",
+            approval.thread_id, approval.id, approval.tool_name
+        ));
+    }
+
+    if let Some(node) = node {
+        return match (node.kind, node.status) {
+            (TaskNodeKind::PlanReview, TaskNodeStatus::WaitingForInput) => Some(format!(
+                "下一步：运行 `codex-forge run confirm-plan --thread {} {} {}`，确认计划后继续执行。",
+                run.thread_id, run.id, node.id
+            )),
+            (_, TaskNodeStatus::WaitingForInput) => Some(format!(
+                "下一步：当前节点 `{}` 等待人工输入；先运行 `codex-forge run node --thread {} --run {} {}` 查看详情。",
+                node.title, run.thread_id, run.id, node.id
+            )),
+            _ => None,
+        };
+    }
+
+    run.blocked_reason
+        .as_ref()
+        .map(|reason| format!("当前 run 正在等待输入：{reason}"))
 }
